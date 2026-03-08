@@ -1,0 +1,54 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# ─── Virtual Environments ────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ─── Logs ─────────────────────────────────────────────────
+*.log
+dicom_sync_gui.log
+dicom_sync.log
+
+# ─── Private / DICOM Config (PACS-Knoten, Credentials) ──
+dicom_config.json
+dicom_preferences.json
+dicom_sync_config.json
+series_stability.json
+*.dcm
+
+# ─── macOS ────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ─── Windows ─────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ─── Linux ────────────────────────────────────────────────
+*~
+.directory
+
+# ─── IDE / Editor ────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
