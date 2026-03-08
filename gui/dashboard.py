@@ -8,10 +8,11 @@ and real-time throughput statistics with color-coded indicators.
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
-    QPushButton, QSpinBox, QFormLayout,
+    QPushButton, QSpinBox, QFormLayout, QCheckBox, QComboBox,
+    QListWidget, QListWidgetItem, QMenu, QToolButton, QFrame,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QAction
 
 from core.transfer_engine import TransferStats
 
@@ -69,6 +70,7 @@ class TransferDashboard(QWidget):
         self._last_queue: list = []
         self._service_running = False
         self._settings_dirty = False
+        self._filter_popup_visible = False
         self._setup_ui()
 
         # Refresh stats display every 2 seconds
@@ -137,6 +139,48 @@ class TransferDashboard(QWidget):
 
         ctrl_group.setLayout(ctrl_layout)
         layout.addWidget(ctrl_group)
+
+        # ── Filter Groups ──
+        filter_group = QGroupBox("Institution Filter")
+        fl = QHBoxLayout()
+
+        self.filter_enable_check = QCheckBox("Enable group filtering")
+        self.filter_enable_check.setChecked(
+            self.config.filter_groups_enabled)
+        self.filter_enable_check.toggled.connect(
+            self._on_filter_toggled)
+        fl.addWidget(self.filter_enable_check)
+
+        fl.addWidget(QLabel("Active groups:"))
+
+        # Multi-select dropdown button
+        self.filter_btn = QToolButton()
+        self.filter_btn.setText("Select Groups...")
+        self.filter_btn.setPopupMode(QToolButton.InstantPopup)
+        self.filter_btn.setStyleSheet(
+            "QToolButton { padding: 5px 12px; border: 1px solid #555; "
+            "border-radius: 4px; background: #2c2c2c; min-width: 200px; "
+            "text-align: left; }"
+            "QToolButton::menu-indicator { subcontrol-position: right center; }")
+
+        self.filter_menu = QMenu(self.filter_btn)
+        self.filter_btn.setMenu(self.filter_menu)
+
+        fl.addWidget(self.filter_btn)
+
+        self.lbl_filter_info = QLabel("")
+        self.lbl_filter_info.setStyleSheet(
+            "QLabel { color: #f39c12; font-style: italic; }")
+        fl.addWidget(self.lbl_filter_info)
+
+        fl.addStretch()
+
+        filter_group.setLayout(fl)
+        layout.addWidget(filter_group)
+
+        self._populate_filter_menu()
+        self._update_filter_button_text()
+        self._update_filter_enabled_state()
 
         # ── Restart Required Banner ──
         self.restart_banner = QLabel(
@@ -222,6 +266,85 @@ class TransferDashboard(QWidget):
         summary.addStretch()
         summary.addWidget(self.lbl_status)
         layout.addLayout(summary)
+
+    # ── Filter group handling ─────────────────────────────────────────
+
+    def _populate_filter_menu(self):
+        """Build the checkable menu items for each filter group."""
+        self.filter_menu.clear()
+        active = set(self.config.active_filter_groups)
+
+        for name in self.config.filter_group_names:
+            action = QAction(name, self.filter_menu)
+            action.setCheckable(True)
+            action.setChecked(name in active)
+            action.toggled.connect(self._on_filter_group_toggled)
+            self.filter_menu.addAction(action)
+
+        if not self.config.filter_group_names:
+            empty_action = QAction(
+                "(no groups configured)", self.filter_menu)
+            empty_action.setEnabled(False)
+            self.filter_menu.addAction(empty_action)
+
+    def _on_filter_group_toggled(self, checked: bool):
+        """Update active groups when a menu item is toggled."""
+        active = []
+        for action in self.filter_menu.actions():
+            if action.isCheckable() and action.isChecked():
+                active.append(action.text())
+        self.config.active_filter_groups = active
+        self.config.filter_groups_enabled = (
+            self.filter_enable_check.isChecked())
+        self.config.save()
+        self._update_filter_button_text()
+
+    def _on_filter_toggled(self, enabled: bool):
+        """Master switch for filtering."""
+        self.config.filter_groups_enabled = enabled
+        self.config.save()
+        self._update_filter_enabled_state()
+        self._update_filter_button_text()
+
+    def _update_filter_enabled_state(self):
+        enabled = self.filter_enable_check.isChecked()
+        self.filter_btn.setEnabled(enabled)
+        if enabled:
+            self.lbl_filter_info.setText("")
+        else:
+            self.lbl_filter_info.setText(
+                "Filtering disabled — all studies will be downloaded.")
+
+    def _update_filter_button_text(self):
+        active = self.config.active_filter_groups
+        if not active:
+            self.filter_btn.setText("Select Groups...")
+        elif len(active) <= 3:
+            self.filter_btn.setText(", ".join(active))
+        else:
+            self.filter_btn.setText(
+                f"{len(active)} groups selected")
+
+        if self.filter_enable_check.isChecked() and active:
+            count = sum(
+                1 for inst, grp
+                in self.config.institution_assignments.items()
+                if grp in set(active))
+            self.lbl_filter_info.setText(
+                f"Filtering active: {len(active)} group(s), "
+                f"{count} institution(s)")
+
+    def refresh_filter_groups(self):
+        """Called when filter groups are edited in the dialog."""
+        # Remove active selections that no longer exist
+        valid_names = set(self.config.filter_group_names)
+        self.config.active_filter_groups = [
+            g for g in self.config.active_filter_groups
+            if g in valid_names]
+        self.config.save()
+        self._populate_filter_menu()
+        self._update_filter_button_text()
+        self._update_filter_enabled_state()
 
     # ── Service control handlers ──────────────────────────────────────────
 

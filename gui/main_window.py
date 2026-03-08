@@ -21,6 +21,8 @@ from core.transfer_engine import TransferEngine
 from gui.settings_dialog import SettingsDialog
 from gui.dashboard import TransferDashboard
 from gui.log_window import LogWindow
+from gui.filter_groups_dialog import FilterGroupsDialog
+from gui.unknown_institution_popup import UnknownInstitutionPopup
 
 logger = logging.getLogger("dicom_sync")
 
@@ -47,16 +49,21 @@ class MainWindow(QMainWindow):
     def _setup_menu(self):
         menubar = self.menuBar()
 
-        file_menu = menubar.addMenu("File")
-        settings_action = QAction("Settings...", self)
+        settings_menu = menubar.addMenu("Settings")
+        settings_action = QAction("PACS Configuration...", self)
         settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(self._open_settings)
-        file_menu.addAction(settings_action)
-        file_menu.addSeparator()
+        settings_menu.addAction(settings_action)
+
+        filter_action = QAction("Manage Filter Groups...", self)
+        filter_action.triggered.connect(self._open_filter_groups)
+        settings_menu.addAction(filter_action)
+
+        settings_menu.addSeparator()
         quit_action = QAction("Quit", self)
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
-        file_menu.addAction(quit_action)
+        settings_menu.addAction(quit_action)
 
         view_menu = menubar.addMenu("View")
         log_action = QAction("Show Log Window", self)
@@ -106,6 +113,13 @@ class MainWindow(QMainWindow):
             self.dashboard.max_images_spin.setValue(self.config.max_images)
             self.dashboard.interval_spin.setValue(self.config.sync_interval)
             self._log("Settings saved.")
+
+    def _open_filter_groups(self):
+        dlg = FilterGroupsDialog(self.config, self)
+        if dlg.exec() == FilterGroupsDialog.Accepted:
+            # Refresh dashboard filter dropdown
+            self.dashboard.refresh_filter_groups()
+            self._log("Filter groups updated.")
 
     # ── C-ECHO ────────────────────────────────────────────────────────────
 
@@ -249,6 +263,32 @@ class MainWindow(QMainWindow):
         e.signals.service_stopped.connect(self._on_service_stopped)
         # Log
         e.signals.log_message.connect(self._log)
+        e.signals.unknown_institution.connect(
+            self._on_unknown_institution)
+
+    # ── Unknown institution handling ──────────────────────────────────────
+
+    def _on_unknown_institution(self, institution_name: str):
+        """Show popup when an unknown institution is encountered."""
+        popup = UnknownInstitutionPopup(
+            institution_name,
+            self.config.filter_group_names,
+            self,
+        )
+        if popup.exec() == UnknownInstitutionPopup.Accepted:
+            if popup.assigned_group:
+                self.config.institution_assignments[
+                    institution_name] = popup.assigned_group
+                self.config.save()
+                self._log(
+                    f"Assigned \"{institution_name}\" "
+                    f"to group \"{popup.assigned_group}\".")
+            else:
+                # Still register it as known but unassigned
+                if institution_name not in self.config.institution_assignments:
+                    self.config.institution_assignments[
+                        institution_name] = ""
+                    self.config.save()
 
     # ── Window close ──────────────────────────────────────────────────────
 
