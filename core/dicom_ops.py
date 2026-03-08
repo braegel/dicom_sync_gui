@@ -110,7 +110,45 @@ class DicomOperations:
         ds.Modality = ''
         ds.SeriesDescription = ''
         ds.NumberOfSeriesRelatedInstances = ''
+        ds.InstitutionName = ''
         return self._execute_find(ds)
+
+    def c_find_institution_names(self, study_date: str = None
+                                  ) -> List[str]:
+        """Discover unique InstitutionName values via series-level query.
+
+        InstitutionName is typically not returned at STUDY level by most
+        PACS. We query at SERIES level where it is reliably available.
+        """
+        # First: find all study UIDs in the date range
+        studies = self.c_find_studies(study_date=study_date)
+        institution_names: set = set()
+
+        for study_ds in studies:
+            study_uid = getattr(study_ds, 'StudyInstanceUID', '')
+            if not study_uid:
+                continue
+
+            # Check if study-level already has InstitutionName
+            inst = str(getattr(study_ds, 'InstitutionName', '')).strip()
+            if inst:
+                institution_names.add(inst)
+                continue
+
+            # Fallback: query one series of this study for InstitutionName
+            ds = Dataset()
+            ds.QueryRetrieveLevel = 'SERIES'
+            ds.StudyInstanceUID = study_uid
+            ds.SeriesInstanceUID = ''
+            ds.InstitutionName = ''
+            series_results = self._execute_find(ds)
+            for ser in series_results:
+                inst = str(getattr(ser, 'InstitutionName', '')).strip()
+                if inst:
+                    institution_names.add(inst)
+                    break  # one hit per study is enough
+
+        return sorted(institution_names)
 
     def c_find_images(self, study_uid: str, series_uid: str) -> List[Dataset]:
         ds = Dataset()

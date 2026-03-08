@@ -92,6 +92,12 @@ class AppConfig:
         self.prior_studies_count: int = 0  # 0 = disabled
         self.prior_studies_same_modality: bool = False
 
+        # Filter groups
+        self.filter_group_names: List[str] = []  # ordered list of group names
+        self.institution_assignments: Dict[str, str] = {}  # {institution: group_name}
+        self.active_filter_groups: List[str] = []  # groups selected in dashboard
+        self.filter_groups_enabled: bool = False  # master switch in dashboard
+
         # Download service defaults (can be overridden in dashboard)
         self.default_hours: int = 3
         self.max_images: int = 0  # 0 = no limit
@@ -135,6 +141,13 @@ class AppConfig:
                                                    os.path.expanduser("~/DICOM_Incoming"))
             self.prior_studies_count = data.get("prior_studies_count", 0)
             self.prior_studies_same_modality = data.get("prior_studies_same_modality", False)
+            self.filter_group_names = data.get("filter_group_names", [])
+            self.institution_assignments = data.get(
+                "institution_assignments", {})
+            self.active_filter_groups = data.get(
+                "active_filter_groups", [])
+            self.filter_groups_enabled = data.get(
+                "filter_groups_enabled", False)
             self.default_hours = data.get("default_hours", 3)
             self.max_images = data.get("max_images", 0)
             self.sync_interval = data.get("sync_interval", 60)
@@ -153,6 +166,10 @@ class AppConfig:
             "fallback_storage_path": self.fallback_storage_path,
             "prior_studies_count": self.prior_studies_count,
             "prior_studies_same_modality": self.prior_studies_same_modality,
+            "filter_group_names": self.filter_group_names,
+            "institution_assignments": self.institution_assignments,
+            "active_filter_groups": self.active_filter_groups,
+            "filter_groups_enabled": self.filter_groups_enabled,
             "default_hours": self.default_hours,
             "max_images": self.max_images,
             "sync_interval": self.sync_interval,

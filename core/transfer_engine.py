@@ -38,6 +38,7 @@ class SeriesJob:
     remote_count: int = 0
     local_count: int = 0
     status: str = "queued"  # queued, transferring, done, error, skipped
+    institution_name: str = ""
 
     @property
     def to_transfer(self) -> int:
@@ -56,6 +57,7 @@ class SeriesJob:
             "remote_count": self.remote_count,
             "local_count": self.local_count,
             "status": self.status,
+            "institution_name": self.institution_name,
         }
 
 
@@ -184,6 +186,8 @@ class TransferSignals(QObject):
     service_stopped = Signal()
     # Log
     log_message = Signal(str)
+    # Unknown institution detected (institution_name)
+    unknown_institution = Signal(str)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +207,7 @@ class TransferEngine:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._queue: List[SeriesJob] = []
+        self._notified_institutions: Set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -306,8 +311,23 @@ class TransferEngine:
                     patient_name = str(getattr(study_ds, 'PatientName', 'Unknown'))
                     patient_id = getattr(study_ds, 'PatientID', '')
                     study_desc = getattr(study_ds, 'StudyDescription', 'N/A')
+                    institution = str(
+                        getattr(study_ds, 'InstitutionName', '')).strip()
 
+                    # Query series (also used for institution fallback)
                     series_list = dicom_ops.c_find_series(study_uid)
+
+                    # InstitutionName is often not at study level.
+                    # Fallback: read it from the first series.
+                    if not institution and series_list:
+                        institution = str(
+                            getattr(series_list[0],
+                                    'InstitutionName', '')).strip()
+
+                    # ── Filter by institution group ──
+                    if not self._passes_institution_filter(institution):
+                        continue
+
                     local_series = {}
                     try:
                         for ls in dicom_ops.c_find_local_series(study_uid):
@@ -346,6 +366,7 @@ class TransferEngine:
                             series_uid=series_uid,
                             remote_count=remote_count,
                             local_count=local_count,
+                            institution_name=institution,
                         )
                         all_jobs.append(job)
 
@@ -515,6 +536,40 @@ class TransferEngine:
                 self._log(f"  {len(prior_jobs)} prior series for patient {pid}")
 
         return prior_jobs
+
+    # ── Institution filter logic ──────────────────────────────────────────
+
+    def _passes_institution_filter(self, institution_name: str) -> bool:
+        """
+        Check whether a study from the given institution should be downloaded.
+
+        Rules (when filtering is enabled):
+        - If institution is assigned to an active group → download
+        - If institution is assigned to an inactive group → skip
+        - If institution is unknown (not assigned to any group) → download
+          AND emit unknown_institution signal so the GUI can alert the user
+        - If filtering is disabled → always download
+        """
+        if not self.config.filter_groups_enabled:
+            return True
+
+        active_groups = set(self.config.active_filter_groups)
+        if not active_groups:
+            # No groups selected = no filtering active
+            return True
+
+        assignments = self.config.institution_assignments
+        assigned_group = assignments.get(institution_name, "")
+
+        if not assigned_group:
+            # Unknown / unassigned institution → download + alert
+            if institution_name and institution_name not in self._notified_institutions:
+                self._notified_institutions.add(institution_name)
+                self.signals.unknown_institution.emit(institution_name)
+            return True
+
+        # Known institution: check if its group is active
+        return assigned_group in active_groups
 
     def _make_dicom_ops(self, remote_key: str) -> DicomOperations:
         remote_node = self.config.remote_nodes[remote_key]
