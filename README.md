@@ -105,11 +105,9 @@ sudo pacman -S python python-pip
 ### 2. Clone or download the project
 
 ```bash
-git clone <repository-url> dicom_sync_gui
+git clone https://github.com/braegel/dicom_sync_gui.git
 cd dicom_sync_gui
 ```
-
-Or unzip the provided `dicom_sync_gui.zip` and navigate into the folder.
 
 ---
 
