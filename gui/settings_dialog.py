@@ -22,6 +22,7 @@ from PySide6.QtGui import QFont
 from core.config import (
     AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES, RETRIEVE_METHODS, get_local_ip,
 )
+from gui.styles import BTN_GREEN, BTN_BLUE
 
 
 class PacsNodeEditor(QWidget):
@@ -194,19 +195,11 @@ class SettingsDialog(QDialog):
         editor_btns = QHBoxLayout()
 
         self.btn_add_new = QPushButton("Add New")
-        self.btn_add_new.setStyleSheet(
-            "QPushButton { background: #27ae60; color: white; padding: 6px 16px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #2ecc71; }"
-            "QPushButton:disabled { background: #7f8c8d; }")
+        self.btn_add_new.setStyleSheet(BTN_GREEN)
         self.btn_add_new.clicked.connect(self._add_remote)
 
         self.btn_save_changes = QPushButton("Save Changes")
-        self.btn_save_changes.setStyleSheet(
-            "QPushButton { background: #2980b9; color: white; padding: 6px 16px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #3498db; }"
-            "QPushButton:disabled { background: #7f8c8d; }")
+        self.btn_save_changes.setStyleSheet(BTN_BLUE)
         self.btn_save_changes.clicked.connect(self._save_changes_to_selected)
         self.btn_save_changes.setVisible(False)
 

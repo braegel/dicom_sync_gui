@@ -253,9 +253,6 @@ class MainWindow(QMainWindow):
         # Dashboard updates
         e.signals.queue_updated.connect(self.dashboard.on_queue_updated)
         e.signals.series_started.connect(self.dashboard.on_series_started)
-        e.signals.series_progress.connect(self.dashboard.on_series_progress)
-        e.signals.series_completed.connect(self.dashboard.on_series_completed)
-        e.signals.series_error.connect(self.dashboard.on_series_error)
         e.signals.stats_updated.connect(self.dashboard.on_stats_updated)
         e.signals.cycle_started.connect(self.dashboard.on_cycle_started)
         e.signals.cycle_finished.connect(self.dashboard.on_cycle_finished)

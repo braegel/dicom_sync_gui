@@ -9,6 +9,7 @@ Workflow:
  - Groups and assignments are persisted in AppConfig
 """
 
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
@@ -18,13 +19,14 @@ from PySide6.QtWidgets import (
     QPushButton, QGroupBox, QListWidget, QListWidgetItem, QComboBox,
     QSpinBox, QMessageBox, QSplitter, QInputDialog, QHeaderView,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QApplication,
-    QProgressDialog,
+    QProgressDialog, QFileDialog,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QColor
 
 from core.config import AppConfig
 from core.dicom_ops import DicomOperations
+from gui.styles import BTN_GREEN, BTN_GREEN_LARGE, BTN_RED, BTN_BLUE, BTN_BLUE_LARGE
 
 logger = logging.getLogger("dicom_sync")
 
@@ -66,10 +68,7 @@ class FilterGroupsDialog(QDialog):
         ql.addWidget(self.query_days_spin)
 
         self.btn_query = QPushButton("  Query Institutions  ")
-        self.btn_query.setStyleSheet(
-            "QPushButton { background: #2980b9; color: white; padding: 8px 18px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #3498db; }")
+        self.btn_query.setStyleSheet(BTN_BLUE_LARGE)
         self.btn_query.clicked.connect(self._query_institutions)
         ql.addWidget(self.btn_query)
 
@@ -94,10 +93,7 @@ class FilterGroupsDialog(QDialog):
         add_grp_layout.addWidget(self.group_name_edit)
 
         self.btn_add_group = QPushButton("Add Group")
-        self.btn_add_group.setStyleSheet(
-            "QPushButton { background: #27ae60; color: white; padding: 6px 14px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #2ecc71; }")
+        self.btn_add_group.setStyleSheet(BTN_GREEN)
         self.btn_add_group.clicked.connect(self._add_group)
         add_grp_layout.addWidget(self.btn_add_group)
 
@@ -116,11 +112,7 @@ class FilterGroupsDialog(QDialog):
 
         self.btn_remove_group = QPushButton("Remove")
         self.btn_remove_group.setEnabled(False)
-        self.btn_remove_group.setStyleSheet(
-            "QPushButton { background: #c0392b; color: white; padding: 6px 14px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #e74c3c; }"
-            "QPushButton:disabled { background: #7f8c8d; }")
+        self.btn_remove_group.setStyleSheet(BTN_RED)
         self.btn_remove_group.clicked.connect(self._remove_group)
         grp_btn_layout.addWidget(self.btn_remove_group)
 
@@ -158,10 +150,7 @@ class FilterGroupsDialog(QDialog):
         assign_layout.addWidget(self.assign_combo)
 
         self.btn_assign = QPushButton("Assign")
-        self.btn_assign.setStyleSheet(
-            "QPushButton { background: #2980b9; color: white; padding: 6px 14px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #3498db; }")
+        self.btn_assign.setStyleSheet(BTN_BLUE)
         self.btn_assign.clicked.connect(self._assign_selected)
         assign_layout.addWidget(self.btn_assign)
 
@@ -189,8 +178,21 @@ class FilterGroupsDialog(QDialog):
         splitter.setSizes([300, 600])
         layout.addWidget(splitter, 1)
 
-        # ── Bottom: Save / Cancel ──
+        # ── Bottom: Export / Import / Save / Cancel ──
         btn_layout = QHBoxLayout()
+
+        self.btn_export = QPushButton("Export...")
+        self.btn_export.setToolTip(
+            "Export filter groups and institution assignments to a JSON file")
+        self.btn_export.clicked.connect(self._export_groups)
+        btn_layout.addWidget(self.btn_export)
+
+        self.btn_import = QPushButton("Import...")
+        self.btn_import.setToolTip(
+            "Import filter groups and institution assignments from a JSON file")
+        self.btn_import.clicked.connect(self._import_groups)
+        btn_layout.addWidget(self.btn_import)
+
         btn_layout.addStretch()
 
         btn_cancel = QPushButton("Cancel")
@@ -198,10 +200,7 @@ class FilterGroupsDialog(QDialog):
         btn_layout.addWidget(btn_cancel)
 
         btn_save = QPushButton("  Save  ")
-        btn_save.setStyleSheet(
-            "QPushButton { background: #27ae60; color: white; padding: 8px 22px; "
-            "border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #2ecc71; }")
+        btn_save.setStyleSheet(BTN_GREEN_LARGE)
         btn_save.clicked.connect(self._save)
         btn_layout.addWidget(btn_save)
 
@@ -411,7 +410,109 @@ class FilterGroupsDialog(QDialog):
         self._refresh_institution_tree()
         self._refresh_group_list()
 
-    # ── Save ──────────────────────────────────────────────────────────────
+    # ── Export / Import ────────────────────────────────────────────────
+
+    def _export_groups(self):
+        """Export the current (unsaved) filter groups to a JSON file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Filter Groups",
+            "filter_groups.json",
+            "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            # Temporarily apply working copies so config can serialise them
+            orig_names = self.config.filter_group_names
+            orig_assign = self.config.institution_assignments
+            self.config.filter_group_names = list(self._group_names)
+            self.config.institution_assignments = dict(self._assignments)
+            self.config.export_filter_groups(path)
+            self.config.filter_group_names = orig_names
+            self.config.institution_assignments = orig_assign
+
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Exported {len(self._group_names)} groups and "
+                f"{len(self._assignments)} institutions to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Export Failed", f"Could not write file:\n{e}")
+
+    def _import_groups(self):
+        """Import filter groups from a JSON file into the dialog's working data."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Filter Groups", "",
+            "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+
+        # Peek at file to show summary in confirmation dialog
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            QMessageBox.critical(
+                self, "Import Failed",
+                f"Could not read file:\n{e}")
+            return
+
+        imported_groups = data.get("filter_group_names", [])
+        imported_assignments = data.get("institution_assignments", {})
+
+        if not imported_groups and not imported_assignments:
+            QMessageBox.warning(
+                self, "Import Empty",
+                "The selected file contains no filter group data.")
+            return
+
+        # Ask whether to replace or merge
+        reply = QMessageBox.question(
+            self, "Import Mode",
+            f"The file contains {len(imported_groups)} groups and "
+            f"{len(imported_assignments)} institutions.\n\n"
+            "Click \"Yes\" to MERGE with existing data "
+            "(add new groups, update assignments).\n"
+            "Click \"No\" to REPLACE all existing groups and assignments.",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes)
+
+        if reply == QMessageBox.Cancel:
+            return
+
+        merge = (reply == QMessageBox.Yes)
+
+        # Delegate to config (operates on working copies)
+        orig_names = self.config.filter_group_names
+        orig_assign = self.config.institution_assignments
+        self.config.filter_group_names = list(self._group_names)
+        self.config.institution_assignments = dict(self._assignments)
+
+        summary = self.config.import_filter_groups(path, merge=merge)
+
+        # Read back the result into working copies
+        self._group_names = list(self.config.filter_group_names)
+        self._assignments = dict(self.config.institution_assignments)
+
+        # Restore config originals (will be persisted on Save)
+        self.config.filter_group_names = orig_names
+        self.config.institution_assignments = orig_assign
+
+        if merge:
+            QMessageBox.information(
+                self, "Import Complete",
+                f"Merged: {summary['groups_added']} new groups, "
+                f"{summary['institutions_added']} new institutions, "
+                f"{summary['institutions_updated']} updated assignments.")
+        else:
+            QMessageBox.information(
+                self, "Import Complete",
+                f"Replaced with {summary['groups_added']} groups and "
+                f"{summary['institutions_added']} institutions.")
+
+        self._refresh_group_list()
+        self._refresh_institution_tree()
+
+    # ── Save ──────────────────────────────────────────────────────────
 
     def _save(self):
         # Clean up assignments: remove entries whose group no longer exists

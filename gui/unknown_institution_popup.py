@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QFont
 
+from gui.styles import BTN_OK_BLUE
+
 logger = logging.getLogger("dicom_sync")
 
 # Try to import QSoundEffect for the alert sound
@@ -111,10 +113,7 @@ class UnknownInstitutionPopup(QDialog):
         btn_layout.addStretch()
 
         btn_ok = QPushButton("  OK  ")
-        btn_ok.setStyleSheet(
-            "QPushButton { background: #2980b9; color: white; "
-            "padding: 8px 24px; border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #3498db; }")
+        btn_ok.setStyleSheet(BTN_OK_BLUE)
         btn_ok.clicked.connect(self._on_ok)
         btn_layout.addWidget(btn_ok)
 
