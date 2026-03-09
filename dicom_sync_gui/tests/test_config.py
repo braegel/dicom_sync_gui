@@ -32,10 +32,6 @@ class TestPacsNode:
         assert node.hours == 3
         assert node.max_images == 0
         assert node.sync_interval == 60
-        assert node.local_ae_title == "LOCAL_AE"
-        assert node.local_port == 11112
-        assert node.local_syntax == "JPEG2000Lossless"
-        assert node.fallback_folder == ""
 
     def test_custom_values(self, sample_pacs_node):
         node = sample_pacs_node
@@ -52,17 +48,6 @@ class TestPacsNode:
         assert node.max_images == 500
         assert node.sync_interval == 120
 
-    def test_custom_local_dest_params(self):
-        node = PacsNode(
-            local_ae_title="ARZT_4", local_port=11113,
-            local_syntax="ExplicitVRLittleEndian",
-            fallback_folder="/tmp/fallback",
-        )
-        assert node.local_ae_title == "ARZT_4"
-        assert node.local_port == 11113
-        assert node.local_syntax == "ExplicitVRLittleEndian"
-        assert node.fallback_folder == "/tmp/fallback"
-
     def test_to_dict(self, sample_pacs_node):
         d = sample_pacs_node.to_dict()
         assert isinstance(d, dict)
@@ -75,10 +60,6 @@ class TestPacsNode:
         assert d["hours"] == 3  # default
         assert d["max_images"] == 0  # default
         assert d["sync_interval"] == 60  # default
-        assert d["local_ae_title"] == "LOCAL_AE"  # default
-        assert d["local_port"] == 11112  # default
-        assert d["local_syntax"] == "JPEG2000Lossless"  # default
-        assert d["fallback_folder"] == ""  # default
 
     def test_to_dict_custom_service_params(self):
         node = PacsNode(name="X", hours=24, max_images=1000, sync_interval=300)
@@ -87,17 +68,6 @@ class TestPacsNode:
         assert d["max_images"] == 1000
         assert d["sync_interval"] == 300
 
-    def test_to_dict_custom_local_dest(self):
-        node = PacsNode(
-            name="X", local_ae_title="ARZT_4", local_port=11113,
-            local_syntax="JPEGLossless", fallback_folder="/data/incoming",
-        )
-        d = node.to_dict()
-        assert d["local_ae_title"] == "ARZT_4"
-        assert d["local_port"] == 11113
-        assert d["local_syntax"] == "JPEGLossless"
-        assert d["fallback_folder"] == "/data/incoming"
-
     def test_from_dict_full(self):
         data = {
             "name": "Remote", "ae_title": "REM_AE",
@@ -105,9 +75,6 @@ class TestPacsNode:
             "transfer_syntax": "ExplicitVRLittleEndian",
             "retrieve_method": "C-GET",
             "hours": 12, "max_images": 200, "sync_interval": 90,
-            "local_ae_title": "ARZT_4", "local_port": 11114,
-            "local_syntax": "JPEGLossless",
-            "fallback_folder": "/fallback",
         }
         node = PacsNode.from_dict(data)
         assert node.name == "Remote"
@@ -117,10 +84,6 @@ class TestPacsNode:
         assert node.hours == 12
         assert node.max_images == 200
         assert node.sync_interval == 90
-        assert node.local_ae_title == "ARZT_4"
-        assert node.local_port == 11114
-        assert node.local_syntax == "JPEGLossless"
-        assert node.fallback_folder == "/fallback"
 
     def test_from_dict_defaults(self):
         node = PacsNode.from_dict({})
@@ -131,10 +94,6 @@ class TestPacsNode:
         assert node.hours == 3
         assert node.max_images == 0
         assert node.sync_interval == 60
-        assert node.local_ae_title == "LOCAL_AE"
-        assert node.local_port == 11112
-        assert node.local_syntax == "JPEG2000Lossless"
-        assert node.fallback_folder == ""
 
     def test_roundtrip(self, sample_pacs_node):
         d = sample_pacs_node.to_dict()
@@ -145,10 +104,6 @@ class TestPacsNode:
         assert restored.hours == sample_pacs_node.hours
         assert restored.max_images == sample_pacs_node.max_images
         assert restored.sync_interval == sample_pacs_node.sync_interval
-        assert restored.local_ae_title == sample_pacs_node.local_ae_title
-        assert restored.local_port == sample_pacs_node.local_port
-        assert restored.local_syntax == sample_pacs_node.local_syntax
-        assert restored.fallback_folder == sample_pacs_node.fallback_folder
 
     def test_roundtrip_custom_service_params(self):
         node = PacsNode(
@@ -160,19 +115,6 @@ class TestPacsNode:
         assert restored.max_images == 9999
         assert restored.sync_interval == 10
 
-    def test_roundtrip_custom_local_dest(self):
-        node = PacsNode(
-            name="Test", ae_title="T_AE",
-            local_ae_title="MY_ARZT", local_port=22222,
-            local_syntax="JPEGLossless",
-            fallback_folder="/my/fallback",
-        )
-        restored = PacsNode.from_dict(node.to_dict())
-        assert restored.local_ae_title == "MY_ARZT"
-        assert restored.local_port == 22222
-        assert restored.local_syntax == "JPEGLossless"
-        assert restored.fallback_folder == "/my/fallback"
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AppConfig — basic properties
@@ -180,14 +122,17 @@ class TestPacsNode:
 
 class TestAppConfigDefaults:
 
-    def test_default_local_node_legacy(self, default_config):
-        """Legacy local_node property should return a sensible default."""
+    def test_default_local_node(self, default_config):
         assert default_config.local_node.name == "Local PACS"
         assert default_config.local_node.ae_title == "LOCAL_AE"
         assert default_config.local_node.port == 11112
 
     def test_default_remote_nodes_empty(self, default_config):
         assert default_config.remote_nodes == {}
+
+    def test_default_fallback(self, default_config):
+        assert default_config.fallback_storage_enabled is False
+        assert "DICOM_Incoming" in default_config.fallback_storage_path
 
     def test_default_prior_studies(self, default_config):
         assert default_config.prior_studies_count == 0
@@ -219,15 +164,9 @@ class TestAppConfigPersistence:
         populated_config.save()
         with open(populated_config.config_path) as f:
             data = json.load(f)
+        assert "local" in data
         assert "remotes" in data
         assert "filter_group_names" in data
-
-    def test_save_no_global_local_key(self, populated_config):
-        """New config should not write a top-level 'local' key."""
-        populated_config.save()
-        with open(populated_config.config_path) as f:
-            data = json.load(f)
-        assert "local" not in data
 
     def test_load_nonexistent_returns_false(self, tmp_config_path):
         config = AppConfig(config_path=tmp_config_path)
@@ -238,6 +177,10 @@ class TestAppConfigPersistence:
 
         loaded = AppConfig(config_path=populated_config.config_path)
         assert loaded.load() is True
+
+        # Local node
+        assert loaded.local_node.ae_title == "LOCAL_AE"
+        assert loaded.local_node.port == 11112
 
         # Remote nodes
         assert "ct" in loaded.remote_nodes
@@ -253,13 +196,9 @@ class TestAppConfigPersistence:
         assert loaded.remote_nodes["mri"].max_images == 1000
         assert loaded.remote_nodes["mri"].sync_interval == 300
 
-        # Per-source local destination
-        assert loaded.remote_nodes["ct"].local_ae_title == "LOCAL_AE"
-        assert loaded.remote_nodes["ct"].local_port == 11112
-        assert loaded.remote_nodes["ct"].fallback_folder == "/tmp/dicom_test"
-        assert loaded.remote_nodes["mri"].local_ae_title == "ARZT_4"
-        assert loaded.remote_nodes["mri"].local_port == 11113
-        assert loaded.remote_nodes["mri"].fallback_folder == "/tmp/dicom_test_mri"
+        # Fallback
+        assert loaded.fallback_storage_enabled is True
+        assert loaded.fallback_storage_path == "/tmp/dicom_test"
 
         # Prior studies
         assert loaded.prior_studies_count == 2
@@ -328,38 +267,6 @@ class TestAppConfigPersistence:
         assert config.remote_nodes["ct"].max_images == 999
         assert config.remote_nodes["ct"].sync_interval == 180
 
-    def test_migrate_old_local_to_per_source(self, tmp_config_path):
-        """Old config with global 'local' should migrate AE/port into each remote."""
-        old_data = {
-            "local": {
-                "name": "Local",
-                "ae_title": "MY_LOCAL",
-                "ip_address": "127.0.0.1",
-                "port": 22222,
-                "transfer_syntax": "JPEGLossless",
-            },
-            "remotes": {
-                "ct": {
-                    "name": "CT", "ae_title": "CT_AE",
-                    "ip_address": "10.0.0.1", "port": 104,
-                    "transfer_syntax": "JPEG2000Lossless",
-                    "retrieve_method": "C-MOVE",
-                    # No local_ae_title etc.
-                },
-            },
-            "fallback_storage_enabled": True,
-            "fallback_storage_path": "/old/fallback",
-        }
-        with open(tmp_config_path, "w") as f:
-            json.dump(old_data, f)
-        config = AppConfig(config_path=tmp_config_path)
-        assert config.load() is True
-        # Should have migrated local dest from old global local
-        assert config.remote_nodes["ct"].local_ae_title == "MY_LOCAL"
-        assert config.remote_nodes["ct"].local_port == 22222
-        assert config.remote_nodes["ct"].local_syntax == "JPEGLossless"
-        assert config.remote_nodes["ct"].fallback_folder == "/old/fallback"
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AppConfig — helper methods
@@ -371,25 +278,9 @@ class TestAppConfigHelpers:
         names = populated_config.get_remote_names()
         assert set(names) == {"ct", "mri"}
 
-    def test_get_local_dict_for_existing(self, populated_config):
-        d = populated_config.get_local_dict_for("ct")
-        assert d["ae_title"] == "LOCAL_AE"
-        assert d["port"] == 11112
-
-    def test_get_local_dict_for_mri(self, populated_config):
-        d = populated_config.get_local_dict_for("mri")
-        assert d["ae_title"] == "ARZT_4"
-        assert d["port"] == 11113
-
-    def test_get_local_dict_for_missing_key(self, populated_config):
-        d = populated_config.get_local_dict_for("nonexistent")
-        assert d["ae_title"] == "LOCAL_AE"  # fallback default
-        assert d["port"] == 11112
-
-    def test_get_local_dict_legacy(self, populated_config):
-        """Legacy get_local_dict() returns first source's local config."""
+    def test_get_local_dict(self, populated_config):
         d = populated_config.get_local_dict()
-        assert d["ae_title"] == "LOCAL_AE"  # from "ct" (first)
+        assert d["ae_title"] == "LOCAL_AE"
 
     def test_get_remote_dict_existing(self, populated_config):
         d = populated_config.get_remote_dict("ct")
@@ -399,21 +290,14 @@ class TestAppConfigHelpers:
     def test_get_remote_dict_missing(self, populated_config):
         assert populated_config.get_remote_dict("nonexistent") is None
 
-    def test_update_local_ip_caches(self, populated_config):
-        """update_local_ip() caches the IP so get_local_dict_for uses it."""
-        with patch("core.config.get_local_ip", return_value="10.0.0.99"):
-            populated_config.update_local_ip()
-        # After caching, get_local_dict_for should use the cached value
-        # even without patching get_local_ip anymore
-        d = populated_config.get_local_dict_for("ct")
-        assert d["ip_address"] == "10.0.0.99"
-
-    def test_update_local_ip_used_by_legacy(self, populated_config):
-        """Legacy get_local_dict also uses cached IP."""
-        with patch("core.config.get_local_ip", return_value="10.0.0.77"):
-            populated_config.update_local_ip()
-        d = populated_config.get_local_dict()
-        assert d["ip_address"] == "10.0.0.77"
+    def test_update_local_ip(self, populated_config):
+        """update_local_ip should save if IP changed."""
+        populated_config.local_node.ip_address = "0.0.0.0"
+        populated_config.save()
+        populated_config.update_local_ip()
+        # After update, ip should be different from 0.0.0.0
+        # (either real IP or 127.0.0.1)
+        assert populated_config.local_node.ip_address != "0.0.0.0"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

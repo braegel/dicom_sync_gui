@@ -1,6 +1,6 @@
 """
 Settings dialog for DICOM Sync GUI.
-Manages source PACS nodes (each with its own local destination) and general settings.
+Manages local PACS, source PACS nodes, storage fallback, and prior study settings.
 
 Source PACS workflow:
  - Editor fields are always enabled so the user can fill them in first.
@@ -26,14 +26,7 @@ from gui.styles import BTN_GREEN, BTN_BLUE
 
 
 class PacsNodeEditor(QWidget):
-    """Widget for editing a single source PACS node.
-
-    When *is_remote=True* (default), includes:
-      - Remote PACS connection fields (name, AE, IP, port, syntax, retrieve)
-      - Per-source service parameters (hours, max images, interval)
-      - Local destination fields (local AE, port, syntax, fallback folder)
-    When *is_remote=False* (legacy local editor), only basic fields are shown.
-    """
+    """Widget for editing a single PACS node."""
 
     def __init__(self, is_local: bool = False, parent=None):
         super().__init__(parent)
@@ -41,7 +34,6 @@ class PacsNodeEditor(QWidget):
         layout = QFormLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        # ── Remote PACS connection ──
         self.name_edit = QLineEdit()
         self.ae_title_edit = QLineEdit()
         self.ip_edit = QLineEdit()
@@ -67,19 +59,20 @@ class PacsNodeEditor(QWidget):
         self.hours_spin = None
         self.max_images_spin = None
         self.interval_spin = None
-        self.local_ae_edit = None
-        self.local_port_spin = None
-        self.local_syntax_combo = None
-        self.fallback_edit = None
-        self.fallback_btn = None
-
         if not is_local:
             self.retrieve_combo = QComboBox()
             self.retrieve_combo.addItems(RETRIEVE_METHODS)
             layout.addRow("Retrieve Method:", self.retrieve_combo)
 
-            # ── Per-source service parameters ──
-            self._add_separator(layout, "Service Parameters")
+            # Per-source service parameters
+            sep = QLabel("\u2500" * 30)
+            sep.setStyleSheet("QLabel { color: #666; }")
+            layout.addRow("", sep)
+
+            svc_label = QLabel("Service Parameters")
+            svc_label.setFont(QFont("", -1, QFont.Bold))
+            svc_label.setStyleSheet("QLabel { color: #2980b9; }")
+            layout.addRow("", svc_label)
 
             self.hours_spin = QSpinBox()
             self.hours_spin.setRange(1, 168)
@@ -100,55 +93,8 @@ class PacsNodeEditor(QWidget):
             self.interval_spin.setSuffix(" sec")
             layout.addRow("Query interval:", self.interval_spin)
 
-            # ── Local destination (C-MOVE target) ──
-            self._add_separator(layout, "Local Destination (C-MOVE Target)")
-
-            self.local_ae_edit = QLineEdit()
-            self.local_ae_edit.setPlaceholderText("AE title the source sends to")
-            layout.addRow("Local AE Title:", self.local_ae_edit)
-
-            self.local_port_spin = QSpinBox()
-            self.local_port_spin.setRange(1, 65535)
-            self.local_port_spin.setValue(11112)
-            layout.addRow("Local Port:", self.local_port_spin)
-
-            self.local_syntax_combo = QComboBox()
-            self.local_syntax_combo.addItems(TRANSFER_SYNTAXES_NAMES)
-            layout.addRow("Preferred Syntax:", self.local_syntax_combo)
-
-            self.fallback_edit = QLineEdit()
-            self.fallback_edit.setPlaceholderText(
-                "Folder to store images if no local PACS is reachable")
-            self.fallback_btn = QPushButton("Browse...")
-            self.fallback_btn.clicked.connect(self._browse_fallback)
-
-            fb_layout = QHBoxLayout()
-            fb_layout.setContentsMargins(0, 0, 0, 0)
-            fb_layout.addWidget(self.fallback_edit)
-            fb_layout.addWidget(self.fallback_btn)
-            fb_widget = QWidget()
-            fb_widget.setLayout(fb_layout)
-            layout.addRow("Fallback Folder:", fb_widget)
-
-    @staticmethod
-    def _add_separator(layout: QFormLayout, title: str):
-        sep = QLabel("\u2500" * 30)
-        sep.setStyleSheet("QLabel { color: #666; }")
-        layout.addRow("", sep)
-        lbl = QLabel(title)
-        lbl.setFont(QFont("", -1, QFont.Bold))
-        lbl.setStyleSheet("QLabel { color: #2980b9; }")
-        layout.addRow("", lbl)
-
     def _auto_detect_ip(self):
         self.ip_edit.setText(get_local_ip())
-
-    def _browse_fallback(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Select Fallback Folder",
-            self.fallback_edit.text() if self.fallback_edit else "")
-        if path:
-            self.fallback_edit.setText(path)
 
     def set_node(self, node: PacsNode):
         self.name_edit.setText(node.name)
@@ -168,16 +114,6 @@ class PacsNodeEditor(QWidget):
             self.max_images_spin.setValue(node.max_images)
         if self.interval_spin:
             self.interval_spin.setValue(node.sync_interval)
-        if self.local_ae_edit:
-            self.local_ae_edit.setText(node.local_ae_title)
-        if self.local_port_spin:
-            self.local_port_spin.setValue(node.local_port)
-        if self.local_syntax_combo:
-            idx = self.local_syntax_combo.findText(node.local_syntax)
-            if idx >= 0:
-                self.local_syntax_combo.setCurrentIndex(idx)
-        if self.fallback_edit:
-            self.fallback_edit.setText(node.fallback_folder)
 
     def get_node(self) -> PacsNode:
         return PacsNode(
@@ -194,14 +130,6 @@ class PacsNodeEditor(QWidget):
                         if self.max_images_spin else 0),
             sync_interval=(self.interval_spin.value()
                            if self.interval_spin else 60),
-            local_ae_title=(self.local_ae_edit.text().strip()
-                            if self.local_ae_edit else "LOCAL_AE"),
-            local_port=(self.local_port_spin.value()
-                        if self.local_port_spin else 11112),
-            local_syntax=(self.local_syntax_combo.currentText()
-                          if self.local_syntax_combo else "JPEG2000Lossless"),
-            fallback_folder=(self.fallback_edit.text().strip()
-                             if self.fallback_edit else ""),
         )
 
     def clear_fields(self):
@@ -218,14 +146,6 @@ class PacsNodeEditor(QWidget):
             self.max_images_spin.setValue(0)
         if self.interval_spin:
             self.interval_spin.setValue(60)
-        if self.local_ae_edit:
-            self.local_ae_edit.clear()
-        if self.local_port_spin:
-            self.local_port_spin.setValue(11112)
-        if self.local_syntax_combo:
-            self.local_syntax_combo.setCurrentIndex(0)
-        if self.fallback_edit:
-            self.fallback_edit.clear()
 
     def has_minimum_data(self) -> bool:
         """True if at least name and AE title are filled in."""
@@ -240,7 +160,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config = config
         self.setWindowTitle("Settings")
-        self.setMinimumSize(780, 640)
+        self.setMinimumSize(720, 580)
 
         # Internal tracking — must init before _setup_ui
         self._remote_keys: list = []
@@ -257,7 +177,31 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
 
-        # ── Tab 1: Source PACS ──
+        # ── Tab 1: Local PACS ──
+        local_tab = QWidget()
+        local_layout = QVBoxLayout(local_tab)
+        self.local_editor = PacsNodeEditor(is_local=True)
+        local_layout.addWidget(self.local_editor)
+
+        # Fallback storage
+        self.fallback_group = QGroupBox(
+            "Download to folder if local PACS is not available")
+        self.fallback_group.setCheckable(True)
+        self.fallback_group.setChecked(False)
+        fg = QHBoxLayout()
+        self.storage_edit = QLineEdit()
+        self.storage_edit.setPlaceholderText("Path to storage folder...")
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_storage)
+        fg.addWidget(self.storage_edit)
+        fg.addWidget(browse_btn)
+        self.fallback_group.setLayout(fg)
+        local_layout.addWidget(self.fallback_group)
+
+        local_layout.addStretch()
+        tabs.addTab(local_tab, "Local PACS")
+
+        # ── Tab 2: Source PACS ──
         remote_tab = QWidget()
         remote_layout = QHBoxLayout(remote_tab)
 
@@ -320,7 +264,7 @@ class SettingsDialog(QDialog):
         remote_layout.addLayout(right, 2)
         tabs.addTab(remote_tab, "Source PACS")
 
-        # ── Tab 2: General ──
+        # ── Tab 3: General ──
         general_tab = QWidget()
         gl = QFormLayout(general_tab)
 
@@ -379,6 +323,9 @@ class SettingsDialog(QDialog):
     # ── Config loading ────────────────────────────────────────────────────
 
     def _load_config(self):
+        self.local_editor.set_node(self.config.local_node)
+        self.fallback_group.setChecked(self.config.fallback_storage_enabled)
+        self.storage_edit.setText(self.config.fallback_storage_path)
         self.prior_spin.setValue(self.config.prior_studies_count)
         self.prior_modality_check.setChecked(
             self.config.prior_studies_same_modality)
@@ -497,6 +444,14 @@ class SettingsDialog(QDialog):
         self.remote_list.takeItem(row)
         self._switch_to_new_mode()
 
+    # ── Browse storage folder ────────────────────────────────────────────
+
+    def _browse_storage(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Storage Folder", self.storage_edit.text())
+        if path:
+            self.storage_edit.setText(path)
+
     # ── Save all settings ────────────────────────────────────────────────
 
     def _save(self):
@@ -507,7 +462,10 @@ class SettingsDialog(QDialog):
             return
 
         # Apply to config
+        self.config.local_node = self.local_editor.get_node()
         self.config.remote_nodes = dict(self._remote_nodes)
+        self.config.fallback_storage_enabled = self.fallback_group.isChecked()
+        self.config.fallback_storage_path = self.storage_edit.text().strip()
         self.config.prior_studies_count = self.prior_spin.value()
         self.config.prior_studies_same_modality = (
             self.prior_modality_check.isChecked())

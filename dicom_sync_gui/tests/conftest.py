@@ -44,9 +44,13 @@ def default_config(tmp_config_path):
 
 @pytest.fixture
 def populated_config(tmp_config_path):
-    """An AppConfig with remote nodes (including per-source local dest)
-    and filter groups pre-configured."""
+    """An AppConfig with remote nodes and filter groups pre-configured."""
     config = AppConfig(config_path=tmp_config_path)
+    config.local_node = PacsNode(
+        name="Local", ae_title="LOCAL_AE",
+        ip_address="127.0.0.1", port=11112,
+        transfer_syntax="JPEG2000Lossless",
+    )
     config.remote_nodes = {
         "ct": PacsNode(
             name="CT Scanner", ae_title="CT_AE",
@@ -54,9 +58,6 @@ def populated_config(tmp_config_path):
             transfer_syntax="JPEG2000Lossless",
             retrieve_method="C-MOVE",
             hours=3, max_images=0, sync_interval=60,
-            local_ae_title="LOCAL_AE", local_port=11112,
-            local_syntax="JPEG2000Lossless",
-            fallback_folder="/tmp/dicom_test",
         ),
         "mri": PacsNode(
             name="MRI Unit", ae_title="MRI_AE",
@@ -64,11 +65,10 @@ def populated_config(tmp_config_path):
             transfer_syntax="ExplicitVRLittleEndian",
             retrieve_method="C-GET",
             hours=24, max_images=1000, sync_interval=300,
-            local_ae_title="ARZT_4", local_port=11113,
-            local_syntax="ExplicitVRLittleEndian",
-            fallback_folder="/tmp/dicom_test_mri",
         ),
     }
+    config.fallback_storage_enabled = True
+    config.fallback_storage_path = "/tmp/dicom_test"
     config.prior_studies_count = 2
     config.prior_studies_same_modality = True
     config.filter_group_names = ["Group A", "Group B", "Group C"]
