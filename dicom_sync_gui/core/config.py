@@ -1,10 +1,6 @@
 """
 Configuration manager for DICOM Sync GUI.
 Handles loading/saving of PACS configurations and application preferences.
-
-Architecture: each source PACS node carries its own *local destination*
-settings (AE title, port, transfer syntax, fallback folder) so that
-C-MOVE responses are directed correctly per source.
 """
 
 import json
@@ -40,26 +36,18 @@ def get_local_ip() -> str:
 
 
 class PacsNode:
-    """Represents a source PACS node with per-source service *and* local
-    destination parameters.
+    """Represents a PACS node (local or remote).
 
-    Remote-specific fields:
-      - hours, max_images, sync_interval: service query parameters
-      - local_ae_title, local_port, local_syntax: where C-MOVE should
-        deliver images to (the local receiver for *this* source)
-      - fallback_folder: directory to save images when no local PACS is
-        reachable (a built-in SCP will be spawned automatically)
+    Remote nodes carry per-source service parameters so that each source
+    PACS can be queried with its own time window, image limit, and poll
+    interval.
     """
 
     def __init__(self, name: str = "", ae_title: str = "", ip_address: str = "",
                  port: int = 104, transfer_syntax: str = "JPEG2000Lossless",
                  retrieve_method: str = "C-MOVE",
                  hours: int = 3, max_images: int = 0,
-                 sync_interval: int = 60,
-                 local_ae_title: str = "LOCAL_AE",
-                 local_port: int = 11112,
-                 local_syntax: str = "JPEG2000Lossless",
-                 fallback_folder: str = ""):
+                 sync_interval: int = 60):
         self.name = name
         self.ae_title = ae_title
         self.ip_address = ip_address
@@ -70,11 +58,6 @@ class PacsNode:
         self.hours = hours
         self.max_images = max_images
         self.sync_interval = sync_interval
-        # Per-source local destination (C-MOVE target)
-        self.local_ae_title = local_ae_title
-        self.local_port = local_port
-        self.local_syntax = local_syntax
-        self.fallback_folder = fallback_folder
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -87,10 +70,6 @@ class PacsNode:
             "hours": self.hours,
             "max_images": self.max_images,
             "sync_interval": self.sync_interval,
-            "local_ae_title": self.local_ae_title,
-            "local_port": self.local_port,
-            "local_syntax": self.local_syntax,
-            "fallback_folder": self.fallback_folder,
         }
 
     @classmethod
@@ -105,10 +84,6 @@ class PacsNode:
             hours=data.get("hours", 3),
             max_images=data.get("max_images", 0),
             sync_interval=data.get("sync_interval", 60),
-            local_ae_title=data.get("local_ae_title", "LOCAL_AE"),
-            local_port=data.get("local_port", 11112),
-            local_syntax=data.get("local_syntax", "JPEG2000Lossless"),
-            fallback_folder=data.get("fallback_folder", ""),
         )
 
 
@@ -117,7 +92,18 @@ class AppConfig:
 
     def __init__(self, config_path: str = ""):
         self.config_path = config_path or self._default_config_path()
+        self.local_node = PacsNode(
+            name="Local PACS",
+            ae_title="LOCAL_AE",
+            ip_address=get_local_ip(),
+            port=11112,
+            transfer_syntax="JPEG2000Lossless",
+        )
         self.remote_nodes: Dict[str, PacsNode] = {}
+
+        # Fallback storage: download to folder if local PACS is not available
+        self.fallback_storage_enabled: bool = False
+        self.fallback_storage_path: str = os.path.expanduser("~/DICOM_Incoming")
 
         # Prior studies
         self.prior_studies_count: int = 0  # 0 = disabled
@@ -129,15 +115,11 @@ class AppConfig:
         self.active_filter_groups: List[str] = []  # groups selected in dashboard
         self.filter_groups_enabled: bool = False  # master switch in dashboard
 
-        # Legacy fields — kept for backward-compatible config loading.
-        # New code reads per-source values from PacsNode directly.
+        # Legacy: global service defaults are kept for backward-compatible
+        # config loading.  New code reads per-source values from PacsNode.
         self.default_hours: int = 3
-        self.max_images: int = 0
-        self.sync_interval: int = 60
-        # Legacy local node (used only during migration)
-        self._legacy_local_node: Optional[Dict[str, Any]] = None
-        self._legacy_fallback_enabled: bool = False
-        self._legacy_fallback_path: str = ""
+        self.max_images: int = 0  # 0 = no limit
+        self.sync_interval: int = 60  # seconds to wait between query cycles
 
     @staticmethod
     def _default_config_path() -> str:
@@ -161,28 +143,20 @@ class AppConfig:
             with open(self.config_path, "r") as f:
                 data = json.load(f)
 
+            if "local" in data:
+                self.local_node = PacsNode.from_dict(data["local"])
+
             self.remote_nodes = {}
             for key, val in data.get("remotes", {}).items():
                 self.remote_nodes[key] = PacsNode.from_dict(val)
 
-            # Migrate old single-remote format ("remote" dict → "remotes")
+            # Migrate old single-remote format
             if "remote" in data and "remotes" not in data:
                 self.remote_nodes["default"] = PacsNode.from_dict(data["remote"])
 
-            # Read legacy global values (needed for migration below)
-            self.default_hours = data.get("default_hours", 3)
-            self.max_images = data.get("max_images", 0)
-            self.sync_interval = data.get("sync_interval", 60)
-
-            # Legacy local node + fallback storage
-            legacy_local = data.get("local", {})
-            legacy_fallback_enabled = data.get("fallback_storage_enabled", False)
-            legacy_fallback_path = data.get(
-                "fallback_storage_path", os.path.expanduser("~/DICOM_Incoming"))
-            self._legacy_local_node = legacy_local
-            self._legacy_fallback_enabled = legacy_fallback_enabled
-            self._legacy_fallback_path = legacy_fallback_path
-
+            self.fallback_storage_enabled = data.get("fallback_storage_enabled", False)
+            self.fallback_storage_path = data.get("fallback_storage_path",
+                                                   os.path.expanduser("~/DICOM_Incoming"))
             self.prior_studies_count = data.get("prior_studies_count", 0)
             self.prior_studies_same_modality = data.get("prior_studies_same_modality", False)
             self.filter_group_names = data.get("filter_group_names", [])
@@ -192,27 +166,24 @@ class AppConfig:
                 "active_filter_groups", [])
             self.filter_groups_enabled = data.get(
                 "filter_groups_enabled", False)
+            self.default_hours = data.get("default_hours", 3)
+            self.max_images = data.get("max_images", 0)
+            self.sync_interval = data.get("sync_interval", 60)
 
-            # ── Migration: inject per-source fields from legacy globals ──
-            remotes_raw = data.get("remotes", {})
-            for key, node in self.remote_nodes.items():
-                raw = remotes_raw.get(key, {})
-                # Migrate service parameters
-                if "hours" not in raw:
-                    node.hours = self.default_hours
-                    node.max_images = self.max_images
-                    node.sync_interval = self.sync_interval
-                # Migrate local destination from old global local_node
-                if "local_ae_title" not in raw and legacy_local:
-                    node.local_ae_title = legacy_local.get("ae_title", "LOCAL_AE")
-                    node.local_port = legacy_local.get("port", 11112)
-                    node.local_syntax = legacy_local.get(
-                        "transfer_syntax", "JPEG2000Lossless")
-                    if legacy_fallback_enabled:
-                        node.fallback_folder = legacy_fallback_path
-
-            print(f"Config loaded: {len(self.remote_nodes)} source(s) — "
-                  f"{list(self.remote_nodes.keys())}")
+            # Migrate legacy global parameters into remote nodes that
+            # don't yet carry their own values (pre-per-source configs).
+            for node in self.remote_nodes.values():
+                d = data.get("remotes", {}).get("", {})  # won't match
+                # If the serialised node had no "hours" key, it comes
+                # from an old config → apply the global defaults.
+                # PacsNode.from_dict already provides defaults of 3/0/60,
+                # so we only need to overwrite when the global differs.
+                for remote_data in data.get("remotes", {}).values():
+                    if "hours" not in remote_data:
+                        node.hours = self.default_hours
+                        node.max_images = self.max_images
+                        node.sync_interval = self.sync_interval
+                        break
 
             return True
         except (json.JSONDecodeError, KeyError) as e:
@@ -223,14 +194,16 @@ class AppConfig:
         """Save configuration to file."""
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         data = {
+            "local": self.local_node.to_dict(),
             "remotes": {k: v.to_dict() for k, v in self.remote_nodes.items()},
+            "fallback_storage_enabled": self.fallback_storage_enabled,
+            "fallback_storage_path": self.fallback_storage_path,
             "prior_studies_count": self.prior_studies_count,
             "prior_studies_same_modality": self.prior_studies_same_modality,
             "filter_group_names": self.filter_group_names,
             "institution_assignments": self.institution_assignments,
             "active_filter_groups": self.active_filter_groups,
             "filter_groups_enabled": self.filter_groups_enabled,
-            # Legacy globals (kept for downgrade compatibility)
             "default_hours": self.default_hours,
             "max_images": self.max_images,
             "sync_interval": self.sync_interval,
@@ -241,70 +214,18 @@ class AppConfig:
     def get_remote_names(self) -> List[str]:
         return list(self.remote_nodes.keys())
 
+    def get_local_dict(self) -> Dict[str, Any]:
+        return self.local_node.to_dict()
+
     def get_remote_dict(self, name: str) -> Optional[Dict[str, Any]]:
         node = self.remote_nodes.get(name)
         return node.to_dict() if node else None
 
-    def get_local_dict_for(self, remote_key: str) -> Dict[str, Any]:
-        """Return the local destination dict for a specific source PACS.
-
-        This is used by DicomOperations as the 'local_config' and also as
-        the C-MOVE destination AE title.
-        """
-        ip = getattr(self, '_local_ip', None) or get_local_ip()
-        node = self.remote_nodes.get(remote_key)
-        if not node:
-            return {"ae_title": "LOCAL_AE", "ip_address": ip,
-                    "port": 11112, "transfer_syntax": "JPEG2000Lossless"}
-        return {
-            "ae_title": node.local_ae_title,
-            "ip_address": ip,
-            "port": node.local_port,
-            "transfer_syntax": node.local_syntax,
-        }
-
-    # ── Kept for backward compatibility with tests ────────────────────
-
-    @property
-    def local_node(self):
-        """Legacy property — returns a PacsNode-like object from the first
-        remote's local settings.  Only used in migration / tests."""
-        ip = getattr(self, '_local_ip', None) or get_local_ip()
-        if self.remote_nodes:
-            first = next(iter(self.remote_nodes.values()))
-            return PacsNode(
-                name="Local PACS",
-                ae_title=first.local_ae_title,
-                ip_address=ip,
-                port=first.local_port,
-                transfer_syntax=first.local_syntax,
-            )
-        return PacsNode(
-            name="Local PACS", ae_title="LOCAL_AE",
-            ip_address=ip, port=11112,
-        )
-
-    @local_node.setter
-    def local_node(self, value):
-        """Legacy setter — ignored. Local config is now per-source."""
-        pass
-
     def update_local_ip(self):
-        """Refresh the cached local IP for all per-source local destinations.
-
-        Called once at startup so that ``get_local_dict_for`` always returns
-        the current LAN address.
-        """
-        self._local_ip = get_local_ip()
-
-    def get_local_dict(self) -> Dict[str, Any]:
-        """Legacy — returns the first source's local config."""
-        if self.remote_nodes:
-            first_key = next(iter(self.remote_nodes))
-            return self.get_local_dict_for(first_key)
-        ip = getattr(self, '_local_ip', None) or get_local_ip()
-        return {"ae_title": "LOCAL_AE", "ip_address": ip,
-                "port": 11112, "transfer_syntax": "JPEG2000Lossless"}
+        new_ip = get_local_ip()
+        if self.local_node.ip_address != new_ip:
+            self.local_node.ip_address = new_ip
+            self.save()
 
     # ── Filter groups export / import ────────────────────────────────────
 

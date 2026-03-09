@@ -595,9 +595,8 @@ class TransferEngine:
 
     def _make_dicom_ops(self) -> DicomOperations:
         remote_node = self.config.remote_nodes[self.remote_key]
-        local_config = self.config.get_local_dict_for(self.remote_key)
         return DicomOperations(
-            local_config,
+            self.config.get_local_dict(),
             remote_node.to_dict(),
             self.remote_key,
         )

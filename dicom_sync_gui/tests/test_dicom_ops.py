@@ -139,21 +139,6 @@ class TestDicomOperationsInit:
         ops = DicomOperations(local_config, remote_config)
         assert ops.ae.ae_title == "LOCAL_AE"
 
-    def test_move_dest_uses_local_config(self, local_config, remote_config):
-        """C-MOVE destination should be the local_config (per-source)."""
-        ops = DicomOperations(local_config, remote_config)
-        assert ops.move_dest_config is local_config
-        assert ops.move_dest_config.get('ae_title') == 'LOCAL_AE'
-
-    def test_per_source_local_ae_used_for_move(self):
-        """When local_config has a custom AE, that's what C-MOVE uses."""
-        local = {"ae_title": "ARZT_4", "ip_address": "127.0.0.1", "port": 11113}
-        remote = {"ae_title": "R_AE", "ip_address": "10.0.0.1", "port": 104,
-                   "transfer_syntax": "JPEG2000Lossless"}
-        ops = DicomOperations(local, remote)
-        assert ops.ae.ae_title == "ARZT_4"
-        assert ops.move_dest_config.get('ae_title') == 'ARZT_4'
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DicomOperations — C-ECHO with mocked network

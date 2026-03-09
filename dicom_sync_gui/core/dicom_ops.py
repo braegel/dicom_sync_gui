@@ -63,10 +63,7 @@ class DicomOperations:
         self.remote_name = remote_name
         self.transfer_syntax = TRANSFER_SYNTAXES.get(
             remote_config.get('transfer_syntax', 'JPEG2000Lossless'), JPEG2000Lossless)
-        # C-MOVE destination is always the per-source local config.
-        # The local_config already contains the correct AE title, port, etc.
-        # for this specific source PACS.
-        self.move_dest_config = local_config
+        self.move_dest_config = remote_config.get('local_config', local_config)
 
         self.ae = AE(ae_title=local_config.get('ae_title', 'LOCAL_AE'))
         for ctx in [PatientRootQueryRetrieveInformationModelFind,

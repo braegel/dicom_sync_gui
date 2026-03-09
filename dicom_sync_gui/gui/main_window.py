@@ -6,7 +6,7 @@ with an independent download service, queue, and statistics.
 
 import logging
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox, QApplication,
@@ -34,8 +34,7 @@ class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
-        # Per-source SCPs keyed by (ae_title, port) tuple
-        self.storage_scps: Dict[Tuple[str, int], StorageSCP] = {}
+        self.storage_scp: Optional[StorageSCP] = None
         # Per-source engines and dashboards
         self.engines: Dict[str, TransferEngine] = {}
         self.dashboards: Dict[str, SourceDashboard] = {}
@@ -165,29 +164,26 @@ class MainWindow(QMainWindow):
 
         results = []
         for key, node in self.config.remote_nodes.items():
-            local_config = self.config.get_local_dict_for(key)
-            ops = DicomOperations(local_config, node.to_dict(), key)
+            ops = DicomOperations(
+                self.config.get_local_dict(), node.to_dict(), key)
             ok = ops.c_echo(target='remote')
             results.append(
                 f"  {key} ({node.name}): "
                 f"{'Reachable' if ok else 'Not reachable'}")
 
-        # Test each unique local destination
-        tested_locals = set()
-        for key, node in self.config.remote_nodes.items():
-            local_key = (node.local_ae_title, node.local_port)
-            if local_key in tested_locals:
-                continue
-            tested_locals.add(local_key)
-            local_config = self.config.get_local_dict_for(key)
-            ops = DicomOperations(local_config, node.to_dict(), key)
+        # Test local PACS
+        if self.config.remote_nodes:
+            first_key = next(iter(self.config.remote_nodes))
+            first_node = self.config.remote_nodes[first_key]
+            ops = DicomOperations(
+                self.config.get_local_dict(), first_node.to_dict(), first_key)
             local_ok = ops.c_echo(target='local')
             results.append(
-                f"\n  Local [{node.local_ae_title}:{node.local_port}]: "
+                f"\n  Local PACS: "
                 f"{'Reachable' if local_ok else 'Not reachable'}")
-            if not local_ok and node.fallback_folder:
+            if not local_ok and self.config.fallback_storage_enabled:
                 results.append(
-                    f"  Fallback: {node.fallback_folder}")
+                    f"  Fallback storage: {self.config.fallback_storage_path}")
 
         QMessageBox.information(
             self, "C-ECHO Results", "Results:\n" + "\n".join(results))
@@ -217,8 +213,8 @@ class MainWindow(QMainWindow):
         if not dashboard:
             return
 
-        # Ensure per-source SCP if local PACS is not reachable
-        self._ensure_storage_scp_for(remote_key)
+        # Ensure local storage / SCP
+        self._ensure_storage_scp()
 
         # Create engine for this source
         engine = TransferEngine(self.config, remote_key)
@@ -250,48 +246,39 @@ class MainWindow(QMainWindow):
             dashboard.set_service_running(False)
         self.statusBar().showMessage(f"Service stopped: {remote_key}")
 
-    # ── Per-source Storage SCP ────────────────────────────────────────────
+    # ── Storage SCP ───────────────────────────────────────────────────────
 
-    def _ensure_storage_scp_for(self, remote_key: str):
-        """Start a built-in SCP for this source if its local PACS is
-        not reachable and a fallback folder is configured."""
-        node = self.config.remote_nodes.get(remote_key)
-        if not node:
+    def _ensure_storage_scp(self):
+        """Start built-in SCP if no local DICOM server is reachable."""
+        if self.storage_scp and self.storage_scp.running:
             return
 
-        scp_key = (node.local_ae_title, node.local_port)
-
-        # Already running for this AE/port combo?
-        if scp_key in self.storage_scps and self.storage_scps[scp_key].running:
-            return
-
-        # Quick echo test against this source's local PACS
-        local_config = self.config.get_local_dict_for(remote_key)
-        ops = DicomOperations(local_config, node.to_dict(), remote_key)
-        local_reachable = ops.c_echo(target='local')
+        # Quick echo test against local PACS
+        local_reachable = False
+        if self.config.remote_nodes:
+            first_key = next(iter(self.config.remote_nodes))
+            first_node = self.config.remote_nodes[first_key]
+            ops = DicomOperations(
+                self.config.get_local_dict(), first_node.to_dict(), first_key)
+            local_reachable = ops.c_echo(target='local')
 
         if not local_reachable:
-            fallback = node.fallback_folder
-            if fallback:
-                import os
-                # Use a per-source subdirectory under the fallback folder
-                storage_path = os.path.join(fallback, remote_key)
-                self._log(
-                    f"Local PACS [{node.local_ae_title}:{node.local_port}] "
-                    f"not reachable for {remote_key}. "
-                    f"Starting built-in SCP — saving to: {storage_path}")
-                scp = StorageSCP(
-                    node.local_ae_title,
-                    node.local_port,
-                    storage_path,
-                )
-                scp.start()
-                self.storage_scps[scp_key] = scp
+            if self.config.fallback_storage_enabled:
+                storage_path = self.config.fallback_storage_path
+                self._log(f"Local PACS not reachable. "
+                          f"Saving to: {storage_path}")
             else:
-                self._log(
-                    f"Local PACS [{node.local_ae_title}:{node.local_port}] "
-                    f"not reachable for {remote_key}. "
-                    f"No fallback folder configured.")
+                storage_path = self.config.fallback_storage_path
+                self._log("Local PACS not reachable. "
+                          "Starting built-in Storage SCP...")
+
+            local = self.config.get_local_dict()
+            self.storage_scp = StorageSCP(
+                local.get('ae_title', 'LOCAL_AE'),
+                local.get('port', 11112),
+                storage_path,
+            )
+            self.storage_scp.start()
 
     # ── Engine signal wiring ──────────────────────────────────────────────
 
@@ -354,9 +341,8 @@ class MainWindow(QMainWindow):
             for engine in self.engines.values():
                 engine.stop()
 
-        for scp in self.storage_scps.values():
-            if scp.running:
-                scp.stop()
+        if self.storage_scp and self.storage_scp.running:
+            self.storage_scp.stop()
 
         self.log_window.close()
         event.accept()

@@ -41,8 +41,8 @@ class TestMainWindowInit:
     def test_engines_starts_empty(self):
         assert self.win.engines == {}
 
-    def test_storage_scps_starts_empty(self):
-        assert self.win.storage_scps == {}
+    def test_storage_scp_starts_none(self):
+        assert self.win.storage_scp is None
 
     def test_statusbar_ready(self):
         assert "Ready" in self.win.statusBar().currentMessage()
@@ -156,7 +156,7 @@ class TestMainWindowService:
         self.win = MainWindow(populated_config)
         self.config = populated_config
 
-    @patch.object(MainWindow, '_ensure_storage_scp_for')
+    @patch.object(MainWindow, '_ensure_storage_scp')
     @patch("gui.main_window.TransferEngine")
     def test_start_creates_engine_for_source(self, MockEngine, mock_scp):
         mock_engine = MagicMock()
@@ -170,19 +170,7 @@ class TestMainWindowService:
         mock_engine.start.assert_called_once_with(
             hours=6, max_images=500, sync_interval=120)
 
-    @patch.object(MainWindow, '_ensure_storage_scp_for')
-    @patch("gui.main_window.TransferEngine")
-    def test_start_calls_ensure_scp_for_source(self, MockEngine, mock_scp):
-        mock_engine = MagicMock()
-        mock_engine.signals = MagicMock()
-        MockEngine.return_value = mock_engine
-
-        self.win._on_start_service(
-            "ct", {"hours": 3, "max_images": 0, "sync_interval": 60})
-
-        mock_scp.assert_called_once_with("ct")
-
-    @patch.object(MainWindow, '_ensure_storage_scp_for')
+    @patch.object(MainWindow, '_ensure_storage_scp')
     @patch("gui.main_window.TransferEngine")
     def test_start_connects_signals(self, MockEngine, mock_scp):
         mock_engine = MagicMock()
@@ -330,69 +318,9 @@ class TestMainWindowCEcho:
 
         self.win._test_echo()
 
-        # Should call c_echo for each remote + each unique local dest
-        # 2 remotes + 2 unique local (different AE/port) = 4 echo calls
-        assert mock_ops.c_echo.call_count >= 3
+        # Should call c_echo for remote + local
+        assert mock_ops.c_echo.call_count >= 2
         mock_info.assert_called_once()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MainWindow — per-source SCP
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestMainWindowSCP:
-
-    @pytest.fixture(autouse=True)
-    def _create(self, populated_config, qapp):
-        self.win = MainWindow(populated_config)
-
-    @patch("gui.main_window.DicomOperations")
-    @patch("gui.main_window.StorageSCP")
-    def test_ensure_scp_starts_when_local_unreachable(
-        self, MockSCP, MockOps
-    ):
-        mock_ops = MagicMock()
-        mock_ops.c_echo.return_value = False  # local not reachable
-        MockOps.return_value = mock_ops
-
-        mock_scp = MagicMock()
-        mock_scp.running = False
-        MockSCP.return_value = mock_scp
-
-        self.win._ensure_storage_scp_for("ct")
-
-        MockSCP.assert_called_once()
-        mock_scp.start.assert_called_once()
-        # Should be stored keyed by (ae_title, port)
-        assert ("LOCAL_AE", 11112) in self.win.storage_scps
-
-    @patch("gui.main_window.DicomOperations")
-    def test_ensure_scp_skips_when_local_reachable(self, MockOps):
-        mock_ops = MagicMock()
-        mock_ops.c_echo.return_value = True  # local is reachable
-        MockOps.return_value = mock_ops
-
-        self.win._ensure_storage_scp_for("ct")
-
-        # No SCP should be started
-        assert len(self.win.storage_scps) == 0
-
-    @patch("gui.main_window.DicomOperations")
-    @patch("gui.main_window.StorageSCP")
-    def test_ensure_scp_reuses_existing(self, MockSCP, MockOps):
-        mock_ops = MagicMock()
-        mock_ops.c_echo.return_value = False
-        MockOps.return_value = mock_ops
-
-        # Pre-existing running SCP for same AE/port
-        existing_scp = MagicMock()
-        existing_scp.running = True
-        self.win.storage_scps[("LOCAL_AE", 11112)] = existing_scp
-
-        self.win._ensure_storage_scp_for("ct")
-
-        # Should not create a new SCP
-        MockSCP.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -430,12 +358,3 @@ class TestMainWindowClose:
         event = MagicMock()
         self.win.closeEvent(event)
         event.ignore.assert_called_once()
-
-    def test_close_stops_scps(self):
-        mock_scp = MagicMock()
-        mock_scp.running = True
-        self.win.storage_scps[("LOCAL_AE", 11112)] = mock_scp
-        event = MagicMock()
-        self.win.closeEvent(event)
-        mock_scp.stop.assert_called_once()
-        event.accept.assert_called_once()

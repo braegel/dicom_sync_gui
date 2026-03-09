@@ -12,7 +12,7 @@ from core.config import AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES, RETRIEVE_M
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PacsNodeEditor — local mode (legacy, minimal)
+# PacsNodeEditor
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestPacsNodeEditorLocal:
@@ -31,12 +31,6 @@ class TestPacsNodeEditorLocal:
         assert self.editor.hours_spin is None
         assert self.editor.max_images_spin is None
         assert self.editor.interval_spin is None
-
-    def test_no_local_dest_fields_for_local(self):
-        assert self.editor.local_ae_edit is None
-        assert self.editor.local_port_spin is None
-        assert self.editor.local_syntax_combo is None
-        assert self.editor.fallback_edit is None
 
     def test_syntax_combo_populated(self):
         items = [self.editor.syntax_combo.itemText(i)
@@ -97,10 +91,6 @@ class TestPacsNodeEditorLocal:
         assert self.editor.has_minimum_data() is False
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PacsNodeEditor — remote mode (with local destination)
-# ═══════════════════════════════════════════════════════════════════════════
-
 class TestPacsNodeEditorRemote:
 
     @pytest.fixture(autouse=True)
@@ -126,19 +116,6 @@ class TestPacsNodeEditorRemote:
         assert self.editor.max_images_spin.value() == 0
         assert self.editor.interval_spin.value() == 60
 
-    def test_has_local_dest_fields(self):
-        assert self.editor.local_ae_edit is not None
-        assert self.editor.local_port_spin is not None
-        assert self.editor.local_syntax_combo is not None
-        assert self.editor.fallback_edit is not None
-        assert self.editor.fallback_btn is not None
-
-    def test_default_local_dest_values(self):
-        assert self.editor.local_port_spin.value() == 11112
-        items = [self.editor.local_syntax_combo.itemText(i)
-                 for i in range(self.editor.local_syntax_combo.count())]
-        assert "JPEG2000Lossless" in items
-
     def test_set_node_with_retrieve_method(self):
         node = PacsNode(
             name="CT", ae_title="CT_AE",
@@ -159,20 +136,6 @@ class TestPacsNodeEditorRemote:
         assert self.editor.max_images_spin.value() == 1000
         assert self.editor.interval_spin.value() == 300
 
-    def test_set_node_with_local_dest(self):
-        node = PacsNode(
-            name="CT", ae_title="CT_AE",
-            ip_address="10.0.0.1", port=104,
-            local_ae_title="ARZT_4", local_port=11113,
-            local_syntax="ExplicitVRLittleEndian",
-            fallback_folder="/my/fallback",
-        )
-        self.editor.set_node(node)
-        assert self.editor.local_ae_edit.text() == "ARZT_4"
-        assert self.editor.local_port_spin.value() == 11113
-        assert self.editor.local_syntax_combo.currentText() == "ExplicitVRLittleEndian"
-        assert self.editor.fallback_edit.text() == "/my/fallback"
-
     def test_get_node_includes_retrieve_method(self):
         self.editor.name_edit.setText("MRI")
         self.editor.ae_title_edit.setText("MRI_AE")
@@ -191,19 +154,6 @@ class TestPacsNodeEditorRemote:
         assert node.max_images == 500
         assert node.sync_interval == 120
 
-    def test_get_node_includes_local_dest(self):
-        self.editor.name_edit.setText("CT")
-        self.editor.ae_title_edit.setText("CT_AE")
-        self.editor.local_ae_edit.setText("ARZT_4")
-        self.editor.local_port_spin.setValue(11113)
-        self.editor.local_syntax_combo.setCurrentText("JPEGLossless")
-        self.editor.fallback_edit.setText("/data/incoming")
-        node = self.editor.get_node()
-        assert node.local_ae_title == "ARZT_4"
-        assert node.local_port == 11113
-        assert node.local_syntax == "JPEGLossless"
-        assert node.fallback_folder == "/data/incoming"
-
     def test_clear_resets_to_first_retrieve(self):
         self.editor.retrieve_combo.setCurrentText("C-GET")
         self.editor.clear_fields()
@@ -219,15 +169,6 @@ class TestPacsNodeEditorRemote:
         assert self.editor.max_images_spin.value() == 0
         assert self.editor.interval_spin.value() == 60
 
-    def test_clear_resets_local_dest(self):
-        self.editor.local_ae_edit.setText("ARZT_4")
-        self.editor.local_port_spin.setValue(22222)
-        self.editor.fallback_edit.setText("/some/path")
-        self.editor.clear_fields()
-        assert self.editor.local_ae_edit.text() == ""
-        assert self.editor.local_port_spin.value() == 11112
-        assert self.editor.fallback_edit.text() == ""
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SettingsDialog — initialization and loading
@@ -241,6 +182,14 @@ class TestSettingsDialogInit:
 
     def test_window_title(self):
         assert self.dialog.windowTitle() == "Settings"
+
+    def test_local_editor_loaded(self):
+        assert self.dialog.local_editor.ae_title_edit.text() == "LOCAL_AE"
+        assert self.dialog.local_editor.port_spin.value() == 11112
+
+    def test_fallback_loaded(self):
+        assert self.dialog.fallback_group.isChecked() is True
+        assert self.dialog.storage_edit.text() == "/tmp/dicom_test"
 
     def test_prior_studies_loaded(self):
         assert self.dialog.prior_spin.value() == 2
@@ -281,21 +230,6 @@ class TestSettingsDialogWorkflow:
 
         assert self.dialog.remote_list.count() == 1
         assert "scanner1" in self.dialog._remote_keys
-
-    def test_add_new_preserves_local_dest(self):
-        self.dialog.key_edit.setText("ct")
-        self.dialog.remote_editor.name_edit.setText("CT")
-        self.dialog.remote_editor.ae_title_edit.setText("CT_AE")
-        self.dialog.remote_editor.local_ae_edit.setText("ARZT_4")
-        self.dialog.remote_editor.local_port_spin.setValue(11113)
-        self.dialog.remote_editor.fallback_edit.setText("/fallback")
-
-        self.dialog._add_remote()
-
-        node = self.dialog._remote_nodes["ct"]
-        assert node.local_ae_title == "ARZT_4"
-        assert node.local_port == 11113
-        assert node.fallback_folder == "/fallback"
 
     @patch("gui.settings_dialog.QMessageBox.warning")
     def test_add_new_missing_data(self, mock_warning):
@@ -362,24 +296,6 @@ class TestSettingsDialogWorkflow:
         self.dialog._save_changes_to_selected()
 
         assert self.dialog._remote_nodes["mri"].name == "MRI Unit Updated"
-
-    def test_save_changes_preserves_local_dest(self):
-        # Add entry
-        self.dialog.key_edit.setText("ct")
-        self.dialog.remote_editor.name_edit.setText("CT")
-        self.dialog.remote_editor.ae_title_edit.setText("CT_AE")
-        self.dialog.remote_editor.local_ae_edit.setText("ARZT_4")
-        self.dialog.remote_editor.local_port_spin.setValue(11113)
-        self.dialog._add_remote()
-
-        # Change local dest
-        self.dialog.remote_editor.local_ae_edit.setText("ARZT_5")
-        self.dialog.remote_editor.local_port_spin.setValue(22222)
-        self.dialog._save_changes_to_selected()
-
-        node = self.dialog._remote_nodes["ct"]
-        assert node.local_ae_title == "ARZT_5"
-        assert node.local_port == 22222
 
 
 # ═══════════════════════════════════════════════════════════════════════════
