@@ -15,10 +15,11 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QAction
 
 from core.transfer_engine import TransferStats
+from gui.styles import BTN_START, BTN_STOP
 
 
 class StatsLabel(QLabel):
-    """A label that is color-coded based on statistical deviation."""
+    """A label that is color-coded relative to the median-all baseline."""
 
     def __init__(self, text="\u2014", parent=None):
         super().__init__(text, parent)
@@ -32,14 +33,21 @@ class StatsLabel(QLabel):
         self.setMinimumHeight(50)
         self.setStyleSheet(self._style("white"))
 
-    def set_value(self, value: float, mean: float, std: float):
+    def set_value(self, value: float, median_all: float):
+        """Update text and colour.
+
+        *median_all* is the overall-median baseline.  A value more than
+        20 % above baseline is green; more than 20 % below is red;
+        everything else stays white.  If baseline is < 1 we don't
+        colour-code (not enough data).
+        """
         self.setText(f"{value:.0f}")
-        if std < 1 or mean < 1:
+        if median_all < 1 or value < 1:
             self.setStyleSheet(self._style("white"))
             return
-        if value > mean + std:
+        if value > median_all * 1.2:
             self.setStyleSheet(self._style("#2ecc71"))  # green
-        elif value < mean - std:
+        elif value < median_all * 0.8:
             self.setStyleSheet(self._style("#e74c3c"))  # red
         else:
             self.setStyleSheet(self._style("white"))
@@ -118,19 +126,13 @@ class TransferDashboard(QWidget):
         btn_layout = QVBoxLayout()
         self.btn_start = QPushButton("  Start Service  ")
         self.btn_start.setFont(QFont("", 11, QFont.Bold))
-        self.btn_start.setStyleSheet(
-            "QPushButton { background: #27ae60; color: white; padding: 10px 24px; "
-            "border-radius: 4px; } QPushButton:hover { background: #2ecc71; } "
-            "QPushButton:disabled { background: #7f8c8d; }")
+        self.btn_start.setStyleSheet(BTN_START)
         self.btn_start.clicked.connect(self._on_start_clicked)
 
         self.btn_stop = QPushButton("  Stop Service  ")
         self.btn_stop.setFont(QFont("", 11, QFont.Bold))
         self.btn_stop.setEnabled(False)
-        self.btn_stop.setStyleSheet(
-            "QPushButton { background: #c0392b; color: white; padding: 10px 24px; "
-            "border-radius: 4px; } QPushButton:hover { background: #e74c3c; } "
-            "QPushButton:disabled { background: #7f8c8d; }")
+        self.btn_stop.setStyleSheet(BTN_STOP)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
 
         btn_layout.addWidget(self.btn_start)
@@ -197,7 +199,8 @@ class TransferDashboard(QWidget):
         stats_group = QGroupBox("Transfer Speed (images / minute)")
         sl = QGridLayout()
 
-        for col, label in enumerate(["1 min", "5 min", "10 min", "Overall"], 1):
+        for col, label in enumerate(
+                ["Last Series", "Median 5", "Median 10", "Median All"], 1):
             lbl = QLabel(label)
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setFont(QFont("", 10, QFont.Bold))
@@ -205,22 +208,15 @@ class TransferDashboard(QWidget):
 
         sl.addWidget(QLabel("Rate:"), 1, 0)
 
-        self.stat_1min = StatsLabel()
-        self.stat_5min = StatsLabel()
-        self.stat_10min = StatsLabel()
-        self.stat_total = StatsLabel()
+        self.stat_last = StatsLabel()
+        self.stat_med5 = StatsLabel()
+        self.stat_med10 = StatsLabel()
+        self.stat_medall = StatsLabel()
 
-        sl.addWidget(self.stat_1min, 1, 1)
-        sl.addWidget(self.stat_5min, 1, 2)
-        sl.addWidget(self.stat_10min, 1, 3)
-        sl.addWidget(self.stat_total, 1, 4)
-
-        self.lbl_mean = QLabel("Mean: \u2014")
-        self.lbl_std = QLabel("Std Dev: \u2014")
-        self.lbl_mean.setAlignment(Qt.AlignCenter)
-        self.lbl_std.setAlignment(Qt.AlignCenter)
-        sl.addWidget(self.lbl_mean, 2, 1, 1, 2)
-        sl.addWidget(self.lbl_std, 2, 3, 1, 2)
+        sl.addWidget(self.stat_last, 1, 1)
+        sl.addWidget(self.stat_med5, 1, 2)
+        sl.addWidget(self.stat_med10, 1, 3)
+        sl.addWidget(self.stat_medall, 1, 4)
 
         stats_group.setLayout(sl)
         layout.addWidget(stats_group)
@@ -230,10 +226,10 @@ class TransferDashboard(QWidget):
         tl = QVBoxLayout()
 
         self.series_table = QTableWidget()
-        self.series_table.setColumnCount(8)
+        self.series_table.setColumnCount(9)
         self.series_table.setHorizontalHeaderLabels([
             "Patient", "Study", "Series", "Modality",
-            "Images", "Pending", "Status", "ETE"
+            "Images", "Pending", "img/min", "Status", "ETE"
         ])
         header = self.series_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -244,6 +240,7 @@ class TransferDashboard(QWidget):
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
         self.series_table.setAlternatingRowColors(True)
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.series_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -390,6 +387,20 @@ class TransferDashboard(QWidget):
         return ipm / 60.0 if ipm > 0 else 0.0
 
     @staticmethod
+    def _compute_cumulative_pending(queue: list) -> list:
+        """Return a list of cumulative pending-image counts per queue row."""
+        running_sum = 0
+        cumulative = []
+        for job in queue:
+            if job["status"] in ("done", "error", "skipped"):
+                running_sum += 0
+            else:
+                pending = job["remote_count"] - job["local_count"]
+                running_sum += max(pending, 0)
+            cumulative.append(running_sum)
+        return cumulative
+
+    @staticmethod
     def _format_ete(seconds: float) -> str:
         """Format seconds into mm:ss or hh:mm:ss."""
         if seconds <= 0:
@@ -413,28 +424,7 @@ class TransferDashboard(QWidget):
 
         self.series_table.setRowCount(0)
         done_count = 0
-        cumulative_pending = 0  # images still to transfer from here down
-
-        # First pass: count total pending for cumulative ETE
-        # We accumulate from the current item downward
-        # So we need to know which items are not yet done
-        pending_list = []
-        for job in queue:
-            if job["status"] in ("done", "error", "skipped"):
-                pending_list.append(0)
-            else:
-                pending = job["remote_count"] - job["local_count"]
-                pending_list.append(max(pending, 0))
-
-        # Cumulative from bottom: for each row, ETE = time to finish
-        # this row + all rows below it that are still pending.
-        # Actually: cumulative from top for "when will THIS series be done"
-        # = sum of pending images from current transferring item through this row
-        cumulative = []
-        running_sum = 0
-        for p in pending_list:
-            running_sum += p
-            cumulative.append(running_sum)
+        cumulative = self._compute_cumulative_pending(queue)
 
         for i, job in enumerate(queue):
             row = self.series_table.rowCount()
@@ -455,10 +445,21 @@ class TransferDashboard(QWidget):
             pending_item = QTableWidgetItem(str(max(pending, 0)))
             self.series_table.setItem(row, 5, pending_item)
 
+            # img/min column
+            ipm = job.get("images_per_minute", 0.0)
             status = job["status"]
+            if status == "done" and ipm > 0:
+                ipm_item = QTableWidgetItem(f"{ipm:.0f}")
+                ipm_item.setForeground(QColor("#3498db"))
+            else:
+                ipm_item = QTableWidgetItem("\u2014")
+                ipm_item.setForeground(QColor("#969696"))
+            ipm_item.setTextAlignment(Qt.AlignCenter)
+            self.series_table.setItem(row, 6, ipm_item)
+
             status_item = QTableWidgetItem(self._status_text(status))
             status_item.setForeground(self._status_color(status))
-            self.series_table.setItem(row, 6, status_item)
+            self.series_table.setItem(row, 7, status_item)
 
             # ETE column
             if status in ("done", "error", "skipped"):
@@ -476,7 +477,7 @@ class TransferDashboard(QWidget):
                 ete_item = QTableWidgetItem("\u2014")
                 ete_item.setForeground(QColor("#969696"))
             ete_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(row, 7, ete_item)
+            self.series_table.setItem(row, 8, ete_item)
 
             if status == "done":
                 done_count += 1
@@ -488,16 +489,6 @@ class TransferDashboard(QWidget):
         self.lbl_status.setText(
             f"Transferring: {info['patient_name']} \u2014 "
             f"[{info.get('modality', '')}] {info['series_description']}")
-
-    def on_series_progress(self, series_uid: str, transferred: int,
-                           total: int):
-        pass  # Queue table is updated via queue_updated signal
-
-    def on_series_completed(self, series_uid: str, total_images: int):
-        pass  # Queue table is updated via queue_updated signal
-
-    def on_series_error(self, series_uid: str, error_msg: str):
-        pass  # Queue table is updated via queue_updated signal
 
     def on_stats_updated(self, stats: TransferStats):
         self._current_stats = stats
@@ -523,44 +514,26 @@ class TransferDashboard(QWidget):
 
     def _refresh_stats_display(self):
         stats = self._current_stats
-        if not stats or stats.total_images == 0:
+        if not stats or stats.completed_count == 0:
             return
 
-        mean, std = stats.overall_mean_and_std()
+        median_all = stats.median_all_ipm()
+        last = stats.last_series_ipm()
+        med5 = stats.median_n_ipm(5)
+        med10 = stats.median_n_ipm(10)
 
-        rate_1 = stats.images_per_minute(1)
-        rate_5 = stats.images_per_minute(5)
-        rate_10 = stats.images_per_minute(10)
-        rate_total = stats.overall_images_per_minute()
+        self.stat_last.set_value(last, median_all)
+        self.stat_med5.set_value(med5, median_all)
+        self.stat_med10.set_value(med10, median_all)
+        self.stat_medall.set_value(median_all, median_all)
 
-        self.stat_1min.set_value(rate_1, mean, std)
-        self.stat_5min.set_value(rate_5, mean, std)
-        self.stat_10min.set_value(rate_10, mean, std)
-        self.stat_total.set_value(rate_total, mean, std)
-
-        self.lbl_mean.setText(f"Mean: {mean:.0f} img/min")
-        self.lbl_std.setText(f"Std Dev: {std:.0f} img/min")
         self.lbl_total_images.setText(f"Total: {stats.total_images} images")
 
     def _update_ete_column(self):
         """Update only the ETE column without rebuilding the whole table."""
         rate = self._get_rate()
         queue = self._last_queue
-
-        # Recalculate cumulative pending
-        pending_list = []
-        for job in queue:
-            if job["status"] in ("done", "error", "skipped"):
-                pending_list.append(0)
-            else:
-                pending = job["remote_count"] - job["local_count"]
-                pending_list.append(max(pending, 0))
-
-        running_sum = 0
-        cumulative = []
-        for p in pending_list:
-            running_sum += p
-            cumulative.append(running_sum)
+        cumulative = self._compute_cumulative_pending(queue)
 
         for i, job in enumerate(queue):
             if i >= self.series_table.rowCount():
@@ -581,7 +554,7 @@ class TransferDashboard(QWidget):
                 ete_item = QTableWidgetItem("\u2014")
                 ete_item.setForeground(QColor("#969696"))
             ete_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(i, 7, ete_item)
+            self.series_table.setItem(i, 8, ete_item)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -609,12 +582,10 @@ class TransferDashboard(QWidget):
         self.series_table.setRowCount(0)
         self._current_stats = None
         self._last_queue = []
-        self.stat_1min.setText("\u2014")
-        self.stat_5min.setText("\u2014")
-        self.stat_10min.setText("\u2014")
-        self.stat_total.setText("\u2014")
-        self.lbl_mean.setText("Mean: \u2014")
-        self.lbl_std.setText("Std Dev: \u2014")
+        self.stat_last.setText("\u2014")
+        self.stat_med5.setText("\u2014")
+        self.stat_med10.setText("\u2014")
+        self.stat_medall.setText("\u2014")
         self.lbl_total_images.setText("Total: 0 images")
         self.lbl_total_series.setText("Series: 0")
         self.lbl_cycle.setText("Cycle: \u2014")

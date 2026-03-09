@@ -192,3 +192,61 @@ class AppConfig:
         if self.local_node.ip_address != new_ip:
             self.local_node.ip_address = new_ip
             self.save()
+
+    # ── Filter groups export / import ────────────────────────────────────
+
+    def export_filter_groups(self, path: str):
+        """Export filter group names and institution assignments to a JSON file."""
+        data = {
+            "filter_group_names": list(self.filter_group_names),
+            "institution_assignments": dict(self.institution_assignments),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def import_filter_groups(self, path: str, merge: bool = False) -> dict:
+        """Import filter groups and institution assignments from a JSON file.
+
+        Args:
+            path: Path to the JSON file.
+            merge: If *True*, merge with existing data (new groups are added,
+                   existing institution assignments are overwritten by the
+                   imported values).  If *False* (default), replace entirely.
+
+        Returns:
+            A summary dict with keys *groups_added*, *institutions_added*,
+            and *institutions_updated*.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        imported_groups: List[str] = data.get("filter_group_names", [])
+        imported_assignments: Dict[str, str] = data.get(
+            "institution_assignments", {})
+
+        summary = {
+            "groups_added": 0,
+            "institutions_added": 0,
+            "institutions_updated": 0,
+        }
+
+        if merge:
+            for g in imported_groups:
+                if g not in self.filter_group_names:
+                    self.filter_group_names.append(g)
+                    summary["groups_added"] += 1
+            for inst, grp in imported_assignments.items():
+                if inst in self.institution_assignments:
+                    if self.institution_assignments[inst] != grp:
+                        self.institution_assignments[inst] = grp
+                        summary["institutions_updated"] += 1
+                else:
+                    self.institution_assignments[inst] = grp
+                    summary["institutions_added"] += 1
+        else:
+            summary["groups_added"] = len(imported_groups)
+            summary["institutions_added"] = len(imported_assignments)
+            self.filter_group_names = imported_groups
+            self.institution_assignments = imported_assignments
+
+        return summary

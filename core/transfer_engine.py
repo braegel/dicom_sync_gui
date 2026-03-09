@@ -5,10 +5,8 @@ Emits Qt signals so the GUI can display queue and progress in real time.
 """
 
 import logging
-import math
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -39,6 +37,7 @@ class SeriesJob:
     local_count: int = 0
     status: str = "queued"  # queued, transferring, done, error, skipped
     institution_name: str = ""
+    images_per_minute: float = 0.0
 
     @property
     def to_transfer(self) -> int:
@@ -58,106 +57,106 @@ class SeriesJob:
             "local_count": self.local_count,
             "status": self.status,
             "institution_name": self.institution_name,
+            "images_per_minute": self.images_per_minute,
         }
 
 
 @dataclass
+class SeriesCompletionRecord:
+    """Stores the measured speed for one completed series."""
+    series_uid: str = ""
+    image_count: int = 0
+    duration_seconds: float = 0.0
+    images_per_minute: float = 0.0
+
+
+@dataclass
 class TransferStats:
-    """Throughput statistics."""
-    _timestamps: deque = field(default_factory=lambda: deque(maxlen=10000))
+    """Per-series throughput statistics with median aggregation.
+
+    Only series with at least ``MIN_IMAGES_FOR_STATS`` images are
+    included in the speed statistics.  Smaller series are still counted
+    towards ``total_images`` but their transfer speed is too noisy to
+    be meaningful.
+    """
+    MIN_IMAGES_FOR_STATS: int = 10
+
     total_images: int = 0
     start_time: float = 0.0
-    _active_periods: list = field(default_factory=list)
-    _current_active_start: Optional[float] = None
+    _completed_series: List["SeriesCompletionRecord"] = field(
+        default_factory=list)
 
     def start_session(self):
         self.start_time = time.time()
         self.total_images = 0
-        self._timestamps.clear()
-        self._active_periods = []
-        self._current_active_start = None
+        self._completed_series = []
 
-    def mark_active(self):
-        if self._current_active_start is None:
-            self._current_active_start = time.time()
+    def record_series(self, series_uid: str, image_count: int,
+                      duration_seconds: float):
+        """Record a completed series transfer with its measured speed.
 
-    def mark_idle(self):
-        if self._current_active_start is not None:
-            self._active_periods.append(
-                (self._current_active_start, time.time()))
-            self._current_active_start = None
+        The series is always appended (so ``completed_count`` reflects
+        every finished transfer), but series below
+        ``MIN_IMAGES_FOR_STATS`` images are flagged so the statistics
+        methods can skip them.
+        """
+        self.total_images += image_count
+        ipm = (image_count / duration_seconds) * 60 if duration_seconds > 0 else 0.0
+        self._completed_series.append(SeriesCompletionRecord(
+            series_uid=series_uid,
+            image_count=image_count,
+            duration_seconds=duration_seconds,
+            images_per_minute=ipm,
+        ))
 
-    def record_image(self, count: int = 1):
-        now = time.time()
-        self._timestamps.append((now, count))
-        self.total_images += count
+    @property
+    def completed_count(self) -> int:
+        return len(self._completed_series)
 
-    def _active_seconds_in_window(self, window_seconds: float) -> float:
-        now = time.time()
-        cutoff = now - window_seconds
-        total = 0.0
-        for start, end in self._active_periods:
-            if end < cutoff:
-                continue
-            s = max(start, cutoff)
-            total += end - s
-        if self._current_active_start is not None:
-            s = max(self._current_active_start, cutoff)
-            total += now - s
-        return max(total, 0.001)
+    @property
+    def _stats_series(self) -> List["SeriesCompletionRecord"]:
+        """Completed series that qualify for speed statistics."""
+        return [r for r in self._completed_series
+                if r.image_count >= self.MIN_IMAGES_FOR_STATS]
 
-    def _images_in_window(self, window_seconds: float) -> int:
-        cutoff = time.time() - window_seconds
-        return sum(c for t, c in self._timestamps if t >= cutoff)
+    def last_series_ipm(self) -> float:
+        """Images/minute for the most recently completed qualifying series."""
+        qualifying = self._stats_series
+        if not qualifying:
+            return 0.0
+        return qualifying[-1].images_per_minute
 
-    def images_per_minute(self, window_minutes: float) -> float:
-        window_sec = window_minutes * 60
-        images = self._images_in_window(window_sec)
-        active_sec = self._active_seconds_in_window(window_sec)
-        return (images / active_sec) * 60
+    @staticmethod
+    def _median(values: List[float]) -> float:
+        if not values:
+            return 0.0
+        s = sorted(values)
+        n = len(s)
+        mid = n // 2
+        if n % 2 == 1:
+            return s[mid]
+        return (s[mid - 1] + s[mid]) / 2
+
+    def median_n_ipm(self, n: int) -> float:
+        """Median images/minute over the last *n* qualifying series."""
+        qualifying = self._stats_series
+        if not qualifying:
+            return 0.0
+        recent = qualifying[-n:]
+        return self._median([r.images_per_minute for r in recent])
+
+    def median_all_ipm(self) -> float:
+        """Median images/minute across all qualifying series."""
+        return self._median(
+            [r.images_per_minute for r in self._stats_series])
 
     def overall_images_per_minute(self) -> float:
-        if self.start_time == 0:
-            return 0.0
-        total_active = sum(end - start for start, end in self._active_periods)
-        if self._current_active_start is not None:
-            total_active += time.time() - self._current_active_start
-        if total_active < 1:
-            return 0.0
-        return (self.total_images / total_active) * 60
+        """Overall images/minute (used for ETE calculation).
 
-    def overall_mean_and_std(self) -> Tuple[float, float]:
-        if self.start_time == 0 or self.total_images == 0:
-            return 0.0, 0.0
-        if not self._timestamps:
-            return 0.0, 0.0
-        buckets = []
-        now = time.time()
-        bucket_size = 10
-        earliest = self._timestamps[0][0] if self._timestamps else now
-        t = earliest
-        while t < now:
-            bucket_end = t + bucket_size
-            count = sum(c for ts, c in self._timestamps if t <= ts < bucket_end)
-            active_in_bucket = False
-            for start, end in self._active_periods:
-                if start < bucket_end and end > t:
-                    active_in_bucket = True
-                    break
-            if (self._current_active_start is not None
-                    and self._current_active_start < bucket_end):
-                active_in_bucket = True
-            if active_in_bucket and count > 0:
-                buckets.append(count * (60.0 / bucket_size))
-            t = bucket_end
-        if not buckets:
-            return self.overall_images_per_minute(), 0.0
-        mean = sum(buckets) / len(buckets)
-        if len(buckets) < 2:
-            return mean, 0.0
-        variance = sum((x - mean) ** 2 for x in buckets) / (len(buckets) - 1)
-        std = math.sqrt(variance)
-        return mean, std
+        Returns the median over all qualifying series.  Falls back to 0
+        when no qualifying series have finished yet.
+        """
+        return self.median_all_ipm()
 
 
 # ---------------------------------------------------------------------------
@@ -283,99 +282,14 @@ class TransferEngine:
         all_jobs: List[SeriesJob] = []
         seen_series: Set[str] = set()
 
-        for remote_key, remote_node in self.config.remote_nodes.items():
+        for remote_key in self.config.remote_nodes:
             if self._cancel.is_set():
                 break
             try:
-                dicom_ops = self._make_dicom_ops(remote_key)
-                self._log(f"Querying {remote_key}...")
-                studies_raw = dicom_ops.c_find_studies(study_date=date_range)
-
-                # Filter by time
-                studies = []
-                for s in studies_raw:
-                    try:
-                        dt_str = (f"{getattr(s, 'StudyDate', '')}"
-                                  f"{getattr(s, 'StudyTime', '000000')[:6]}")
-                        if datetime.strptime(dt_str, '%Y%m%d%H%M%S') >= cutoff:
-                            studies.append(s)
-                    except ValueError:
-                        studies.append(s)
-
-                self._log(f"  {remote_key}: {len(studies)} studies in time window")
-
-                for study_ds in studies:
-                    if self._cancel.is_set():
-                        break
-                    study_uid = getattr(study_ds, 'StudyInstanceUID', '')
-                    patient_name = str(getattr(study_ds, 'PatientName', 'Unknown'))
-                    patient_id = getattr(study_ds, 'PatientID', '')
-                    study_desc = getattr(study_ds, 'StudyDescription', 'N/A')
-                    institution = str(
-                        getattr(study_ds, 'InstitutionName', '')).strip()
-
-                    # Query series (also used for institution fallback)
-                    series_list = dicom_ops.c_find_series(study_uid)
-
-                    # InstitutionName is often not at study level.
-                    # Fallback: read it from the first series.
-                    if not institution and series_list:
-                        institution = str(
-                            getattr(series_list[0],
-                                    'InstitutionName', '')).strip()
-
-                    # ── Filter by institution group ──
-                    if not self._passes_institution_filter(institution):
-                        continue
-
-                    local_series = {}
-                    try:
-                        for ls in dicom_ops.c_find_local_series(study_uid):
-                            uid = getattr(ls, 'SeriesInstanceUID', '')
-                            cnt = int(getattr(ls, 'NumberOfSeriesRelatedInstances', 0) or 0)
-                            if uid:
-                                local_series[uid] = cnt
-                    except Exception:
-                        pass
-
-                    for ser in series_list:
-                        series_uid = getattr(ser, 'SeriesInstanceUID', '')
-                        if series_uid in seen_series:
-                            continue
-                        remote_count = int(
-                            getattr(ser, 'NumberOfSeriesRelatedInstances', 0) or 0)
-                        local_count = local_series.get(series_uid, 0)
-
-                        if remote_count == 0 or local_count >= remote_count:
-                            continue
-                        if max_images > 0 and remote_count > max_images:
-                            continue
-                        missing = remote_count - local_count
-                        if remote_count > 10 and missing <= 2:
-                            continue
-
-                        seen_series.add(series_uid)
-                        job = SeriesJob(
-                            patient_name=patient_name,
-                            patient_id=patient_id,
-                            study_description=study_desc,
-                            series_description=getattr(ser, 'SeriesDescription', 'N/A'),
-                            modality=getattr(ser, 'Modality', 'UN'),
-                            series_number=str(getattr(ser, 'SeriesNumber', '')),
-                            study_uid=study_uid,
-                            series_uid=series_uid,
-                            remote_count=remote_count,
-                            local_count=local_count,
-                            institution_name=institution,
-                        )
-                        all_jobs.append(job)
-
-                # Handle prior studies
-                if self.config.prior_studies_count > 0:
-                    prior_jobs = self._resolve_priors(
-                        dicom_ops, studies, seen_series, max_images)
-                    all_jobs.extend(prior_jobs)
-
+                jobs = self._query_source(
+                    remote_key, date_range, cutoff,
+                    max_images, seen_series)
+                all_jobs.extend(jobs)
             except Exception as e:
                 self._log(f"  Error querying {remote_key}: {e}")
 
@@ -394,10 +308,98 @@ class TransferEngine:
             if self._cancel.is_set():
                 break
             total_images += self._transfer_series(job)
-            # Update queue after each series
             self.signals.queue_updated.emit([j.to_dict() for j in all_jobs])
 
         return total_images
+
+    def _query_source(self, remote_key: str, date_range: str,
+                      cutoff: datetime, max_images: int,
+                      seen_series: Set[str]) -> List[SeriesJob]:
+        """Query one source PACS and return new SeriesJob items."""
+        dicom_ops = self._make_dicom_ops(remote_key)
+        self._log(f"Querying {remote_key}...")
+        studies_raw = dicom_ops.c_find_studies(study_date=date_range)
+
+        # Filter by time
+        studies = []
+        for s in studies_raw:
+            try:
+                dt_str = (f"{getattr(s, 'StudyDate', '')}"
+                          f"{getattr(s, 'StudyTime', '000000')[:6]}")
+                if datetime.strptime(dt_str, '%Y%m%d%H%M%S') >= cutoff:
+                    studies.append(s)
+            except ValueError:
+                studies.append(s)
+
+        self._log(f"  {remote_key}: {len(studies)} studies in time window")
+
+        jobs: List[SeriesJob] = []
+        for study_ds in studies:
+            if self._cancel.is_set():
+                break
+            jobs.extend(self._build_study_jobs(
+                dicom_ops, study_ds, seen_series, max_images))
+
+        # Handle prior studies
+        if self.config.prior_studies_count > 0:
+            prior_jobs = self._resolve_priors(
+                dicom_ops, studies, seen_series, max_images)
+            jobs.extend(prior_jobs)
+
+        return jobs
+
+    def _build_study_jobs(
+            self, dicom_ops: DicomOperations, study_ds,
+            seen_series: Set[str], max_images: int) -> List[SeriesJob]:
+        """Build SeriesJob items for one study."""
+        study_uid = getattr(study_ds, 'StudyInstanceUID', '')
+        patient_name = str(getattr(study_ds, 'PatientName', 'Unknown'))
+        patient_id = getattr(study_ds, 'PatientID', '')
+        study_desc = getattr(study_ds, 'StudyDescription', 'N/A')
+        institution = str(
+            getattr(study_ds, 'InstitutionName', '')).strip()
+
+        series_list = dicom_ops.c_find_series(study_uid)
+
+        # InstitutionName fallback: read from first series
+        if not institution and series_list:
+            institution = str(
+                getattr(series_list[0], 'InstitutionName', '')).strip()
+
+        if not self._passes_institution_filter(institution):
+            return []
+
+        local_series = self._fetch_local_series_counts(
+            dicom_ops, study_uid)
+
+        jobs: List[SeriesJob] = []
+        for ser in series_list:
+            series_uid = getattr(ser, 'SeriesInstanceUID', '')
+            if series_uid in seen_series:
+                continue
+            remote_count = int(
+                getattr(ser, 'NumberOfSeriesRelatedInstances', 0) or 0)
+            local_count = local_series.get(series_uid, 0)
+
+            if self._should_skip_series(
+                    remote_count, local_count, max_images):
+                continue
+
+            seen_series.add(series_uid)
+            jobs.append(SeriesJob(
+                patient_name=patient_name,
+                patient_id=patient_id,
+                study_description=study_desc,
+                series_description=getattr(ser, 'SeriesDescription', 'N/A'),
+                modality=getattr(ser, 'Modality', 'UN'),
+                series_number=str(getattr(ser, 'SeriesNumber', '')),
+                study_uid=study_uid,
+                series_uid=series_uid,
+                remote_count=remote_count,
+                local_count=local_count,
+                institution_name=institution,
+            ))
+        return jobs
 
     def _transfer_series(self, job: SeriesJob) -> int:
         """Transfer one series. Returns number of images transferred."""
@@ -409,30 +411,27 @@ class TransferEngine:
                   f"[{job.modality}] {job.series_description} "
                   f"({to_transfer} images)")
 
-        # Find which remote has this series
-        dicom_ops = None
-        for remote_key in self.config.remote_nodes:
-            dicom_ops = self._make_dicom_ops(remote_key)
-            break  # We'll try the first remote that works
-        # Actually, we need to try the right source. For now, try all.
+        # Try all configured sources until one succeeds
         for remote_key in self.config.remote_nodes:
             if self._cancel.is_set():
                 job.status = "error"
                 return 0
             try:
                 ops = self._make_dicom_ops(remote_key)
-                self.stats.mark_active()
+                t_start = time.time()
                 success, images = ops.c_move_series(job.study_uid, job.series_uid)
-                self.stats.mark_idle()
+                t_elapsed = time.time() - t_start
                 if success:
                     images = max(images, to_transfer)
-                    self.stats.record_image(images)
+                    self.stats.record_series(
+                        job.series_uid, images, t_elapsed)
+                    ipm = (images / t_elapsed) * 60 if t_elapsed > 0 else 0.0
+                    job.images_per_minute = ipm
                     job.status = "done"
                     self.signals.series_completed.emit(job.series_uid, images)
                     self.signals.stats_updated.emit(self.stats)
                     return images
             except Exception as e:
-                self.stats.mark_idle()
                 self._log(f"  C-MOVE via {remote_key} failed: {e}")
 
         job.status = "error"
@@ -494,15 +493,8 @@ class TransferEngine:
                 ps_desc = getattr(ps, 'StudyDescription', 'N/A')
 
                 series_list = dicom_ops.c_find_series(ps_uid)
-                local_series = {}
-                try:
-                    for ls in dicom_ops.c_find_local_series(ps_uid):
-                        uid = getattr(ls, 'SeriesInstanceUID', '')
-                        cnt = int(getattr(ls, 'NumberOfSeriesRelatedInstances', 0) or 0)
-                        if uid:
-                            local_series[uid] = cnt
-                except Exception:
-                    pass
+                local_series = self._fetch_local_series_counts(
+                    dicom_ops, ps_uid)
 
                 for ser in series_list:
                     series_uid = getattr(ser, 'SeriesInstanceUID', '')
@@ -511,12 +503,8 @@ class TransferEngine:
                     remote_count = int(
                         getattr(ser, 'NumberOfSeriesRelatedInstances', 0) or 0)
                     local_count = local_series.get(series_uid, 0)
-                    if remote_count == 0 or local_count >= remote_count:
-                        continue
-                    if max_images > 0 and remote_count > max_images:
-                        continue
-                    missing = remote_count - local_count
-                    if remote_count > 10 and missing <= 2:
+                    if self._should_skip_series(
+                            remote_count, local_count, max_images):
                         continue
                     seen_series.add(series_uid)
                     prior_jobs.append(SeriesJob(
@@ -570,6 +558,37 @@ class TransferEngine:
 
         # Known institution: check if its group is active
         return assigned_group in active_groups
+
+    # ── Reusable helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _should_skip_series(remote_count: int, local_count: int,
+                            max_images: int) -> bool:
+        """Return True if a series does not need to be transferred."""
+        if remote_count == 0 or local_count >= remote_count:
+            return True
+        if max_images > 0 and remote_count > max_images:
+            return True
+        missing = remote_count - local_count
+        if remote_count > 10 and missing <= 2:
+            return True
+        return False
+
+    @staticmethod
+    def _fetch_local_series_counts(
+            dicom_ops: DicomOperations, study_uid: str) -> Dict[str, int]:
+        """Query local PACS and return {series_uid: image_count}."""
+        counts: Dict[str, int] = {}
+        try:
+            for ls in dicom_ops.c_find_local_series(study_uid):
+                uid = getattr(ls, 'SeriesInstanceUID', '')
+                cnt = int(
+                    getattr(ls, 'NumberOfSeriesRelatedInstances', 0) or 0)
+                if uid:
+                    counts[uid] = cnt
+        except Exception:
+            pass
+        return counts
 
     def _make_dicom_ops(self, remote_key: str) -> DicomOperations:
         remote_node = self.config.remote_nodes[remote_key]
