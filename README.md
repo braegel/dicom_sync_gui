@@ -272,4 +272,7 @@ A log file (`dicom_sync_gui.log`) is written to the working directory.
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+This project is licensed under the **GNU General Public License v3.0**.
+See [LICENSE](LICENSE) for the full text.
+
+Copyright (C) 2026 Bernd Brägelmann
