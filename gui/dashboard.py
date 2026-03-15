@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QAction
 
 from core.transfer_engine import TransferStats
-from gui.styles import BTN_START, BTN_STOP
+from gui.styles import BTN_START, BTN_STOP, BTN_DOWNLOAD_SELECTED
 
 
 class StatsLabel(QLabel):
@@ -68,8 +68,9 @@ class SourceDashboard(QWidget):
     """Dashboard widget for a single source PACS — controls + live progress."""
 
     # Signals to main window
-    start_requested = Signal(str, dict)   # remote_key, {hours, max_images, sync_interval}
+    start_requested = Signal(str, dict)   # remote_key, {hours, max_images, sync_interval, selection_mode}
     stop_requested = Signal(str)          # remote_key
+    selection_confirmed = Signal(str, list)  # remote_key, [series_uid, ...]
 
     def __init__(self, config, remote_key: str, parent=None):
         super().__init__(parent)
@@ -126,6 +127,11 @@ class SourceDashboard(QWidget):
         self.interval_spin.valueChanged.connect(self._on_settings_changed)
         form.addRow("Query interval:", self.interval_spin)
 
+        self.manual_selection_check = QCheckBox("Manual series selection")
+        self.manual_selection_check.setToolTip(
+            "After each query, pause and let you choose which series to download.")
+        form.addRow("", self.manual_selection_check)
+
         ctrl_layout.addLayout(form)
         ctrl_layout.addStretch()
 
@@ -142,8 +148,16 @@ class SourceDashboard(QWidget):
         self.btn_stop.setStyleSheet(BTN_STOP)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
 
+        self.btn_download_selected = QPushButton("  Download Selected  ")
+        self.btn_download_selected.setFont(QFont("", 11, QFont.Bold))
+        self.btn_download_selected.setStyleSheet(BTN_DOWNLOAD_SELECTED)
+        self.btn_download_selected.setVisible(False)
+        self.btn_download_selected.clicked.connect(
+            self._on_download_selected_clicked)
+
         btn_layout.addWidget(self.btn_start)
         btn_layout.addWidget(self.btn_stop)
+        btn_layout.addWidget(self.btn_download_selected)
         ctrl_layout.addLayout(btn_layout)
 
         ctrl_group.setLayout(ctrl_layout)
@@ -151,6 +165,8 @@ class SourceDashboard(QWidget):
 
         # ── Filter Groups ──
         filter_group = QGroupBox("Institution Filter")
+        filter_vbox = QVBoxLayout()
+
         fl = QHBoxLayout()
 
         self.filter_enable_check = QCheckBox("Enable group filtering")
@@ -183,8 +199,37 @@ class SourceDashboard(QWidget):
         fl.addWidget(self.lbl_filter_info)
 
         fl.addStretch()
+        filter_vbox.addLayout(fl)
 
-        filter_group.setLayout(fl)
+        # Small-series exception row
+        fl2 = QHBoxLayout()
+
+        self.small_series_check = QCheckBox(
+            "Allow small series (other groups)")
+        self.small_series_check.setToolTip(
+            "Download series with few images even if the institution "
+            "is not in an active filter group.")
+        self.small_series_check.setChecked(
+            self.config.filter_allow_small_series)
+        self.small_series_check.toggled.connect(
+            self._on_small_series_toggled)
+        fl2.addWidget(self.small_series_check)
+
+        self.lbl_small_max = QLabel("Max images/series:")
+        fl2.addWidget(self.lbl_small_max)
+
+        self.small_series_spin = QSpinBox()
+        self.small_series_spin.setRange(1, 999)
+        self.small_series_spin.setValue(
+            self.config.filter_small_series_max)
+        self.small_series_spin.valueChanged.connect(
+            self._on_small_series_max_changed)
+        fl2.addWidget(self.small_series_spin)
+
+        fl2.addStretch()
+        filter_vbox.addLayout(fl2)
+
+        filter_group.setLayout(filter_vbox)
         layout.addWidget(filter_group)
 
         self._populate_filter_menu()
@@ -233,24 +278,26 @@ class SourceDashboard(QWidget):
         tl = QVBoxLayout()
 
         self.series_table = QTableWidget()
-        self.series_table.setColumnCount(9)
+        self.series_table.setColumnCount(10)
         self.series_table.setHorizontalHeaderLabels([
-            "Patient", "Study", "Series", "Modality",
+            "☑", "Patient", "Study", "Series", "Modality",
             "Images", "Pending", "img/min", "Status", "ETE"
         ])
         header = self.series_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)
         self.series_table.setAlternatingRowColors(True)
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.series_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.series_table.setColumnHidden(0, True)
 
         tl.addWidget(self.series_table)
         table_group.setLayout(tl)
@@ -309,10 +356,27 @@ class SourceDashboard(QWidget):
         self.config.save()
         self._update_filter_enabled_state()
         self._update_filter_button_text()
+        self._on_settings_changed()
+
+    def _on_small_series_toggled(self, checked: bool):
+        self.config.filter_allow_small_series = checked
+        self.config.save()
+        self._update_filter_enabled_state()
+        self._on_settings_changed()
+
+    def _on_small_series_max_changed(self, value: int):
+        self.config.filter_small_series_max = value
+        self.config.save()
+        self._on_settings_changed()
 
     def _update_filter_enabled_state(self):
         enabled = self.filter_enable_check.isChecked()
         self.filter_btn.setEnabled(enabled)
+        # Small-series controls: visible only when filtering is enabled
+        small_visible = enabled and self.small_series_check.isChecked()
+        self.small_series_check.setVisible(enabled)
+        self.lbl_small_max.setVisible(small_visible)
+        self.small_series_spin.setVisible(small_visible)
         if enabled:
             self.lbl_filter_info.setText("")
         else:
@@ -371,6 +435,7 @@ class SourceDashboard(QWidget):
             "hours": self.hours_spin.value(),
             "max_images": self.max_images_spin.value(),
             "sync_interval": self.interval_spin.value(),
+            "selection_mode": self.manual_selection_check.isChecked(),
         }
         self.start_requested.emit(self.remote_key, params)
 
@@ -390,6 +455,8 @@ class SourceDashboard(QWidget):
             self._settings_dirty = False
             self.restart_banner.setVisible(False)
             self.lbl_status.setText("Stopped")
+            self.btn_download_selected.setVisible(False)
+            self.series_table.setColumnHidden(0, True)
 
     # ── ETE calculation ───────────────────────────────────────────────────
 
@@ -434,6 +501,10 @@ class SourceDashboard(QWidget):
     def on_queue_updated(self, queue: list):
         """Rebuild the series table from the full queue list."""
         self._last_queue = queue
+        # Hide selection UI — engine is now downloading or idle
+        self.btn_download_selected.setVisible(False)
+        self.series_table.setColumnHidden(0, True)
+
         rate = self._get_rate()
 
         self.series_table.setRowCount(0)
@@ -445,19 +516,19 @@ class SourceDashboard(QWidget):
             self.series_table.insertRow(row)
 
             self.series_table.setItem(
-                row, 0, QTableWidgetItem(job["patient_name"]))
+                row, 1, QTableWidgetItem(job["patient_name"]))
             self.series_table.setItem(
-                row, 1, QTableWidgetItem(job["study_description"]))
+                row, 2, QTableWidgetItem(job["study_description"]))
             self.series_table.setItem(
-                row, 2, QTableWidgetItem(job["series_description"]))
+                row, 3, QTableWidgetItem(job["series_description"]))
             self.series_table.setItem(
-                row, 3, QTableWidgetItem(job["modality"]))
+                row, 4, QTableWidgetItem(job["modality"]))
             self.series_table.setItem(
-                row, 4, QTableWidgetItem(str(job["remote_count"])))
+                row, 5, QTableWidgetItem(str(job["remote_count"])))
 
             pending = job["remote_count"] - job["local_count"]
             pending_item = QTableWidgetItem(str(max(pending, 0)))
-            self.series_table.setItem(row, 5, pending_item)
+            self.series_table.setItem(row, 6, pending_item)
 
             # img/min column
             ipm = job.get("images_per_minute", 0.0)
@@ -469,11 +540,11 @@ class SourceDashboard(QWidget):
                 ipm_item = QTableWidgetItem("\u2014")
                 ipm_item.setForeground(QColor("#969696"))
             ipm_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(row, 6, ipm_item)
+            self.series_table.setItem(row, 7, ipm_item)
 
             status_item = QTableWidgetItem(self._status_text(status))
             status_item.setForeground(self._status_color(status))
-            self.series_table.setItem(row, 7, status_item)
+            self.series_table.setItem(row, 8, status_item)
 
             # ETE column
             if status in ("done", "error", "skipped"):
@@ -491,13 +562,68 @@ class SourceDashboard(QWidget):
                 ete_item = QTableWidgetItem("\u2014")
                 ete_item.setForeground(QColor("#969696"))
             ete_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(row, 8, ete_item)
+            self.series_table.setItem(row, 9, ete_item)
 
             if status == "done":
                 done_count += 1
 
         self.lbl_total_series.setText(
             f"Series: {done_count} / {len(queue)}")
+
+    def on_queue_ready_for_selection(self, queue: list):
+        """Engine paused after query — show checkboxes for manual selection."""
+        self._last_queue = queue
+        self.series_table.setRowCount(0)
+        self.series_table.setColumnHidden(0, False)
+
+        for job in queue:
+            row = self.series_table.rowCount()
+            self.series_table.insertRow(row)
+
+            cb_item = QTableWidgetItem()
+            cb_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            cb_item.setCheckState(Qt.Checked)
+            cb_item.setData(Qt.UserRole, job["series_uid"])
+            self.series_table.setItem(row, 0, cb_item)
+
+            self.series_table.setItem(
+                row, 1, QTableWidgetItem(job["patient_name"]))
+            self.series_table.setItem(
+                row, 2, QTableWidgetItem(job["study_description"]))
+            self.series_table.setItem(
+                row, 3, QTableWidgetItem(job["series_description"]))
+            self.series_table.setItem(
+                row, 4, QTableWidgetItem(job["modality"]))
+            self.series_table.setItem(
+                row, 5, QTableWidgetItem(str(job["remote_count"])))
+            pending = job["remote_count"] - job["local_count"]
+            self.series_table.setItem(
+                row, 6, QTableWidgetItem(str(max(pending, 0))))
+            self.series_table.setItem(row, 7, QTableWidgetItem("\u2014"))
+            status_item = QTableWidgetItem("\u23f3 Waiting")
+            status_item.setForeground(QColor("#f39c12"))
+            self.series_table.setItem(row, 8, status_item)
+            self.series_table.setItem(row, 9, QTableWidgetItem("\u2014"))
+
+        total = sum(max(j["remote_count"] - j["local_count"], 0) for j in queue)
+        self.lbl_total_series.setText(f"Series: 0 / {len(queue)}")
+        self.lbl_total_images.setText(f"Pending: {total} images")
+        self.lbl_status.setText(
+            f"Awaiting selection — {len(queue)} series found")
+        self.btn_download_selected.setVisible(True)
+        # Allow checking/unchecking in the table
+        self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+    def _on_download_selected_clicked(self):
+        """Collect checked series UIDs and confirm selection to the engine."""
+        selected_uids = []
+        for row in range(self.series_table.rowCount()):
+            cb_item = self.series_table.item(row, 0)
+            if cb_item and cb_item.checkState() == Qt.Checked:
+                uid = cb_item.data(Qt.UserRole)
+                if uid:
+                    selected_uids.append(uid)
+        self.selection_confirmed.emit(self.remote_key, selected_uids)
 
     def on_series_started(self, info: dict):
         self.lbl_status.setText(
@@ -568,7 +694,7 @@ class SourceDashboard(QWidget):
                 ete_item = QTableWidgetItem("\u2014")
                 ete_item.setForeground(QColor("#969696"))
             ete_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(i, 8, ete_item)
+            self.series_table.setItem(i, 9, ete_item)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

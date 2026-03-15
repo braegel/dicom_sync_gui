@@ -128,6 +128,8 @@ class AppConfig:
         self.institution_assignments: Dict[str, str] = {}  # {institution: group_name}
         self.active_filter_groups: List[str] = []  # groups selected in dashboard
         self.filter_groups_enabled: bool = False  # master switch in dashboard
+        self.filter_allow_small_series: bool = False  # download small series regardless of group
+        self.filter_small_series_max: int = 20  # max images per series for the above
 
         # Legacy fields — kept for backward-compatible config loading.
         # New code reads per-source values from PacsNode directly.
@@ -192,6 +194,10 @@ class AppConfig:
                 "active_filter_groups", [])
             self.filter_groups_enabled = data.get(
                 "filter_groups_enabled", False)
+            self.filter_allow_small_series = data.get(
+                "filter_allow_small_series", False)
+            self.filter_small_series_max = data.get(
+                "filter_small_series_max", 20)
 
             # ── Migration: inject per-source fields from legacy globals ──
             remotes_raw = data.get("remotes", {})
@@ -230,6 +236,8 @@ class AppConfig:
             "institution_assignments": self.institution_assignments,
             "active_filter_groups": self.active_filter_groups,
             "filter_groups_enabled": self.filter_groups_enabled,
+            "filter_allow_small_series": self.filter_allow_small_series,
+            "filter_small_series_max": self.filter_small_series_max,
             # Legacy globals (kept for downgrade compatibility)
             "default_hours": self.default_hours,
             "max_images": self.max_images,
