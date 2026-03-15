@@ -62,3 +62,9 @@ BTN_OK_BLUE = (
     "padding: 8px 24px; border-radius: 4px; font-weight: bold; }"
     "QPushButton:hover { background: #3498db; }"
 )
+
+BTN_DOWNLOAD_SELECTED = (
+    "QPushButton { background: #d35400; color: white; padding: 10px 24px; "
+    "border-radius: 4px; } QPushButton:hover { background: #e67e22; } "
+    "QPushButton:disabled { background: #7f8c8d; }"
+)

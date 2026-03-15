@@ -234,6 +234,7 @@ class MainWindow(QMainWindow):
             hours=params["hours"],
             max_images=params["max_images"],
             sync_interval=params["sync_interval"],
+            selection_mode=params.get("selection_mode", False),
         )
 
     def _on_stop_service(self, remote_key: str):
@@ -308,6 +309,11 @@ class MainWindow(QMainWindow):
         # Service lifecycle — use a lambda to pass the remote_key
         e.signals.service_stopped.connect(
             lambda rk=remote_key: self._on_service_stopped(rk))
+        # Manual series selection
+        e.signals.queue_ready_for_selection.connect(
+            dashboard.on_queue_ready_for_selection)
+        dashboard.selection_confirmed.connect(
+            lambda rk, uids, eng=engine: eng.confirm_selection(uids))
         # Log
         e.signals.log_message.connect(self._log)
         e.signals.unknown_institution.connect(

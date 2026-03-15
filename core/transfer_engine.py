@@ -184,6 +184,8 @@ class TransferSignals(QObject):
     # Service lifecycle
     service_started = Signal()
     service_stopped = Signal()
+    # Manual selection mode: engine paused, waiting for user to pick series
+    queue_ready_for_selection = Signal(list)  # list[SeriesJob.to_dict()]
     # Log
     log_message = Signal(str)
     # Unknown institution detected (institution_name)
@@ -210,6 +212,9 @@ class TransferEngine:
         self._running = False
         self._queue: List[SeriesJob] = []
         self._notified_institutions: Set[str] = set()
+        self._selection_mode = False
+        self._selection_event = threading.Event()
+        self._selected_uids: Set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -221,11 +226,14 @@ class TransferEngine:
 
     # -- public API ----------------------------------------------------------
 
-    def start(self, hours: int, max_images: int, sync_interval: int):
+    def start(self, hours: int, max_images: int, sync_interval: int,
+              selection_mode: bool = False):
         """Start the continuous service loop."""
         if self._running:
             return
         self._cancel.clear()
+        self._selection_event.clear()
+        self._selection_mode = selection_mode
         self._running = True
         self._thread = threading.Thread(
             target=self._service_loop,
@@ -238,6 +246,13 @@ class TransferEngine:
     def stop(self):
         """Request a graceful stop."""
         self._cancel.set()
+        # Unblock any pending selection wait
+        self._selection_event.set()
+
+    def confirm_selection(self, selected_uids: list):
+        """Called from the GUI: user confirmed which series to download."""
+        self._selected_uids = set(selected_uids)
+        self._selection_event.set()
 
     # -- internal ------------------------------------------------------------
 
@@ -301,6 +316,22 @@ class TransferEngine:
             self._queue = []
             self.signals.queue_updated.emit([])
             return 0
+
+        if self._selection_mode:
+            self._selection_event.clear()
+            self.signals.queue_ready_for_selection.emit(
+                [j.to_dict() for j in jobs])
+            # Block until user confirms selection or service is cancelled
+            while not self._cancel.is_set():
+                if self._selection_event.wait(timeout=1.0):
+                    break
+            if self._cancel.is_set():
+                return 0
+            jobs = [j for j in jobs if j.series_uid in self._selected_uids]
+            if not jobs:
+                self._queue = []
+                self.signals.queue_updated.emit([])
+                return 0
 
         self._queue = jobs
         self.signals.queue_updated.emit([j.to_dict() for j in jobs])
@@ -370,12 +401,16 @@ class TransferEngine:
             institution = str(
                 getattr(series_list[0], 'InstitutionName', '')).strip()
 
-        if not self._passes_institution_filter(institution):
+        institution_ok = self._passes_institution_filter(institution)
+        allow_small = (not institution_ok
+                       and self.config.filter_allow_small_series)
+        if not institution_ok and not allow_small:
             return []
 
         local_series = self._fetch_local_series_counts(
             dicom_ops, study_uid)
 
+        small_max = self.config.filter_small_series_max
         jobs: List[SeriesJob] = []
         for ser in series_list:
             series_uid = getattr(ser, 'SeriesInstanceUID', '')
@@ -387,6 +422,10 @@ class TransferEngine:
 
             if self._should_skip_series(
                     remote_count, local_count, max_images):
+                continue
+
+            # Institution filtered but small-series exception applies
+            if allow_small and remote_count > small_max:
                 continue
 
             seen_series.add(series_uid)
