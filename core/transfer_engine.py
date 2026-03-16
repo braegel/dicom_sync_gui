@@ -497,12 +497,16 @@ class TransferEngine:
                             if getattr(s, 'PatientID', '') == pid}
 
             all_raw = dicom_ops.c_find_studies(patient_id=pid)
+            self._log(f"  [Prior] patient {pid}: {len(all_raw)} total studies on PACS, "
+                      f"{len(current_uids)} in current window")
             prior_studies = []
             for s in all_raw:
                 uid = getattr(s, 'StudyInstanceUID', '')
                 if uid in current_uids:
                     continue
                 prior_studies.append(s)
+
+            self._log(f"  [Prior] {len(prior_studies)} candidate prior studies")
 
             prior_studies.sort(
                 key=lambda x: (getattr(x, 'StudyDate', ''),
@@ -519,6 +523,7 @@ class TransferEngine:
                             m = m.strip()
                             if m:
                                 target_mods.add(m)
+                self._log(f"  [Prior] modality filter active, target: {target_mods}")
                 if target_mods:
                     prior_studies = [
                         s for s in prior_studies
@@ -527,8 +532,11 @@ class TransferEngine:
                             .replace("\\", ",").split(",")
                             if m.strip()} & target_mods
                     ]
+                    self._log(f"  [Prior] {len(prior_studies)} after modality filter")
 
             count = min(self.config.prior_studies_count, len(prior_studies))
+            self._log(f"  [Prior] downloading {count} of {len(prior_studies)} "
+                      f"(configured max: {self.config.prior_studies_count})")
             for ps in prior_studies[:count]:
                 ps_uid = getattr(ps, 'StudyInstanceUID', '')
                 ps_name = str(getattr(ps, 'PatientName', 'Unknown'))
