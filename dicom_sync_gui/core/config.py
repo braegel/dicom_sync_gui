@@ -100,6 +100,7 @@ class AppConfig:
             transfer_syntax="JPEG2000Lossless",
         )
         self.remote_nodes: Dict[str, PacsNode] = {}
+        self.local_nodes: Dict[str, PacsNode] = {}
 
         # Fallback storage: download to folder if local PACS is not available
         self.fallback_storage_enabled: bool = False
@@ -150,6 +151,10 @@ class AppConfig:
             for key, val in data.get("remotes", {}).items():
                 self.remote_nodes[key] = PacsNode.from_dict(val)
 
+            self.local_nodes = {}
+            for key, val in data.get("local_nodes", {}).items():
+                self.local_nodes[key] = PacsNode.from_dict(val)
+
             # Migrate old single-remote format
             if "remote" in data and "remotes" not in data:
                 self.remote_nodes["default"] = PacsNode.from_dict(data["remote"])
@@ -196,6 +201,7 @@ class AppConfig:
         data = {
             "local": self.local_node.to_dict(),
             "remotes": {k: v.to_dict() for k, v in self.remote_nodes.items()},
+            "local_nodes": {k: v.to_dict() for k, v in self.local_nodes.items()},
             "fallback_storage_enabled": self.fallback_storage_enabled,
             "fallback_storage_path": self.fallback_storage_path,
             "prior_studies_count": self.prior_studies_count,
@@ -210,6 +216,16 @@ class AppConfig:
         }
         with open(self.config_path, "w") as f:
             json.dump(data, f, indent=2)
+
+    def get_local_dict_for(self, remote_key: str) -> Dict[str, Any]:
+        """Return the local PACS config dict for a given remote key.
+
+        Falls back to the default local_node when no per-remote local is configured.
+        """
+        node = self.local_nodes.get(remote_key)
+        if node is not None:
+            return node.to_dict()
+        return self.local_node.to_dict()
 
     def get_remote_names(self) -> List[str]:
         return list(self.remote_nodes.keys())

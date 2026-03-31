@@ -6,6 +6,7 @@ Emits Qt signals so the GUI can display queue and progress in real time.
 """
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal
 
 from core.dicom_ops import DicomOperations
+from core.storage_scp import StorageSCP
 
 logger = logging.getLogger("dicom_sync")
 
@@ -210,6 +212,8 @@ class TransferEngine:
         self._running = False
         self._queue: List[SeriesJob] = []
         self._notified_institutions: Set[str] = set()
+        self._fallback_scp: Optional[StorageSCP] = None
+        self._local_reachable: Optional[bool] = None
 
     @property
     def is_running(self) -> bool:
@@ -238,6 +242,8 @@ class TransferEngine:
     def stop(self):
         """Request a graceful stop."""
         self._cancel.set()
+        if self._fallback_scp is not None and self._fallback_scp.running:
+            self._fallback_scp.stop()
 
     # -- internal ------------------------------------------------------------
 
@@ -281,6 +287,26 @@ class TransferEngine:
             self._log(f"[{self.remote_key}] Service stopped.")
             self.signals.service_stopped.emit()
 
+    def _ensure_fallback_scp(self, dicom_ops: DicomOperations):
+        """Start a fallback StorageSCP if the local PACS is unreachable."""
+        if not self.config.fallback_storage_enabled:
+            return
+        if self._fallback_scp is not None and self._fallback_scp.running:
+            return
+        if self._local_reachable:
+            return
+        reachable = dicom_ops.c_echo(target="local")
+        self._local_reachable = reachable
+        if not reachable:
+            local_dict = self.config.get_local_dict_for(self.remote_key)
+            storage_path = os.path.join(
+                self.config.fallback_storage_path, self.remote_key)
+            self._fallback_scp = StorageSCP(
+                local_dict["ae_title"], local_dict["port"], storage_path)
+            self._fallback_scp.start()
+            self._log(f"[{self.remote_key}] Local PACS unreachable — "
+                      f"started fallback SCP on port {local_dict['port']}")
+
     def _run_one_cycle(self, hours: int, max_images: int) -> int:
         """Query the source PACS, build queue, transfer everything."""
         now = datetime.now()
@@ -321,6 +347,7 @@ class TransferEngine:
                       seen_series: Set[str]) -> List[SeriesJob]:
         """Query the source PACS and return new SeriesJob items."""
         dicom_ops = self._make_dicom_ops()
+        self._ensure_fallback_scp(dicom_ops)
         self._log(f"Querying {self.remote_key}...")
         studies_raw = dicom_ops.c_find_studies(study_date=date_range)
 
@@ -596,7 +623,7 @@ class TransferEngine:
     def _make_dicom_ops(self) -> DicomOperations:
         remote_node = self.config.remote_nodes[self.remote_key]
         return DicomOperations(
-            self.config.get_local_dict(),
+            self.config.get_local_dict_for(self.remote_key),
             remote_node.to_dict(),
             self.remote_key,
         )
