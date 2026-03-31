@@ -41,9 +41,6 @@ class TestMainWindowInit:
     def test_engines_starts_empty(self):
         assert self.win.engines == {}
 
-    def test_storage_scp_starts_none(self):
-        assert self.win.storage_scp is None
-
     def test_statusbar_ready(self):
         assert "Ready" in self.win.statusBar().currentMessage()
 
@@ -156,9 +153,8 @@ class TestMainWindowService:
         self.win = MainWindow(populated_config)
         self.config = populated_config
 
-    @patch.object(MainWindow, '_ensure_storage_scp')
     @patch("gui.main_window.TransferEngine")
-    def test_start_creates_engine_for_source(self, MockEngine, mock_scp):
+    def test_start_creates_engine_for_source(self, MockEngine):
         mock_engine = MagicMock()
         mock_engine.signals = MagicMock()
         MockEngine.return_value = mock_engine
@@ -170,9 +166,8 @@ class TestMainWindowService:
         mock_engine.start.assert_called_once_with(
             hours=6, max_images=500, sync_interval=120)
 
-    @patch.object(MainWindow, '_ensure_storage_scp')
     @patch("gui.main_window.TransferEngine")
-    def test_start_connects_signals(self, MockEngine, mock_scp):
+    def test_start_connects_signals(self, MockEngine):
         mock_engine = MagicMock()
         mock_signals = MagicMock()
         mock_engine.signals = mock_signals
@@ -306,20 +301,30 @@ class TestMainWindowCEcho:
         self.win._test_echo()
         mock_warning.assert_called_once()
 
-    @patch("gui.main_window.QApplication.processEvents")
     @patch("gui.main_window.QMessageBox.information")
     @patch("gui.main_window.DicomOperations")
     def test_echo_runs_for_all_remotes(
-        self, MockOps, mock_info, mock_events
+        self, MockOps, mock_info
     ):
+        import time
         mock_ops = MagicMock()
         mock_ops.c_echo.return_value = True
         MockOps.return_value = mock_ops
 
         self.win._test_echo()
 
+        # Wait for the background thread to finish
+        for _ in range(50):
+            time.sleep(0.02)
+            QApplication.processEvents()
+            if mock_ops.c_echo.call_count >= 2:
+                break
+
         # Should call c_echo for remote + local
         assert mock_ops.c_echo.call_count >= 2
+
+        # Process the signal delivery
+        QApplication.processEvents()
         mock_info.assert_called_once()
 
 

@@ -315,10 +315,12 @@ class TransferEngine:
         date_range = f"{yesterday.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
 
         seen_series: Set[str] = set()
+        dicom_ops = self._make_dicom_ops()
+        self._ensure_fallback_scp(dicom_ops)
 
         try:
             jobs = self._query_source(
-                date_range, cutoff, max_images, seen_series)
+                dicom_ops, date_range, cutoff, max_images, seen_series)
         except Exception as e:
             self._log(f"  [{self.remote_key}] Error querying: {e}")
             jobs = []
@@ -337,17 +339,16 @@ class TransferEngine:
         for job in jobs:
             if self._cancel.is_set():
                 break
-            total_images += self._transfer_series(job)
+            total_images += self._transfer_series(dicom_ops, job)
             self.signals.queue_updated.emit([j.to_dict() for j in jobs])
 
         return total_images
 
-    def _query_source(self, date_range: str, cutoff: datetime,
+    def _query_source(self, dicom_ops: DicomOperations,
+                      date_range: str, cutoff: datetime,
                       max_images: int,
                       seen_series: Set[str]) -> List[SeriesJob]:
         """Query the source PACS and return new SeriesJob items."""
-        dicom_ops = self._make_dicom_ops()
-        self._ensure_fallback_scp(dicom_ops)
         self._log(f"Querying {self.remote_key}...")
         studies_raw = dicom_ops.c_find_studies(study_date=date_range)
 
@@ -432,7 +433,8 @@ class TransferEngine:
             ))
         return jobs
 
-    def _transfer_series(self, job: SeriesJob) -> int:
+    def _transfer_series(self, dicom_ops: DicomOperations,
+                         job: SeriesJob) -> int:
         """Transfer one series. Returns number of images transferred."""
         job.status = "transferring"
         self.signals.series_started.emit(job.to_dict())
@@ -446,9 +448,8 @@ class TransferEngine:
             job.status = "error"
             return 0
         try:
-            ops = self._make_dicom_ops()
             t_start = time.time()
-            success, images = ops.c_move_series(job.study_uid, job.series_uid)
+            success, images = dicom_ops.c_move_series(job.study_uid, job.series_uid)
             t_elapsed = time.time() - t_start
             if success:
                 images = max(images, to_transfer)

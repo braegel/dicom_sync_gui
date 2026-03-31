@@ -26,11 +26,9 @@ RETRIEVE_METHODS = ["C-MOVE", "C-GET"]
 def get_local_ip() -> str:
     """Get local IP address."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
 
@@ -177,18 +175,13 @@ class AppConfig:
 
             # Migrate legacy global parameters into remote nodes that
             # don't yet carry their own values (pre-per-source configs).
-            for node in self.remote_nodes.values():
-                d = data.get("remotes", {}).get("", {})  # won't match
-                # If the serialised node had no "hours" key, it comes
-                # from an old config → apply the global defaults.
-                # PacsNode.from_dict already provides defaults of 3/0/60,
-                # so we only need to overwrite when the global differs.
-                for remote_data in data.get("remotes", {}).values():
-                    if "hours" not in remote_data:
-                        node.hours = self.default_hours
-                        node.max_images = self.max_images
-                        node.sync_interval = self.sync_interval
-                        break
+            remotes_data = data.get("remotes", {})
+            for key, node in self.remote_nodes.items():
+                remote_data = remotes_data.get(key, {})
+                if "hours" not in remote_data:
+                    node.hours = self.default_hours
+                    node.max_images = self.max_images
+                    node.sync_interval = self.sync_interval
 
             return True
         except (json.JSONDecodeError, KeyError) as e:

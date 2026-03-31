@@ -11,6 +11,7 @@ Workflow:
 
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QApplication,
     QProgressDialog, QFileDialog,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QColor
 
 from core.config import AppConfig
@@ -34,9 +35,12 @@ logger = logging.getLogger("dicom_sync")
 class FilterGroupsDialog(QDialog):
     """Dialog for creating and managing institution filter groups."""
 
+    _institutions_discovered = Signal(set)
+
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
         self.config = config
+        self._institutions_discovered.connect(self._on_institutions_discovered)
 
         # Work on copies so we can cancel
         self._assignments: Dict[str, str] = dict(
@@ -370,35 +374,30 @@ class FilterGroupsDialog(QDialog):
 
         self.btn_query.setEnabled(False)
         self.lbl_query_status.setText("Querying...")
-        QApplication.processEvents()
 
-        discovered: Set[str] = set()
+        def run_query():
+            discovered: Set[str] = set()
+            for remote_key, remote_node in self.config.remote_nodes.items():
+                try:
+                    ops = DicomOperations(
+                        self.config.get_local_dict_for(remote_key),
+                        remote_node.to_dict(),
+                        remote_key,
+                    )
+                    names = ops.c_find_institution_names(
+                        study_date=date_range)
+                    discovered.update(names)
+                except Exception as e:
+                    logger.error(f"Query failed for {remote_key}: {e}")
+            self._institutions_discovered.emit(discovered)
 
-        for remote_key, remote_node in self.config.remote_nodes.items():
-            try:
-                ops = DicomOperations(
-                    self.config.get_local_dict(),
-                    remote_node.to_dict(),
-                    remote_key,
-                )
-                self.lbl_query_status.setText(
-                    f"Querying {remote_key} (study + series level)...")
-                QApplication.processEvents()
+        threading.Thread(target=run_query, daemon=True).start()
 
-                # Use dedicated method that falls back to series-level
-                # queries when InstitutionName is not at study level
-                names = ops.c_find_institution_names(
-                    study_date=date_range)
-                discovered.update(names)
-
-            except Exception as e:
-                logger.error(f"Query failed for {remote_key}: {e}")
-
-        # Merge discovered institutions with existing ones
+    def _on_institutions_discovered(self, discovered: set):
         new_count = 0
         for inst in discovered:
             if inst not in self._assignments:
-                self._assignments[inst] = ""  # unassigned
+                self._assignments[inst] = ""
                 new_count += 1
 
         self.btn_query.setEnabled(True)

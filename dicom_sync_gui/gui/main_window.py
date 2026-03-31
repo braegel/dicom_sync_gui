@@ -5,19 +5,19 @@ with an independent download service, queue, and statistics.
 """
 
 import logging
+import threading
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox, QApplication,
     QTabWidget, QLabel,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QFont
 
 from core.config import AppConfig
 from core.dicom_ops import DicomOperations
-from core.storage_scp import StorageSCP
 from core.transfer_engine import TransferEngine
 from gui.settings_dialog import SettingsDialog
 from gui.dashboard import SourceDashboard
@@ -31,13 +31,16 @@ logger = logging.getLogger("dicom_sync")
 class MainWindow(QMainWindow):
     """Main application window — per-source tabs, fully automatic."""
 
+    _echo_results_ready = Signal(list)
+
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
-        self.storage_scp: Optional[StorageSCP] = None
         # Per-source engines and dashboards
         self.engines: Dict[str, TransferEngine] = {}
         self.dashboards: Dict[str, SourceDashboard] = {}
+
+        self._echo_results_ready.connect(self._on_echo_results)
 
         self.setWindowTitle("DICOM Sync")
         self.setMinimumSize(1000, 750)
@@ -75,9 +78,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction(log_action)
 
         tools_menu = menubar.addMenu("Tools")
-        echo_action = QAction("C-ECHO Test...", self)
-        echo_action.triggered.connect(self._test_echo)
-        tools_menu.addAction(echo_action)
+        self._echo_action = QAction("C-ECHO Test...", self)
+        self._echo_action.triggered.connect(self._test_echo)
+        tools_menu.addAction(self._echo_action)
 
     # ── Central UI ────────────────────────────────────────────────────────
 
@@ -159,32 +162,41 @@ class MainWindow(QMainWindow):
                 "No source PACS configured. Open Settings first.")
             return
 
+        self._echo_action.setEnabled(False)
         self.statusBar().showMessage("C-ECHO test running...")
-        QApplication.processEvents()
 
-        results = []
-        for key, node in self.config.remote_nodes.items():
-            ops = DicomOperations(
-                self.config.get_local_dict(), node.to_dict(), key)
-            ok = ops.c_echo(target='remote')
-            results.append(
-                f"  {key} ({node.name}): "
-                f"{'Reachable' if ok else 'Not reachable'}")
-
-        # Test local PACS
-        if self.config.remote_nodes:
-            first_key = next(iter(self.config.remote_nodes))
-            first_node = self.config.remote_nodes[first_key]
-            ops = DicomOperations(
-                self.config.get_local_dict(), first_node.to_dict(), first_key)
-            local_ok = ops.c_echo(target='local')
-            results.append(
-                f"\n  Local PACS: "
-                f"{'Reachable' if local_ok else 'Not reachable'}")
-            if not local_ok and self.config.fallback_storage_enabled:
+        def run_echo():
+            results = []
+            for key, node in self.config.remote_nodes.items():
+                ops = DicomOperations(
+                    self.config.get_local_dict_for(key), node.to_dict(), key)
+                ok = ops.c_echo(target='remote')
                 results.append(
-                    f"  Fallback storage: {self.config.fallback_storage_path}")
+                    f"  {key} ({node.name}): "
+                    f"{'Reachable' if ok else 'Not reachable'}")
 
+            # Test local PACS
+            if self.config.remote_nodes:
+                first_key = next(iter(self.config.remote_nodes))
+                first_node = self.config.remote_nodes[first_key]
+                ops = DicomOperations(
+                    self.config.get_local_dict_for(first_key),
+                    first_node.to_dict(), first_key)
+                local_ok = ops.c_echo(target='local')
+                results.append(
+                    f"\n  Local PACS: "
+                    f"{'Reachable' if local_ok else 'Not reachable'}")
+                if not local_ok and self.config.fallback_storage_enabled:
+                    results.append(
+                        f"  Fallback storage: "
+                        f"{self.config.fallback_storage_path}")
+
+            self._echo_results_ready.emit(results)
+
+        threading.Thread(target=run_echo, daemon=True).start()
+
+    def _on_echo_results(self, results: list):
+        self._echo_action.setEnabled(True)
         QMessageBox.information(
             self, "C-ECHO Results", "Results:\n" + "\n".join(results))
         self.statusBar().showMessage("Ready")
@@ -212,9 +224,6 @@ class MainWindow(QMainWindow):
         dashboard = self.dashboards.get(remote_key)
         if not dashboard:
             return
-
-        # Ensure local storage / SCP
-        self._ensure_storage_scp()
 
         # Create engine for this source
         engine = TransferEngine(self.config, remote_key)
@@ -245,40 +254,6 @@ class MainWindow(QMainWindow):
         if dashboard:
             dashboard.set_service_running(False)
         self.statusBar().showMessage(f"Service stopped: {remote_key}")
-
-    # ── Storage SCP ───────────────────────────────────────────────────────
-
-    def _ensure_storage_scp(self):
-        """Start built-in SCP if no local DICOM server is reachable."""
-        if self.storage_scp and self.storage_scp.running:
-            return
-
-        # Quick echo test against local PACS
-        local_reachable = False
-        if self.config.remote_nodes:
-            first_key = next(iter(self.config.remote_nodes))
-            first_node = self.config.remote_nodes[first_key]
-            ops = DicomOperations(
-                self.config.get_local_dict(), first_node.to_dict(), first_key)
-            local_reachable = ops.c_echo(target='local')
-
-        if not local_reachable:
-            if self.config.fallback_storage_enabled:
-                storage_path = self.config.fallback_storage_path
-                self._log(f"Local PACS not reachable. "
-                          f"Saving to: {storage_path}")
-            else:
-                storage_path = self.config.fallback_storage_path
-                self._log("Local PACS not reachable. "
-                          "Starting built-in Storage SCP...")
-
-            local = self.config.get_local_dict()
-            self.storage_scp = StorageSCP(
-                local.get('ae_title', 'LOCAL_AE'),
-                local.get('port', 11112),
-                storage_path,
-            )
-            self.storage_scp.start()
 
     # ── Engine signal wiring ──────────────────────────────────────────────
 
@@ -340,9 +315,6 @@ class MainWindow(QMainWindow):
                 return
             for engine in self.engines.values():
                 engine.stop()
-
-        if self.storage_scp and self.storage_scp.running:
-            self.storage_scp.stop()
 
         self.log_window.close()
         event.accept()

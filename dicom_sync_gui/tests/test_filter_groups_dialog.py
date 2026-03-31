@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication
 
 from gui.filter_groups_dialog import FilterGroupsDialog
 from core.config import AppConfig, PacsNode
@@ -295,11 +296,9 @@ class TestFilterGroupsQuery:
         self.dialog._query_institutions()
         mock_warning.assert_called_once()
 
-    @patch("gui.filter_groups_dialog.QApplication.processEvents")
     @patch("gui.filter_groups_dialog.DicomOperations")
-    def test_query_discovers_institutions(
-        self, MockOps, mock_events
-    ):
+    def test_query_discovers_institutions(self, MockOps):
+        import time
         mock_ops = MagicMock()
         mock_ops.c_find_institution_names.return_value = [
             "New Hospital X", "New Hospital Y"
@@ -308,22 +307,30 @@ class TestFilterGroupsQuery:
 
         self.dialog._query_institutions()
 
+        # Wait for background thread + signal delivery
+        for _ in range(50):
+            time.sleep(0.02)
+            QApplication.processEvents()
+            if "New Hospital X" in self.dialog._assignments:
+                break
+
         assert "New Hospital X" in self.dialog._assignments
         assert "New Hospital Y" in self.dialog._assignments
-        # Status label should mention "Found"
         assert "Found" in self.dialog.lbl_query_status.text()
 
-    @patch("gui.filter_groups_dialog.QApplication.processEvents")
     @patch("gui.filter_groups_dialog.DicomOperations")
-    def test_query_does_not_overwrite_existing_assignments(
-        self, MockOps, mock_events
-    ):
+    def test_query_does_not_overwrite_existing_assignments(self, MockOps):
+        import time
         mock_ops = MagicMock()
-        # "Hospital Alpha" already exists with Group A
         mock_ops.c_find_institution_names.return_value = ["Hospital Alpha"]
         MockOps.return_value = mock_ops
 
         self.dialog._query_institutions()
 
-        # Should keep existing assignment
+        for _ in range(50):
+            time.sleep(0.02)
+            QApplication.processEvents()
+            if self.dialog.btn_query.isEnabled():
+                break
+
         assert self.dialog._assignments["Hospital Alpha"] == "Group A"
