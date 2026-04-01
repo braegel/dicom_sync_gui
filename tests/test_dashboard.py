@@ -941,3 +941,84 @@ class TestConfigHighLoadAlert:
         config2 = AppConfig(config_path=tmp_config_path)
         config2.load()
         assert config2.high_load_alert_enabled is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SourceDashboard — study completion notification sound
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStudyCompleteSound:
+    """When all series of a patient (including priors) are done and the
+    patient's institution belongs to an active filter group, the dashboard
+    must play a notification sound."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        # populated_config: filter_groups_enabled=True,
+        # active_filter_groups=["Group A"],
+        # institution_assignments: "Hospital Alpha" → "Group A"
+        self.config.study_complete_sound_enabled = True
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def test_has_on_patient_studies_completed_slot(self):
+        assert hasattr(self.dashboard, "on_patient_studies_completed")
+        assert callable(self.dashboard.on_patient_studies_completed)
+
+    @patch("gui.dashboard.QApplication.beep")
+    def test_sound_played_for_active_group(self, mock_beep):
+        """Institution in active filter group → play sound."""
+        self.dashboard.on_patient_studies_completed(
+            "P1", "Hospital Alpha")
+        mock_beep.assert_called_once()
+
+    @patch("gui.dashboard.QApplication.beep")
+    def test_no_sound_for_inactive_group(self, mock_beep):
+        """Institution in inactive group → no sound."""
+        self.dashboard.on_patient_studies_completed(
+            "P1", "Clinic Beta")  # Group B, not active
+        mock_beep.assert_not_called()
+
+    @patch("gui.dashboard.QApplication.beep")
+    def test_no_sound_when_disabled(self, mock_beep):
+        """Setting study_complete_sound_enabled=False suppresses sound."""
+        self.config.study_complete_sound_enabled = False
+        self.dashboard.on_patient_studies_completed(
+            "P1", "Hospital Alpha")
+        mock_beep.assert_not_called()
+
+    @patch("gui.dashboard.QApplication.beep")
+    def test_sound_plays_when_filter_disabled(self, mock_beep):
+        """With filtering off, sound plays for any institution."""
+        self.config.filter_groups_enabled = False
+        self.dashboard.on_patient_studies_completed(
+            "P1", "Whatever Hospital")
+        mock_beep.assert_called_once()
+
+    @patch("gui.dashboard.QApplication.beep")
+    def test_sound_for_unassigned_institution_when_filter_on(self, mock_beep):
+        """Unassigned institution with filter on → no sound (not in any
+        active group)."""
+        self.dashboard.on_patient_studies_completed(
+            "P1", "Nonexistent Hospital")
+        mock_beep.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Config — study_complete_sound_enabled
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestConfigStudyCompleteSound:
+
+    def test_default_true(self, tmp_config_path):
+        config = AppConfig(config_path=tmp_config_path)
+        assert config.study_complete_sound_enabled is True
+
+    def test_roundtrip(self, tmp_config_path):
+        config = AppConfig(config_path=tmp_config_path)
+        config.study_complete_sound_enabled = False
+        config.save()
+        config2 = AppConfig(config_path=tmp_config_path)
+        config2.load()
+        assert config2.study_complete_sound_enabled is False

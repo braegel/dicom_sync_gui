@@ -786,6 +786,19 @@ class SourceDashboard(QWidget):
             return "#f1c40f"
         return "#e74c3c"
 
+    def on_patient_studies_completed(self, patient_id: str,
+                                     institution_name: str):
+        """Slot for patient_studies_completed — play notification sound
+        if the institution belongs to an active filter group."""
+        if not self.config.study_complete_sound_enabled:
+            return
+        if self.config.filter_groups_enabled:
+            group = self.config.institution_assignments.get(
+                institution_name, "")
+            if group not in set(self.config.active_filter_groups):
+                return
+        QApplication.beep()
+
     def on_studies_queried(self, studies: list):
         """Slot for the studies_queried signal — receives raw query results."""
         self._update_study_rate_display(studies)

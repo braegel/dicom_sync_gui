@@ -196,6 +196,8 @@ class TransferSignals(QObject):
     unknown_institution = Signal(str)
     # Raw query results — study-level dicts for study rate display
     studies_queried = Signal(list)  # list[{study_uid, study_date, study_time, institution_name}]
+    # All series for a patient (incl. priors) finished downloading
+    patient_studies_completed = Signal(str, str)  # patient_id, institution_name
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +223,7 @@ class TransferEngine:
         self._selection_mode = False
         self._selection_event = threading.Event()
         self._selected_uids: Set[str] = set()
+        self._completed_patients: Set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -304,6 +307,7 @@ class TransferEngine:
 
     def _run_one_cycle(self, hours: int, max_images: int) -> int:
         """Query the source PACS, build queue, transfer everything."""
+        self._completed_patients.clear()
         now = datetime.now()
         cutoff = now - timedelta(hours=hours)
         yesterday = now - timedelta(days=1)
@@ -510,6 +514,7 @@ class TransferEngine:
                 job.status = "done"
                 self.signals.series_completed.emit(job.series_uid, images)
                 self.signals.stats_updated.emit(self.stats)
+                self._check_patient_complete(job.patient_id)
                 return images
         except Exception as e:
             self._log(f"  [{self.remote_key}] C-MOVE failed: {e}")
@@ -518,6 +523,22 @@ class TransferEngine:
         self.signals.series_error.emit(
             job.series_uid, "Transfer failed")
         return 0
+
+    def _check_patient_complete(self, patient_id: str):
+        """Emit patient_studies_completed if all series for this patient
+        (including priors) are done or errored."""
+        if patient_id in self._completed_patients:
+            return
+        patient_series = [j for j in self._queue
+                          if j.patient_id == patient_id]
+        if not patient_series:
+            return
+        if all(j.status in ("done", "error", "skipped")
+               for j in patient_series):
+            self._completed_patients.add(patient_id)
+            institution = patient_series[0].institution_name
+            self.signals.patient_studies_completed.emit(
+                patient_id, institution)
 
     def _resolve_priors(self, dicom_ops: DicomOperations,
                         current_studies, seen_series: Set[str],

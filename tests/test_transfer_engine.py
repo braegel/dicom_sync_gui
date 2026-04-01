@@ -732,3 +732,102 @@ class TestStudiesQueriedEmission:
         uids = {s["study_uid"] for s in studies}
         assert "1.1" in uids, "Recent study missing from signal"
         assert "1.2" in uids, "Time-filtered study missing from signal"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — patient_studies_completed signal
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPatientStudiesCompleted:
+    """After the last series for a patient finishes (including priors),
+    a patient_studies_completed signal must fire."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.filter_groups_enabled = False
+        self.engine = TransferEngine(self.config, "ct")
+
+    def test_signal_exists(self):
+        assert hasattr(self.engine.signals, "patient_studies_completed")
+
+    def test_fires_when_all_series_done(self):
+        """Signal fires after the last series of a patient completes."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="transferring", institution_name="Hospital Alpha"),
+        ]
+        received = []
+        self.engine.signals.patient_studies_completed.connect(
+            lambda pid, inst: received.append((pid, inst)))
+
+        # Simulate the last series finishing
+        self.engine._queue[1].status = "done"
+        self.engine._check_patient_complete("P1")
+
+        assert len(received) == 1
+        assert received[0] == ("P1", "Hospital Alpha")
+
+    def test_does_not_fire_while_series_pending(self):
+        """Signal must NOT fire if any series is still queued/transferring."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="queued", institution_name="Hospital Alpha"),
+        ]
+        received = []
+        self.engine.signals.patient_studies_completed.connect(
+            lambda pid, inst: received.append((pid, inst)))
+
+        self.engine._check_patient_complete("P1")
+        assert len(received) == 0
+
+    def test_includes_prior_studies(self):
+        """Prior studies (different study_uid, same patient) must all be
+        done before the signal fires."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
+                      status="done",
+                      study_description="[Prior] Old CT",
+                      institution_name="Hospital Alpha"),
+        ]
+        received = []
+        self.engine.signals.patient_studies_completed.connect(
+            lambda pid, inst: received.append((pid, inst)))
+
+        self.engine._check_patient_complete("P1")
+        assert len(received) == 1
+
+    def test_does_not_fire_twice_for_same_patient(self):
+        """Signal must fire only once per patient per cycle."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+        ]
+        received = []
+        self.engine.signals.patient_studies_completed.connect(
+            lambda pid, inst: received.append((pid, inst)))
+
+        self.engine._check_patient_complete("P1")
+        self.engine._check_patient_complete("P1")
+        assert len(received) == 1
+
+    def test_error_series_does_not_block(self):
+        """Errored series count as finished — don't block the signal."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="error", institution_name="Hospital Alpha"),
+        ]
+        received = []
+        self.engine.signals.patient_studies_completed.connect(
+            lambda pid, inst: received.append((pid, inst)))
+
+        self.engine._check_patient_complete("P1")
+        assert len(received) == 1

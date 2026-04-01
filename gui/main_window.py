@@ -303,6 +303,8 @@ class MainWindow(QMainWindow):
         # Dashboard updates
         e.signals.queue_updated.connect(dashboard.on_queue_updated)
         e.signals.studies_queried.connect(dashboard.on_studies_queried)
+        e.signals.patient_studies_completed.connect(
+            dashboard.on_patient_studies_completed)
         e.signals.series_started.connect(dashboard.on_series_started)
         e.signals.stats_updated.connect(dashboard.on_stats_updated)
         e.signals.cycle_started.connect(dashboard.on_cycle_started)
