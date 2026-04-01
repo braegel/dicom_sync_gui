@@ -517,3 +517,123 @@ class TestTransferEngineLifecycle:
 
     def test_notified_institutions_starts_empty(self):
         assert self.engine._notified_institutions == set()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — studies_queried signal
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStudiesQueriedEmission:
+    """studies_queried must carry institution_name resolved at series level,
+    not the (often empty) study-level InstitutionName."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.filter_groups_enabled = False  # no filtering
+        self.engine = TransferEngine(self.config, "ct")
+
+    def _make_study_ds(self, study_uid, institution_name=""):
+        """Fake DICOM study-level dataset (no InstitutionName)."""
+        from datetime import datetime
+        now = datetime.now()
+        ds = MagicMock()
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = now.strftime("%Y%m%d")
+        ds.StudyTime = now.strftime("%H%M%S")
+        ds.PatientName = "Doe^John"
+        ds.PatientID = "P1"
+        ds.StudyDescription = "CT Head"
+        ds.InstitutionName = institution_name
+        return ds
+
+    def _make_series_ds(self, series_uid, institution_name="",
+                        num_instances=10):
+        """Fake DICOM series-level dataset."""
+        ds = MagicMock()
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesDescription = "Axial"
+        ds.Modality = "CT"
+        ds.SeriesNumber = "1"
+        ds.NumberOfSeriesRelatedInstances = num_instances
+        ds.InstitutionName = institution_name
+        return ds
+
+    def test_institution_from_series_fallback(self):
+        """When study-level InstitutionName is empty, the emitted dict
+        must carry the institution resolved from the first series."""
+        study_ds = self._make_study_ds("1.2.3", institution_name="")
+        series_ds = self._make_series_ds("1.2.3.1",
+                                         institution_name="Hospital Alpha")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [study_ds]
+        mock_ops.c_find_series.return_value = [series_ds]
+        mock_ops.c_find_local_series.return_value = []
+
+        received = []
+        self.engine.signals.studies_queried.connect(received.append)
+
+        from datetime import datetime, timedelta
+        cutoff = datetime.now() - timedelta(hours=1)
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=mock_ops):
+            self.engine._query_source(
+                "20260401", cutoff, max_images=0, seen_series=set())
+
+        assert len(received) == 1
+        studies = received[0]
+        assert len(studies) == 1
+        assert studies[0]["institution_name"] == "Hospital Alpha"
+
+    def test_institution_from_study_level_when_present(self):
+        """When study-level InstitutionName IS present, it must be used."""
+        study_ds = self._make_study_ds("1.2.3",
+                                       institution_name="Clinic Beta")
+        series_ds = self._make_series_ds("1.2.3.1",
+                                         institution_name="Clinic Beta")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [study_ds]
+        mock_ops.c_find_series.return_value = [series_ds]
+        mock_ops.c_find_local_series.return_value = []
+
+        received = []
+        self.engine.signals.studies_queried.connect(received.append)
+
+        from datetime import datetime, timedelta
+        cutoff = datetime.now() - timedelta(hours=1)
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=mock_ops):
+            self.engine._query_source(
+                "20260401", cutoff, max_images=0, seen_series=set())
+
+        studies = received[0]
+        assert studies[0]["institution_name"] == "Clinic Beta"
+
+    def test_studies_queried_deduplicates_by_study_uid(self):
+        """Multiple series from the same study must emit one entry."""
+        study_ds = self._make_study_ds("1.2.3", institution_name="")
+        series1 = self._make_series_ds("1.2.3.1",
+                                       institution_name="Hospital Alpha")
+        series2 = self._make_series_ds("1.2.3.2",
+                                       institution_name="Hospital Alpha")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [study_ds]
+        mock_ops.c_find_series.return_value = [series1, series2]
+        mock_ops.c_find_local_series.return_value = []
+
+        received = []
+        self.engine.signals.studies_queried.connect(received.append)
+
+        from datetime import datetime, timedelta
+        cutoff = datetime.now() - timedelta(hours=1)
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=mock_ops):
+            self.engine._query_source(
+                "20260401", cutoff, max_images=0, seen_series=set())
+
+        studies = received[0]
+        assert len(studies) == 1
+        assert studies[0]["study_uid"] == "1.2.3"

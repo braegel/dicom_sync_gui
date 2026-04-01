@@ -387,18 +387,21 @@ class TransferEngine:
                 dicom_ops, studies, seen_series, max_images)
             jobs.extend(prior_jobs)
 
-        # Emit raw study metadata for study rate display (after jobs are
-        # built so it doesn't delay transfer start)
-        self.signals.studies_queried.emit([
-            {
-                "study_uid": getattr(s, 'StudyInstanceUID', ''),
-                "study_date": getattr(s, 'StudyDate', ''),
-                "study_time": (getattr(s, 'StudyTime', '') or '')[:6],
-                "institution_name": str(
-                    getattr(s, 'InstitutionName', '')).strip(),
-            }
-            for s in studies_raw
-        ])
+        # Emit study metadata for study rate display.  Derive from built
+        # jobs (not studies_raw) because InstitutionName is often only
+        # available at series level and resolved during _build_study_jobs.
+        # Deduplicate to one entry per study_uid.
+        seen_uids: dict[str, dict] = {}
+        for j in jobs:
+            uid = j.study_uid
+            if uid not in seen_uids:
+                seen_uids[uid] = {
+                    "study_uid": uid,
+                    "study_date": j.study_date,
+                    "study_time": j.study_time,
+                    "institution_name": j.institution_name,
+                }
+        self.signals.studies_queried.emit(list(seen_uids.values()))
 
         return jobs
 
