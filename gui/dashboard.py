@@ -277,6 +277,14 @@ class SourceDashboard(QWidget):
         stats_group.setLayout(sl)
         layout.addWidget(stats_group)
 
+        # ── Study Rate Display ──
+        self.study_rate_group = QGroupBox("Studies / Hour")
+        self.study_rate_layout = QHBoxLayout()
+        self.study_rate_labels: dict[str, QLabel] = {}
+        self._rebuild_study_rate_labels()
+        self.study_rate_group.setLayout(self.study_rate_layout)
+        layout.addWidget(self.study_rate_group)
+
         # ── Series Queue Table ──
         table_group = QGroupBox("Series Queue")
         tl = QVBoxLayout()
@@ -324,14 +332,6 @@ class SourceDashboard(QWidget):
         summary.addStretch()
         summary.addWidget(self.lbl_status)
         layout.addLayout(summary)
-
-        # ── Study Rate Display ──
-        self.study_rate_group = QGroupBox("Studies / Hour")
-        self.study_rate_layout = QHBoxLayout()
-        self.study_rate_labels: dict[str, QLabel] = {}
-        self._rebuild_study_rate_labels()
-        self.study_rate_group.setLayout(self.study_rate_layout)
-        layout.addWidget(self.study_rate_group)
 
     # ── Filter group handling ─────────────────────────────────────────
 
@@ -595,8 +595,6 @@ class SourceDashboard(QWidget):
         self.lbl_total_series.setText(
             f"Series: {done_count} / {len(queue)}")
 
-        self._update_study_rate_display(queue)
-
     def on_queue_ready_for_selection(self, queue: list):
         """Engine paused after query — show checkboxes for manual selection."""
         self._last_queue = queue
@@ -788,9 +786,13 @@ class SourceDashboard(QWidget):
             return "#f1c40f"
         return "#e74c3c"
 
-    def _update_study_rate_display(self, queue: list):
+    def on_studies_queried(self, studies: list):
+        """Slot for the studies_queried signal — receives raw query results."""
+        self._update_study_rate_display(studies)
+
+    def _update_study_rate_display(self, studies: list):
         """Refresh the study rate labels and trigger high-load popup."""
-        rates = self._compute_study_rates(queue)
+        rates = self._compute_study_rates(studies)
 
         # Create labels on the fly for groups not yet tracked
         for key in rates:

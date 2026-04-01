@@ -194,6 +194,8 @@ class TransferSignals(QObject):
     log_message = Signal(str)
     # Unknown institution detected (institution_name)
     unknown_institution = Signal(str)
+    # Raw query results — study-level dicts for study rate display
+    studies_queried = Signal(list)  # list[{study_uid, study_date, study_time, institution_name}]
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +386,19 @@ class TransferEngine:
             prior_jobs = self._resolve_priors(
                 dicom_ops, studies, seen_series, max_images)
             jobs.extend(prior_jobs)
+
+        # Emit raw study metadata for study rate display (after jobs are
+        # built so it doesn't delay transfer start)
+        self.signals.studies_queried.emit([
+            {
+                "study_uid": getattr(s, 'StudyInstanceUID', ''),
+                "study_date": getattr(s, 'StudyDate', ''),
+                "study_time": (getattr(s, 'StudyTime', '') or '')[:6],
+                "institution_name": str(
+                    getattr(s, 'InstitutionName', '')).strip(),
+            }
+            for s in studies_raw
+        ])
 
         return jobs
 
