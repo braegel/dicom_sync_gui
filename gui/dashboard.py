@@ -5,11 +5,14 @@ the series queue with ETE (estimated time to completion),
 and real-time throughput statistics with color-coded indicators.
 """
 
+from datetime import datetime, timedelta
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
     QPushButton, QSpinBox, QFormLayout, QCheckBox, QComboBox,
     QListWidget, QListWidgetItem, QMenu, QToolButton, QFrame,
+    QMessageBox, QApplication,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QAction
@@ -81,6 +84,7 @@ class SourceDashboard(QWidget):
         self._service_running = False
         self._settings_dirty = False
         self._filter_popup_visible = False
+        self._last_high_load_groups: set = set()
         self._setup_ui()
 
         # Refresh stats display every 2 seconds
@@ -321,6 +325,14 @@ class SourceDashboard(QWidget):
         summary.addWidget(self.lbl_status)
         layout.addLayout(summary)
 
+        # ── Study Rate Display ──
+        self.study_rate_group = QGroupBox("Studies / Hour")
+        self.study_rate_layout = QHBoxLayout()
+        self.study_rate_labels: dict[str, QLabel] = {}
+        self._rebuild_study_rate_labels()
+        self.study_rate_group.setLayout(self.study_rate_layout)
+        layout.addWidget(self.study_rate_group)
+
     # ── Filter group handling ─────────────────────────────────────────
 
     def _populate_filter_menu(self):
@@ -359,6 +371,7 @@ class SourceDashboard(QWidget):
         self.config.save()
         self._update_filter_enabled_state()
         self._update_filter_button_text()
+        self._rebuild_study_rate_labels()
         self._on_settings_changed()
 
     def _on_small_series_toggled(self, checked: bool):
@@ -418,6 +431,7 @@ class SourceDashboard(QWidget):
         self._populate_filter_menu()
         self._update_filter_button_text()
         self._update_filter_enabled_state()
+        self._rebuild_study_rate_labels()
 
     # ── Service control handlers ──────────────────────────────────────────
 
@@ -581,6 +595,8 @@ class SourceDashboard(QWidget):
         self.lbl_total_series.setText(
             f"Series: {done_count} / {len(queue)}")
 
+        self._update_study_rate_display(queue)
+
     def on_queue_ready_for_selection(self, queue: list):
         """Engine paused after query — show checkboxes for manual selection."""
         self._last_queue = queue
@@ -713,6 +729,108 @@ class SourceDashboard(QWidget):
             ete_item.setTextAlignment(Qt.AlignCenter)
             self.series_table.setItem(i, 9, ete_item)
 
+    # ── Study rate ────────────────────────────────────────────────────────
+
+    def _rebuild_study_rate_labels(self):
+        """Create or recreate per-group (or total) labels."""
+        # Clear existing
+        for lbl in self.study_rate_labels.values():
+            lbl.setParent(None)
+        self.study_rate_labels.clear()
+
+        if self.config.filter_groups_enabled:
+            for name in self.config.filter_group_names:
+                lbl = QLabel(f"{name}: 0")
+                self.study_rate_layout.addWidget(lbl)
+                self.study_rate_labels[name] = lbl
+        else:
+            lbl = QLabel("Total: 0")
+            self.study_rate_layout.addWidget(lbl)
+            self.study_rate_labels["_total"] = lbl
+
+    def _compute_study_rates(self, queue: list,
+                             now: datetime | None = None) -> dict[str, int]:
+        """Count unique studies within the last 60 minutes, grouped."""
+        now = now or datetime.now()
+        cutoff = now - timedelta(minutes=60)
+        seen: dict[str, set] = {}  # group -> set of study_uids
+
+        for job in queue:
+            sd = job.get("study_date", "")
+            st = job.get("study_time", "").ljust(6, "0")[:6]
+            if not sd:
+                continue
+            try:
+                dt = datetime.strptime(f"{sd}{st}", "%Y%m%d%H%M%S")
+            except ValueError:
+                continue
+            if dt <= cutoff:
+                continue
+
+            if self.config.filter_groups_enabled:
+                group = self.config.institution_assignments.get(
+                    job.get("institution_name", ""), "")
+            else:
+                group = "_total"
+
+            seen.setdefault(group, set()).add(job.get("study_uid", ""))
+
+        return {g: len(uids) for g, uids in seen.items()}
+
+    @staticmethod
+    def _study_rate_color(n: int) -> str | None:
+        """Return CSS color string for a study rate value."""
+        if n <= 0:
+            return None
+        if n <= 5:
+            return "#2ecc71"
+        if n <= 11:
+            return "#f1c40f"
+        return "#e74c3c"
+
+    def _update_study_rate_display(self, queue: list):
+        """Refresh the study rate labels and trigger high-load popup."""
+        rates = self._compute_study_rates(queue)
+
+        # Create labels on the fly for groups not yet tracked
+        for key in rates:
+            if key not in self.study_rate_labels:
+                display = "Unassigned" if key == "" else key
+                lbl = QLabel(f"{display}: 0")
+                self.study_rate_layout.addWidget(lbl)
+                self.study_rate_labels[key] = lbl
+
+        for key, lbl in self.study_rate_labels.items():
+            count = rates.get(key, 0)
+            if key == "_total":
+                lbl.setText(f"Total: {count}")
+            elif key == "":
+                lbl.setText(f"Unassigned: {count}")
+            else:
+                lbl.setText(f"{key}: {count}")
+            color = self._study_rate_color(count)
+            if color:
+                lbl.setStyleSheet(f"color: {color};")
+            else:
+                lbl.setStyleSheet("")
+
+        # High-load popup (non-modal so it doesn't block signal processing)
+        high_groups = {g for g, c in rates.items() if c >= 12}
+        new_high = high_groups - self._last_high_load_groups
+        if new_high and self.config.high_load_alert_enabled:
+            QApplication.beep()
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("High Study Load")
+            msg.setText(
+                "The incoming study rate has exceeded the threshold "
+                "(≥12 studies/hour). Please check system capacity.",
+            )
+            msg.setModal(False)
+            msg.setAttribute(Qt.WA_DeleteOnClose)
+            msg.show()
+        self._last_high_load_groups = high_groups
+
     # ── Helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
@@ -739,6 +857,7 @@ class SourceDashboard(QWidget):
         self.series_table.setRowCount(0)
         self._current_stats = None
         self._last_queue = []
+        self._last_high_load_groups = set()
         self.stat_last.setText("\u2014")
         self.stat_med5.setText("\u2014")
         self.stat_med10.setText("\u2014")
@@ -747,6 +866,7 @@ class SourceDashboard(QWidget):
         self.lbl_total_series.setText("Series: 0")
         self.lbl_cycle.setText("Cycle: \u2014")
         self.lbl_status.setText("Idle")
+        self._rebuild_study_rate_labels()
 
     def sync_from_config(self):
         """Update spinboxes from the current config node values."""

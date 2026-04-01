@@ -39,6 +39,8 @@ class SeriesJob:
     status: str = "queued"  # queued, transferring, done, error, skipped
     institution_name: str = ""
     images_per_minute: float = 0.0
+    study_date: str = ""
+    study_time: str = ""
 
     @property
     def to_transfer(self) -> int:
@@ -59,6 +61,8 @@ class SeriesJob:
             "status": self.status,
             "institution_name": self.institution_name,
             "images_per_minute": self.images_per_minute,
+            "study_date": self.study_date,
+            "study_time": self.study_time,
         }
 
 
@@ -391,6 +395,8 @@ class TransferEngine:
         patient_name = str(getattr(study_ds, 'PatientName', 'Unknown'))
         patient_id = getattr(study_ds, 'PatientID', '')
         study_desc = getattr(study_ds, 'StudyDescription', 'N/A')
+        study_date = getattr(study_ds, 'StudyDate', '')
+        study_time = getattr(study_ds, 'StudyTime', '')[:6] if getattr(study_ds, 'StudyTime', '') else ''
         institution = str(
             getattr(study_ds, 'InstitutionName', '')).strip()
 
@@ -441,6 +447,8 @@ class TransferEngine:
                 remote_count=remote_count,
                 local_count=local_count,
                 institution_name=institution,
+                study_date=study_date,
+                study_time=study_time,
             ))
         return jobs
 
@@ -541,6 +549,9 @@ class TransferEngine:
                 ps_uid = getattr(ps, 'StudyInstanceUID', '')
                 ps_name = str(getattr(ps, 'PatientName', 'Unknown'))
                 ps_desc = getattr(ps, 'StudyDescription', 'N/A')
+                ps_date = getattr(ps, 'StudyDate', '')
+                ps_time_raw = getattr(ps, 'StudyTime', '')
+                ps_time = ps_time_raw[:6] if ps_time_raw else ''
 
                 series_list = dicom_ops.c_find_series(ps_uid)
                 local_series = self._fetch_local_series_counts(
@@ -568,6 +579,8 @@ class TransferEngine:
                         series_uid=series_uid,
                         remote_count=remote_count,
                         local_count=local_count,
+                        study_date=ps_date,
+                        study_time=ps_time,
                     ))
 
             if prior_jobs:

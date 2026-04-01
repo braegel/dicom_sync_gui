@@ -3,6 +3,7 @@ Tests for gui.dashboard — SourceDashboard and StatsLabel.
 """
 
 import time
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -169,14 +170,16 @@ class TestDashboardUI:
 
     def test_table_has_correct_columns(self):
         table = self.dashboard.series_table
-        assert table.columnCount() == 9
-        headers = [
+        # 11 total columns: hidden ☑ (0), Patient–ETE (1-9), Group (10)
+        assert table.columnCount() == 11
+        visible = [
             table.horizontalHeaderItem(i).text()
             for i in range(table.columnCount())
+            if not table.isColumnHidden(i)
         ]
-        assert headers == [
+        assert visible == [
             "Patient", "Study", "Series", "Modality",
-            "Images", "Pending", "img/min", "Status", "ETE",
+            "Images", "Pending", "img/min", "Status", "ETE", "Group",
         ]
 
     def test_signals_exist(self):
@@ -251,6 +254,8 @@ class TestDashboardQueue:
             "status": "queued",
             "institution_name": "Hospital",
             "images_per_minute": 0.0,
+            "study_date": "",
+            "study_time": "",
         }
         base.update(overrides)
         return base
@@ -266,25 +271,25 @@ class TestDashboardQueue:
     def test_on_queue_updated_shows_patient_name(self):
         queue = [self._make_job_dict(patient_name="Smith^Jane")]
         self.dashboard.on_queue_updated(queue)
-        item = self.dashboard.series_table.item(0, 0)
+        item = self.dashboard.series_table.item(0, 1)  # col 1 = Patient
         assert item.text() == "Smith^Jane"
 
     def test_on_queue_updated_shows_pending(self):
         queue = [self._make_job_dict(remote_count=100, local_count=30)]
         self.dashboard.on_queue_updated(queue)
-        pending_item = self.dashboard.series_table.item(0, 5)
+        pending_item = self.dashboard.series_table.item(0, 6)  # col 6 = Pending
         assert pending_item.text() == "70"
 
     def test_done_status_shows_checkmark_in_ete(self):
         queue = [self._make_job_dict(status="done")]
         self.dashboard.on_queue_updated(queue)
-        ete_item = self.dashboard.series_table.item(0, 8)  # col 8 = ETE
+        ete_item = self.dashboard.series_table.item(0, 9)  # col 9 = ETE
         assert "\u2713" in ete_item.text()
 
     def test_error_status_shows_dash_in_ete(self):
         queue = [self._make_job_dict(status="error")]
         self.dashboard.on_queue_updated(queue)
-        ete_item = self.dashboard.series_table.item(0, 8)  # col 8 = ETE
+        ete_item = self.dashboard.series_table.item(0, 9)  # col 9 = ETE
         assert "\u2014" in ete_item.text()
 
     def test_series_count_label(self):
@@ -308,20 +313,20 @@ class TestDashboardQueue:
         queue = [self._make_job_dict(
             status="done", images_per_minute=150.0)]
         self.dashboard.on_queue_updated(queue)
-        ipm_item = self.dashboard.series_table.item(0, 6)  # col 6 = img/min
+        ipm_item = self.dashboard.series_table.item(0, 7)  # col 7 = img/min
         assert ipm_item.text() == "150"
 
     def test_ipm_column_shows_dash_for_queued(self):
         queue = [self._make_job_dict(status="queued")]
         self.dashboard.on_queue_updated(queue)
-        ipm_item = self.dashboard.series_table.item(0, 6)
+        ipm_item = self.dashboard.series_table.item(0, 7)  # col 7 = img/min
         assert "\u2014" in ipm_item.text()
 
     def test_ipm_column_shows_dash_for_done_zero_speed(self):
         queue = [self._make_job_dict(
             status="done", images_per_minute=0.0)]
         self.dashboard.on_queue_updated(queue)
-        ipm_item = self.dashboard.series_table.item(0, 6)
+        ipm_item = self.dashboard.series_table.item(0, 7)  # col 7 = img/min
         assert "\u2014" in ipm_item.text()
 
 
@@ -587,3 +592,381 @@ class TestDashboardGroupColumn:
             if hdr and hdr.text() == "Group":
                 return col
         pytest.fail("No 'Group' column found in series table")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SourceDashboard — study rate display (studies per hour)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _dt(minutes_ago: float, ref: datetime | None = None) -> tuple[str, str]:
+    """Return (study_date, study_time) strings for *minutes_ago* before *ref*.
+
+    Utility for building job dicts with realistic DICOM date/time values.
+    """
+    ref = ref or datetime.now()
+    dt = ref - timedelta(minutes=minutes_ago)
+    return dt.strftime("%Y%m%d"), dt.strftime("%H%M%S")
+
+
+class TestStudyRateCalculation:
+    """_compute_study_rates must count unique studies (by study_uid) whose
+    study_date+study_time falls within the last 60 minutes, grouped by
+    filter group when filtering is enabled."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+        self.now = datetime.now()
+
+    def _make_job(self, **overrides):
+        sd, st = _dt(30, self.now)  # default: 30 min ago
+        base = {
+            "patient_name": "Doe^John",
+            "patient_id": "12345",
+            "study_description": "CT Head",
+            "series_description": "Axial",
+            "modality": "CT",
+            "series_number": "1",
+            "study_uid": "1.2.3.4",
+            "series_uid": "1.2.3.4.5",
+            "remote_count": 100,
+            "local_count": 10,
+            "status": "queued",
+            "institution_name": "Hospital Alpha",
+            "images_per_minute": 0.0,
+            "study_date": sd,
+            "study_time": st,
+        }
+        base.update(overrides)
+        return base
+
+    def test_counts_unique_studies(self):
+        """Two series sharing a study_uid count as ONE study."""
+        sd, st = _dt(10, self.now)
+        queue = [
+            self._make_job(study_uid="S1", series_uid="1.1",
+                           study_date=sd, study_time=st),
+            self._make_job(study_uid="S1", series_uid="1.2",
+                           study_date=sd, study_time=st),
+        ]
+        rates = self.dashboard._compute_study_rates(queue, now=self.now)
+        # filter enabled → keyed by group; Hospital Alpha → Group A
+        assert rates["Group A"] == 1
+
+    def test_excludes_studies_older_than_60min(self):
+        """A study from 90 minutes ago must not be counted."""
+        sd_old, st_old = _dt(90, self.now)
+        sd_new, st_new = _dt(10, self.now)
+        queue = [
+            self._make_job(study_uid="OLD", series_uid="1.1",
+                           study_date=sd_old, study_time=st_old,
+                           institution_name="Hospital Alpha"),
+            self._make_job(study_uid="NEW", series_uid="1.2",
+                           study_date=sd_new, study_time=st_new,
+                           institution_name="Hospital Alpha"),
+        ]
+        rates = self.dashboard._compute_study_rates(queue, now=self.now)
+        assert rates["Group A"] == 1
+
+    def test_groups_counted_separately(self):
+        """Each group gets its own count."""
+        sd, st = _dt(5, self.now)
+        queue = [
+            self._make_job(study_uid="S1", series_uid="1.1",
+                           institution_name="Hospital Alpha",
+                           study_date=sd, study_time=st),
+            self._make_job(study_uid="S2", series_uid="1.2",
+                           institution_name="Clinic Beta",
+                           study_date=sd, study_time=st),
+        ]
+        rates = self.dashboard._compute_study_rates(queue, now=self.now)
+        assert rates["Group A"] == 1
+        assert rates["Group B"] == 1
+
+    def test_total_when_filter_disabled(self):
+        """With filtering off, rates has a single '_total' key."""
+        self.config.filter_groups_enabled = False
+        sd, st = _dt(5, self.now)
+        queue = [
+            self._make_job(study_uid="S1", series_uid="1.1",
+                           study_date=sd, study_time=st),
+            self._make_job(study_uid="S2", series_uid="1.2",
+                           study_date=sd, study_time=st),
+        ]
+        rates = self.dashboard._compute_study_rates(queue, now=self.now)
+        assert "_total" in rates
+        assert rates["_total"] == 2
+
+    def test_empty_queue_returns_zero(self):
+        rates = self.dashboard._compute_study_rates([], now=self.now)
+        assert rates.get("Group A", 0) == 0
+
+    def test_study_at_boundary_excluded(self):
+        """A study exactly 60 minutes ago is outside the window."""
+        sd, st = _dt(60, self.now)
+        queue = [
+            self._make_job(study_uid="BOUNDARY", series_uid="1.1",
+                           study_date=sd, study_time=st),
+        ]
+        rates = self.dashboard._compute_study_rates(queue, now=self.now)
+        assert rates.get("Group A", 0) == 0
+
+    def test_study_at_59min_included(self):
+        """A study 59 minutes ago is inside the window."""
+        sd, st = _dt(59, self.now)
+        queue = [
+            self._make_job(study_uid="INSIDE", series_uid="1.1",
+                           study_date=sd, study_time=st),
+        ]
+        rates = self.dashboard._compute_study_rates(queue, now=self.now)
+        assert rates["Group A"] == 1
+
+    def test_unassigned_institution_grouped_under_empty(self):
+        """Institutions with no group assignment are counted under ''."""
+        sd, st = _dt(5, self.now)
+        queue = [
+            self._make_job(study_uid="S1", series_uid="1.1",
+                           institution_name="Unknown Clinic",
+                           study_date=sd, study_time=st),
+        ]
+        rates = self.dashboard._compute_study_rates(queue, now=self.now)
+        assert rates.get("", 0) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SourceDashboard — study rate display widgets and color coding
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStudyRateDisplay:
+    """The dashboard must show a 'Study Rate' section with per-group labels
+    (when filter active) or a single total label (when filter inactive).
+    Color coding: 0 = neutral, 1-5 = green, 6-11 = yellow, ≥12 = red."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+        self.now = datetime.now()
+
+    def _make_job(self, **overrides):
+        sd, st = _dt(30, self.now)
+        base = {
+            "patient_name": "Doe^John",
+            "patient_id": "12345",
+            "study_description": "CT Head",
+            "series_description": "Axial",
+            "modality": "CT",
+            "series_number": "1",
+            "study_uid": "1.2.3.4",
+            "series_uid": "1.2.3.4.5",
+            "remote_count": 100,
+            "local_count": 10,
+            "status": "queued",
+            "institution_name": "Hospital Alpha",
+            "images_per_minute": 0.0,
+            "study_date": sd,
+            "study_time": st,
+        }
+        base.update(overrides)
+        return base
+
+    # -- widget existence -------------------------------------------------
+
+    def test_study_rate_group_box_exists(self):
+        """A QGroupBox titled 'Studies / Hour' must exist."""
+        assert hasattr(self.dashboard, "study_rate_group")
+        assert self.dashboard.study_rate_group.title() == "Studies / Hour"
+
+    def test_per_group_labels_when_filter_enabled(self):
+        """With filtering on, there must be a label dict keyed by group."""
+        assert hasattr(self.dashboard, "study_rate_labels")
+        assert isinstance(self.dashboard.study_rate_labels, dict)
+
+    # -- color coding -----------------------------------------------------
+
+    def test_rate_color_zero_is_neutral(self):
+        color = SourceDashboard._study_rate_color(0)
+        assert color is None or "white" in color.lower() or "transparent" in color.lower()
+
+    def test_rate_color_1_to_5_is_green(self):
+        for n in (1, 3, 5):
+            color = SourceDashboard._study_rate_color(n)
+            assert "#2ecc71" in color
+
+    def test_rate_color_6_to_11_is_yellow(self):
+        for n in (6, 8, 11):
+            color = SourceDashboard._study_rate_color(n)
+            assert "#f1c40f" in color
+
+    def test_rate_color_12_plus_is_red(self):
+        for n in (12, 15, 99):
+            color = SourceDashboard._study_rate_color(n)
+            assert "#e74c3c" in color
+
+    # -- label update after queue -----------------------------------------
+
+    def test_labels_updated_on_queue_update(self):
+        """on_queue_updated must refresh the study rate labels."""
+        sd, st = _dt(5, self.now)
+        queue = [
+            self._make_job(study_uid=f"S{i}", series_uid=f"1.{i}",
+                           study_date=sd, study_time=st)
+            for i in range(3)
+        ]
+        self.dashboard.on_queue_updated(queue)
+        # Group A label should show "3"
+        lbl = self.dashboard.study_rate_labels.get("Group A")
+        assert lbl is not None
+        assert "3" in lbl.text()
+
+    def test_single_total_label_when_filter_disabled(self):
+        """With filtering off, a single '_total' label is shown."""
+        self.config.filter_groups_enabled = False
+        dash = SourceDashboard(config=self.config, remote_key="ct")
+        sd, st = _dt(5, self.now)
+        queue = [
+            self._make_job(study_uid="S1", series_uid="1.1",
+                           study_date=sd, study_time=st),
+        ]
+        dash.on_queue_updated(queue)
+        lbl = dash.study_rate_labels.get("_total")
+        assert lbl is not None
+        assert "1" in lbl.text()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SourceDashboard — high-load popup
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestHighLoadPopup:
+    """When any group's study rate hits ≥12 a warning popup with a sound
+    must appear.  The popup can be disabled via config."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.high_load_alert_enabled = True
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+        self.now = datetime.now()
+
+    def _make_job(self, **overrides):
+        sd, st = _dt(30, self.now)
+        base = {
+            "patient_name": "Doe^John",
+            "patient_id": "12345",
+            "study_description": "CT Head",
+            "series_description": "Axial",
+            "modality": "CT",
+            "series_number": "1",
+            "study_uid": "1.2.3.4",
+            "series_uid": "1.2.3.4.5",
+            "remote_count": 100,
+            "local_count": 10,
+            "status": "queued",
+            "institution_name": "Hospital Alpha",
+            "images_per_minute": 0.0,
+            "study_date": sd,
+            "study_time": st,
+        }
+        base.update(overrides)
+        return base
+
+    def _build_queue(self, n_studies):
+        """Build a queue with *n_studies* unique studies in the last hour."""
+        sd, st = _dt(5, self.now)
+        jobs = []
+        for i in range(n_studies):
+            jobs.append(self._make_job(
+                study_uid=f"S{i}", series_uid=f"1.{i}",
+                study_date=sd, study_time=st,
+            ))
+        return jobs
+
+    # -- popup trigger ----------------------------------------------------
+
+    @patch("gui.dashboard.QMessageBox")
+    def test_popup_shown_at_12_studies(self, mock_msgbox_cls):
+        """Popup must fire when rate reaches 12."""
+        queue = self._build_queue(12)
+        self.dashboard.on_queue_updated(queue)
+        mock_msgbox_cls.return_value.show.assert_called_once()
+
+    @patch("gui.dashboard.QMessageBox")
+    def test_popup_not_shown_at_11_studies(self, mock_msgbox_cls):
+        """Popup must NOT fire when rate is below 12."""
+        queue = self._build_queue(11)
+        self.dashboard.on_queue_updated(queue)
+        mock_msgbox_cls.return_value.show.assert_not_called()
+
+    @patch("gui.dashboard.QMessageBox")
+    def test_popup_message_is_english(self, mock_msgbox_cls):
+        """The popup text must be in English."""
+        queue = self._build_queue(14)
+        self.dashboard.on_queue_updated(queue)
+        instance = mock_msgbox_cls.return_value
+        title = instance.setWindowTitle.call_args[0][0]
+        message = instance.setText.call_args[0][0]
+        assert "load" in title.lower() or "load" in message.lower()
+
+    # -- sound ------------------------------------------------------------
+
+    @patch("gui.dashboard.QApplication.beep")
+    @patch("gui.dashboard.QMessageBox")
+    def test_sound_played_on_popup(self, mock_msgbox_cls, mock_beep):
+        """An audible alert must accompany the popup."""
+        queue = self._build_queue(12)
+        self.dashboard.on_queue_updated(queue)
+        mock_beep.assert_called_once()
+
+    # -- config disable ---------------------------------------------------
+
+    @patch("gui.dashboard.QMessageBox")
+    def test_popup_suppressed_when_disabled(self, mock_msgbox_cls):
+        """Setting high_load_alert_enabled=False must suppress the popup."""
+        self.config.high_load_alert_enabled = False
+        queue = self._build_queue(15)
+        self.dashboard.on_queue_updated(queue)
+        mock_msgbox_cls.return_value.show.assert_not_called()
+
+    @patch("gui.dashboard.QApplication.beep")
+    @patch("gui.dashboard.QMessageBox")
+    def test_no_sound_when_disabled(self, mock_msgbox_cls, mock_beep):
+        """Sound must also be suppressed when alert is disabled."""
+        self.config.high_load_alert_enabled = False
+        queue = self._build_queue(15)
+        self.dashboard.on_queue_updated(queue)
+        mock_beep.assert_not_called()
+
+    # -- no repeated popup for same rate ----------------------------------
+
+    @patch("gui.dashboard.QMessageBox")
+    def test_popup_not_repeated_on_same_queue(self, mock_msgbox_cls):
+        """Popup must not fire again if the rate hasn't changed."""
+        queue = self._build_queue(13)
+        self.dashboard.on_queue_updated(queue)
+        self.dashboard.on_queue_updated(queue)
+        assert mock_msgbox_cls.return_value.show.call_count == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Config — high_load_alert_enabled
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestConfigHighLoadAlert:
+    """AppConfig must have a high_load_alert_enabled flag, defaulting True."""
+
+    def test_default_true(self, tmp_config_path):
+        config = AppConfig(config_path=tmp_config_path)
+        assert config.high_load_alert_enabled is True
+
+    def test_roundtrip(self, tmp_config_path):
+        config = AppConfig(config_path=tmp_config_path)
+        config.high_load_alert_enabled = False
+        config.save()
+        config2 = AppConfig(config_path=tmp_config_path)
+        config2.load()
+        assert config2.high_load_alert_enabled is False

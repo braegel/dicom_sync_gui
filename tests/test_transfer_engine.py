@@ -93,8 +93,20 @@ class TestSeriesJob:
             "series_description", "modality", "series_number",
             "study_uid", "series_uid", "remote_count", "local_count",
             "status", "institution_name", "images_per_minute",
+            "study_date", "study_time",
         }
         assert set(d.keys()) == expected
+
+    def test_study_date_time_defaults(self):
+        job = SeriesJob()
+        assert job.study_date == ""
+        assert job.study_time == ""
+
+    def test_study_date_time_in_to_dict(self):
+        job = SeriesJob(study_date="20260401", study_time="143000")
+        d = job.to_dict()
+        assert d["study_date"] == "20260401"
+        assert d["study_time"] == "143000"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

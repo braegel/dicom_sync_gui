@@ -168,7 +168,8 @@ class TestMainWindowService:
 
         MockEngine.assert_called_once_with(self.config, "ct")
         mock_engine.start.assert_called_once_with(
-            hours=6, max_images=500, sync_interval=120)
+            hours=6, max_images=500, sync_interval=120,
+            selection_mode=False)
 
     @patch.object(MainWindow, '_ensure_storage_scp_for')
     @patch("gui.main_window.TransferEngine")
