@@ -476,3 +476,114 @@ class TestDashboardFilterUI:
         self.dashboard._service_running = False
         self.dashboard._on_settings_changed()
         assert not self.dashboard.restart_banner.isVisible()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SourceDashboard — group column in series queue
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDashboardGroupColumn:
+    """When filter groups are enabled the series table must show an extra
+    'Group' column that displays the group each series belongs to, derived
+    from institution_name → institution_assignments."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        # populated_config has filter_groups_enabled=True,
+        # active_filter_groups=["Group A"],
+        # institution_assignments includes "Hospital Alpha" → "Group A"
+        self.config = populated_config
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def _make_job(self, **overrides):
+        base = {
+            "patient_name": "Doe^John",
+            "patient_id": "12345",
+            "study_description": "CT Head",
+            "series_description": "Axial",
+            "modality": "CT",
+            "series_number": "1",
+            "study_uid": "1.2.3.4",
+            "series_uid": "1.2.3.4.5",
+            "remote_count": 100,
+            "local_count": 10,
+            "status": "queued",
+            "institution_name": "Hospital Alpha",
+            "images_per_minute": 0.0,
+        }
+        base.update(overrides)
+        return base
+
+    # -- column presence --------------------------------------------------
+
+    def test_group_column_visible_when_filter_enabled(self):
+        """A 'Group' column header must be present when filtering is on."""
+        headers = [
+            self.dashboard.series_table.horizontalHeaderItem(i).text()
+            for i in range(self.dashboard.series_table.columnCount())
+            if not self.dashboard.series_table.isColumnHidden(i)
+        ]
+        assert "Group" in headers
+
+    def test_group_column_hidden_when_filter_disabled(self):
+        """The 'Group' column must NOT appear when filtering is off."""
+        self.config.filter_groups_enabled = False
+        dash = SourceDashboard(config=self.config, remote_key="ct")
+        headers = [
+            dash.series_table.horizontalHeaderItem(i).text()
+            for i in range(dash.series_table.columnCount())
+            if not dash.series_table.isColumnHidden(i)
+        ]
+        assert "Group" not in headers
+
+    # -- cell content -----------------------------------------------------
+
+    def test_group_column_shows_group_name(self):
+        """Series from 'Hospital Alpha' (assigned to 'Group A') must show
+        'Group A' in the Group column."""
+        self.dashboard.on_queue_updated([
+            self._make_job(institution_name="Hospital Alpha"),
+        ])
+        group_col = self._find_group_column()
+        item = self.dashboard.series_table.item(0, group_col)
+        assert item is not None
+        assert item.text() == "Group A"
+
+    def test_group_column_shows_different_groups(self):
+        """Two series from different institutions show their respective
+        groups."""
+        self.dashboard.on_queue_updated([
+            self._make_job(institution_name="Hospital Alpha",
+                           series_uid="1.1"),
+            self._make_job(institution_name="Clinic Beta",
+                           series_uid="1.2"),
+        ])
+        group_col = self._find_group_column()
+        assert self.dashboard.series_table.item(0, group_col).text() \
+            == "Group A"
+        assert self.dashboard.series_table.item(1, group_col).text() \
+            == "Group B"
+
+    def test_group_column_unassigned_institution(self):
+        """An institution not assigned to any group shows empty or a
+        placeholder."""
+        self.dashboard.on_queue_updated([
+            self._make_job(institution_name="Unknown Clinic"),
+        ])
+        group_col = self._find_group_column()
+        item = self.dashboard.series_table.item(0, group_col)
+        assert item is not None
+        # unassigned → empty string (assignment is "")
+        assert item.text() == ""
+
+    # -- helpers ----------------------------------------------------------
+
+    def _find_group_column(self):
+        """Return the column index whose header is 'Group'."""
+        table = self.dashboard.series_table
+        for col in range(table.columnCount()):
+            hdr = table.horizontalHeaderItem(col)
+            if hdr and hdr.text() == "Group":
+                return col
+        pytest.fail("No 'Group' column found in series table")

@@ -278,10 +278,10 @@ class SourceDashboard(QWidget):
         tl = QVBoxLayout()
 
         self.series_table = QTableWidget()
-        self.series_table.setColumnCount(10)
+        self.series_table.setColumnCount(11)
         self.series_table.setHorizontalHeaderLabels([
             "☑", "Patient", "Study", "Series", "Modality",
-            "Images", "Pending", "img/min", "Status", "ETE"
+            "Images", "Pending", "img/min", "Status", "ETE", "Group"
         ])
         header = self.series_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -294,10 +294,13 @@ class SourceDashboard(QWidget):
         header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(9, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(10, QHeaderView.ResizeToContents)
         self.series_table.setAlternatingRowColors(True)
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.series_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.series_table.setColumnHidden(0, True)
+        self.series_table.setColumnHidden(10,
+                                          not self.config.filter_groups_enabled)
 
         tl.addWidget(self.series_table)
         table_group.setLayout(tl)
@@ -372,6 +375,8 @@ class SourceDashboard(QWidget):
     def _update_filter_enabled_state(self):
         enabled = self.filter_enable_check.isChecked()
         self.filter_btn.setEnabled(enabled)
+        if hasattr(self, "series_table"):
+            self.series_table.setColumnHidden(10, not enabled)
         # Small-series controls: visible only when filtering is enabled
         small_visible = enabled and self.small_series_check.isChecked()
         self.small_series_check.setVisible(enabled)
@@ -564,6 +569,12 @@ class SourceDashboard(QWidget):
             ete_item.setTextAlignment(Qt.AlignCenter)
             self.series_table.setItem(row, 9, ete_item)
 
+            # Group column
+            group = self.config.institution_assignments.get(
+                job.get("institution_name", ""), "")
+            self.series_table.setItem(
+                row, 10, QTableWidgetItem(group))
+
             if status == "done":
                 done_count += 1
 
@@ -604,6 +615,12 @@ class SourceDashboard(QWidget):
             status_item.setForeground(QColor("#f39c12"))
             self.series_table.setItem(row, 8, status_item)
             self.series_table.setItem(row, 9, QTableWidgetItem("\u2014"))
+
+            # Group column
+            group = self.config.institution_assignments.get(
+                job.get("institution_name", ""), "")
+            self.series_table.setItem(
+                row, 10, QTableWidgetItem(group))
 
         total = sum(max(j["remote_count"] - j["local_count"], 0) for j in queue)
         self.lbl_total_series.setText(f"Series: 0 / {len(queue)}")
