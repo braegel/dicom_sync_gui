@@ -637,3 +637,98 @@ class TestStudiesQueriedEmission:
         studies = received[0]
         assert len(studies) == 1
         assert studies[0]["study_uid"] == "1.2.3"
+
+    def test_filtered_out_studies_still_emitted(self):
+        """Studies rejected by the institution filter must still appear
+        in studies_queried — the signal counts all query results."""
+        # Enable filtering: only Group A is active
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A"]
+        self.config.filter_group_names = ["Group A", "Group B"]
+        self.config.institution_assignments = {
+            "Hospital Alpha": "Group A",
+            "Clinic Beta": "Group B",  # Group B is NOT active → filtered
+        }
+        engine = TransferEngine(self.config, "ct")
+
+        study_a = self._make_study_ds("1.1", institution_name="Hospital Alpha")
+        study_b = self._make_study_ds("1.2", institution_name="Clinic Beta")
+        series_a = self._make_series_ds("1.1.1",
+                                        institution_name="Hospital Alpha")
+        series_b = self._make_series_ds("1.2.1",
+                                        institution_name="Clinic Beta")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [study_a, study_b]
+        mock_ops.c_find_series.side_effect = [[series_a], [series_b]]
+        mock_ops.c_find_local_series.return_value = []
+
+        received = []
+        engine.signals.studies_queried.connect(received.append)
+
+        from datetime import datetime, timedelta
+        cutoff = datetime.now() - timedelta(hours=1)
+        with patch.object(engine, '_make_dicom_ops',
+                          return_value=mock_ops):
+            jobs = engine._query_source(
+                "20260401", cutoff, max_images=0, seen_series=set())
+
+        # Only Group A study should produce jobs
+        assert all(j.institution_name == "Hospital Alpha" for j in jobs)
+        # But BOTH studies must appear in the signal
+        studies = received[0]
+        uids = {s["study_uid"] for s in studies}
+        assert "1.1" in uids
+        assert "1.2" in uids
+        institutions = {s["institution_name"] for s in studies}
+        assert "Hospital Alpha" in institutions
+        assert "Clinic Beta" in institutions
+
+    def test_time_filtered_studies_still_emitted(self):
+        """Studies outside the engine's time cutoff (but returned by the
+        PACS query) must still appear in studies_queried — the dashboard
+        applies its own 60-minute window."""
+        from datetime import datetime, timedelta
+        now = datetime.now()
+
+        # recent study: inside cutoff
+        recent = self._make_study_ds("1.1", institution_name="Hospital Alpha")
+        # old study: outside cutoff (3 hours ago)
+        old = MagicMock()
+        old.StudyInstanceUID = "1.2"
+        old.StudyDate = (now - timedelta(hours=3)).strftime("%Y%m%d")
+        old.StudyTime = (now - timedelta(hours=3)).strftime("%H%M%S")
+        old.PatientName = "Old^Patient"
+        old.PatientID = "P2"
+        old.StudyDescription = "Old CT"
+        old.InstitutionName = "Clinic Beta"
+
+        series_recent = self._make_series_ds(
+            "1.1.1", institution_name="Hospital Alpha")
+
+        mock_ops = MagicMock()
+        # c_find_studies returns BOTH (PACS returns all for date range)
+        mock_ops.c_find_studies.return_value = [recent, old]
+        # c_find_series only called for the recent one (old filtered by time)
+        mock_ops.c_find_series.return_value = [series_recent]
+        mock_ops.c_find_local_series.return_value = []
+
+        received = []
+        self.engine.signals.studies_queried.connect(received.append)
+
+        # cutoff = 1 hour ago → "old" study won't pass time filter
+        cutoff = now - timedelta(hours=1)
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=mock_ops):
+            jobs = self.engine._query_source(
+                "20260401", cutoff, max_images=0, seen_series=set())
+
+        # Only the recent study should produce jobs
+        assert len(jobs) == 1
+        assert jobs[0].study_uid == "1.1"
+
+        # But BOTH studies must appear in the signal
+        studies = received[0]
+        uids = {s["study_uid"] for s in studies}
+        assert "1.1" in uids, "Recent study missing from signal"
+        assert "1.2" in uids, "Time-filtered study missing from signal"

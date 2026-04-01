@@ -374,12 +374,30 @@ class TransferEngine:
 
         self._log(f"  {self.remote_key}: {len(studies)} studies in time window")
 
+        # Seed study_metadata from ALL raw query results (before time
+        # filter) so the dashboard study rate sees every study the PACS
+        # returned.  InstitutionName at study level may be empty — it
+        # gets patched up in _build_study_jobs from the series fallback.
+        study_metadata: dict[str, dict] = {}
+        for s in studies_raw:
+            uid = getattr(s, 'StudyInstanceUID', '')
+            if uid and uid not in study_metadata:
+                raw_time = getattr(s, 'StudyTime', '') or ''
+                study_metadata[uid] = {
+                    "study_uid": uid,
+                    "study_date": getattr(s, 'StudyDate', ''),
+                    "study_time": raw_time[:6],
+                    "institution_name": str(
+                        getattr(s, 'InstitutionName', '')).strip(),
+                }
+
         jobs: List[SeriesJob] = []
         for study_ds in studies:
             if self._cancel.is_set():
                 break
             jobs.extend(self._build_study_jobs(
-                dicom_ops, study_ds, seen_series, max_images))
+                dicom_ops, study_ds, seen_series, max_images,
+                study_metadata))
 
         # Handle prior studies
         if self.config.prior_studies_count > 0:
@@ -387,27 +405,18 @@ class TransferEngine:
                 dicom_ops, studies, seen_series, max_images)
             jobs.extend(prior_jobs)
 
-        # Emit study metadata for study rate display.  Derive from built
-        # jobs (not studies_raw) because InstitutionName is often only
-        # available at series level and resolved during _build_study_jobs.
-        # Deduplicate to one entry per study_uid.
-        seen_uids: dict[str, dict] = {}
-        for j in jobs:
-            uid = j.study_uid
-            if uid not in seen_uids:
-                seen_uids[uid] = {
-                    "study_uid": uid,
-                    "study_date": j.study_date,
-                    "study_time": j.study_time,
-                    "institution_name": j.institution_name,
-                }
-        self.signals.studies_queried.emit(list(seen_uids.values()))
+        # Emit study metadata for study rate display.  Covers ALL studies
+        # from the query (including filtered-out and time-filtered ones)
+        # with InstitutionName patched from series-level where available.
+        self.signals.studies_queried.emit(list(study_metadata.values()))
 
         return jobs
 
     def _build_study_jobs(
             self, dicom_ops: DicomOperations, study_ds,
-            seen_series: Set[str], max_images: int) -> List[SeriesJob]:
+            seen_series: Set[str], max_images: int,
+            study_metadata: dict[str, dict] | None = None,
+    ) -> List[SeriesJob]:
         """Build SeriesJob items for one study."""
         study_uid = getattr(study_ds, 'StudyInstanceUID', '')
         patient_name = str(getattr(study_ds, 'PatientName', 'Unknown'))
@@ -424,6 +433,10 @@ class TransferEngine:
         if not institution and series_list:
             institution = str(
                 getattr(series_list[0], 'InstitutionName', '')).strip()
+
+        # Patch study_metadata with resolved institution (series fallback)
+        if study_metadata is not None and study_uid in study_metadata:
+            study_metadata[study_uid]["institution_name"] = institution
 
         institution_ok = self._passes_institution_filter(institution)
         allow_small = (not institution_ok
