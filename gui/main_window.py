@@ -5,14 +5,15 @@ with an independent download service, queue, and statistics.
 """
 
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QMessageBox, QApplication,
+    QMainWindow, QWidget, QVBoxLayout, QMessageBox,
     QTabWidget, QLabel,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QFont
 
 from core.config import AppConfig
@@ -31,6 +32,9 @@ logger = logging.getLogger("dicom_sync")
 class MainWindow(QMainWindow):
     """Main application window — per-source tabs, fully automatic."""
 
+    _echo_results_ready = Signal(list)
+    _scp_check_done = Signal(str, bool, dict)
+
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
@@ -47,6 +51,8 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._setup_ui()
         self._setup_statusbar()
+        self._echo_results_ready.connect(self._on_echo_results)
+        self._scp_check_done.connect(self._on_scp_check_done)
 
     # ── Menu ──────────────────────────────────────────────────────────────
 
@@ -76,9 +82,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction(log_action)
 
         tools_menu = menubar.addMenu("Tools")
-        echo_action = QAction("C-ECHO Test...", self)
-        echo_action.triggered.connect(self._test_echo)
-        tools_menu.addAction(echo_action)
+        self._echo_action = QAction("C-ECHO Test...", self)
+        self._echo_action.triggered.connect(self._test_echo)
+        tools_menu.addAction(self._echo_action)
 
     # ── Central UI ────────────────────────────────────────────────────────
 
@@ -160,35 +166,41 @@ class MainWindow(QMainWindow):
                 "No source PACS configured. Open Settings first.")
             return
 
+        self._echo_action.setEnabled(False)
         self.statusBar().showMessage("C-ECHO test running...")
-        QApplication.processEvents()
 
-        results = []
-        for key, node in self.config.remote_nodes.items():
-            local_config = self.config.get_local_dict_for(key)
-            ops = DicomOperations(local_config, node.to_dict(), key)
-            ok = ops.c_echo(target='remote')
-            results.append(
-                f"  {key} ({node.name}): "
-                f"{'Reachable' if ok else 'Not reachable'}")
-
-        # Test each unique local destination
-        tested_locals = set()
-        for key, node in self.config.remote_nodes.items():
-            local_key = (node.local_ae_title, node.local_port)
-            if local_key in tested_locals:
-                continue
-            tested_locals.add(local_key)
-            local_config = self.config.get_local_dict_for(key)
-            ops = DicomOperations(local_config, node.to_dict(), key)
-            local_ok = ops.c_echo(target='local')
-            results.append(
-                f"\n  Local [{node.local_ae_title}:{node.local_port}]: "
-                f"{'Reachable' if local_ok else 'Not reachable'}")
-            if not local_ok and node.fallback_folder:
+        def run_echo():
+            results = []
+            for key, node in self.config.remote_nodes.items():
+                local_config = self.config.get_local_dict_for(key)
+                ops = DicomOperations(local_config, node.to_dict(), key)
+                ok = ops.c_echo(target='remote')
                 results.append(
-                    f"  Fallback: {node.fallback_folder}")
+                    f"  {key} ({node.name}): "
+                    f"{'Reachable' if ok else 'Not reachable'}")
 
+            tested_locals = set()
+            for key, node in self.config.remote_nodes.items():
+                local_key = (node.local_ae_title, node.local_port)
+                if local_key in tested_locals:
+                    continue
+                tested_locals.add(local_key)
+                local_config = self.config.get_local_dict_for(key)
+                ops = DicomOperations(local_config, node.to_dict(), key)
+                local_ok = ops.c_echo(target='local')
+                results.append(
+                    f"\n  Local [{node.local_ae_title}:{node.local_port}]: "
+                    f"{'Reachable' if local_ok else 'Not reachable'}")
+                if not local_ok and node.fallback_folder:
+                    results.append(
+                        f"  Fallback: {node.fallback_folder}")
+
+            self._echo_results_ready.emit(results)
+
+        threading.Thread(target=run_echo, daemon=True).start()
+
+    def _on_echo_results(self, results: list):
+        self._echo_action.setEnabled(True)
         QMessageBox.information(
             self, "C-ECHO Results", "Results:\n" + "\n".join(results))
         self.statusBar().showMessage("Ready")
@@ -217,10 +229,17 @@ class MainWindow(QMainWindow):
         if not dashboard:
             return
 
-        # Ensure per-source SCP if local PACS is not reachable
+        # Check local PACS reachability in a background thread,
+        # then start the engine once the check completes.
+        self._pending_start_params = (remote_key, params)
         self._ensure_storage_scp_for(remote_key)
 
-        # Create engine for this source
+    def _start_engine(self, remote_key: str, params: dict):
+        """Actually create and start the engine (called on main thread)."""
+        dashboard = self.dashboards.get(remote_key)
+        if not dashboard:
+            return
+
         engine = TransferEngine(self.config, remote_key)
         self.engines[remote_key] = engine
         self._connect_engine_signals(remote_key, engine, dashboard)
@@ -258,29 +277,47 @@ class MainWindow(QMainWindow):
         not reachable and a fallback folder is configured."""
         node = self.config.remote_nodes.get(remote_key)
         if not node:
+            # No node — skip SCP check, start engine directly
+            rk, params = self._pending_start_params
+            self._start_engine(rk, params)
             return
 
         scp_key = (node.local_ae_title, node.local_port)
 
         # Already running for this AE/port combo?
         if scp_key in self.storage_scps and self.storage_scps[scp_key].running:
+            rk, params = self._pending_start_params
+            self._start_engine(rk, params)
             return
 
-        # Quick echo test against this source's local PACS
-        local_config = self.config.get_local_dict_for(remote_key)
-        ops = DicomOperations(local_config, node.to_dict(), remote_key)
-        local_reachable = ops.c_echo(target='local')
+        # Run echo test in background thread to avoid blocking the UI
+        # and causing GC/threading conflicts with PySide6.
+        def check_local():
+            local_config = self.config.get_local_dict_for(remote_key)
+            ops = DicomOperations(local_config, node.to_dict(), remote_key)
+            reachable = ops.c_echo(target='local')
+            self._scp_check_done.emit(
+                remote_key, reachable, node.to_dict())
+
+        threading.Thread(target=check_local, daemon=True).start()
+
+    def _on_scp_check_done(self, remote_key: str, local_reachable: bool,
+                           node_dict: dict):
+        """Handle SCP check result on the main thread."""
+        node = self.config.remote_nodes.get(remote_key)
+        if not node:
+            return
 
         if not local_reachable:
             fallback = node.fallback_folder
             if fallback:
                 import os
-                # Use a per-source subdirectory under the fallback folder
                 storage_path = os.path.join(fallback, remote_key)
                 self._log(
                     f"Local PACS [{node.local_ae_title}:{node.local_port}] "
                     f"not reachable for {remote_key}. "
                     f"Starting built-in SCP — saving to: {storage_path}")
+                scp_key = (node.local_ae_title, node.local_port)
                 scp = StorageSCP(
                     node.local_ae_title,
                     node.local_port,
@@ -293,6 +330,10 @@ class MainWindow(QMainWindow):
                     f"Local PACS [{node.local_ae_title}:{node.local_port}] "
                     f"not reachable for {remote_key}. "
                     f"No fallback folder configured.")
+
+        # Now start the engine
+        rk, params = self._pending_start_params
+        self._start_engine(rk, params)
 
     # ── Engine signal wiring ──────────────────────────────────────────────
 
