@@ -831,3 +831,152 @@ class TestPatientStudiesCompleted:
 
         self.engine._check_patient_complete("P1")
         assert len(received) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — priors must respect institution filter
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPriorsInstitutionFilter:
+    """Prior studies must be filtered by institution group, just like
+    current studies.  If a prior belongs to an institution in an inactive
+    group, it must be skipped."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        # Group A active, Group B inactive
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A"]
+        self.config.institution_assignments = {
+            "Hospital Alpha": "Group A",
+            "Clinic Beta": "Group B",
+        }
+        self.config.prior_studies_count = 2
+        self.config.prior_studies_same_modality = False
+        self.config.filter_allow_small_series = False
+        self.engine = TransferEngine(self.config, "ct")
+
+    def _make_study_ds(self, study_uid, patient_id="P1",
+                       study_date="20260401", study_time="120000",
+                       institution_name="", modalities="CT"):
+        ds = MagicMock()
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = study_date
+        ds.StudyTime = study_time
+        ds.PatientName = "Doe^John"
+        ds.PatientID = patient_id
+        ds.StudyDescription = "CT Head"
+        ds.InstitutionName = institution_name
+        ds.ModalitiesInStudy = modalities
+        return ds
+
+    def _make_series_ds(self, series_uid, institution_name="",
+                        num_instances=50):
+        ds = MagicMock()
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesDescription = "Axial"
+        ds.Modality = "CT"
+        ds.SeriesNumber = "1"
+        ds.NumberOfSeriesRelatedInstances = num_instances
+        ds.InstitutionName = institution_name
+        return ds
+
+    def test_priors_from_inactive_group_are_skipped(self):
+        """A prior study whose institution belongs to an inactive group
+        must NOT be downloaded."""
+        # Current study is at Hospital Alpha (active Group A)
+        current = [self._make_study_ds(
+            "1.1", institution_name="Hospital Alpha")]
+
+        # Prior study is at Clinic Beta (inactive Group B)
+        prior_ds = self._make_study_ds(
+            "2.1", study_date="20260301",
+            institution_name="Clinic Beta")
+        prior_series = self._make_series_ds(
+            "2.1.1", institution_name="Clinic Beta")
+
+        mock_ops = MagicMock()
+        # c_find_studies(patient_id=...) returns current + prior
+        mock_ops.c_find_studies.return_value = [
+            current[0], prior_ds]
+        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_local_series.return_value = []
+
+        jobs = self.engine._resolve_priors(
+            mock_ops, current, seen_series=set(), max_images=0)
+
+        assert len(jobs) == 0, (
+            "Prior from inactive group should be skipped")
+
+    def test_priors_from_active_group_are_downloaded(self):
+        """A prior study whose institution belongs to an active group
+        must be downloaded."""
+        current = [self._make_study_ds(
+            "1.1", institution_name="Hospital Alpha")]
+
+        prior_ds = self._make_study_ds(
+            "2.1", study_date="20260301",
+            institution_name="Hospital Alpha")
+        prior_series = self._make_series_ds(
+            "2.1.1", institution_name="Hospital Alpha")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [
+            current[0], prior_ds]
+        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_local_series.return_value = []
+
+        jobs = self.engine._resolve_priors(
+            mock_ops, current, seen_series=set(), max_images=0)
+
+        assert len(jobs) == 1
+        assert jobs[0].series_uid == "2.1.1"
+
+    def test_priors_from_unknown_institution_are_downloaded(self):
+        """A prior study from an unknown (unassigned) institution should
+        still be downloaded — same rule as current studies."""
+        current = [self._make_study_ds(
+            "1.1", institution_name="Hospital Alpha")]
+
+        prior_ds = self._make_study_ds(
+            "2.1", study_date="20260301",
+            institution_name="Brand New Hospital")
+        prior_series = self._make_series_ds(
+            "2.1.1", institution_name="Brand New Hospital")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [
+            current[0], prior_ds]
+        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_local_series.return_value = []
+
+        jobs = self.engine._resolve_priors(
+            mock_ops, current, seen_series=set(), max_images=0)
+
+        assert len(jobs) == 1, (
+            "Unknown institution should be downloaded (same as current)")
+
+    def test_priors_unfiltered_when_filtering_disabled(self):
+        """With filtering disabled, all priors should be downloaded."""
+        self.config.filter_groups_enabled = False
+
+        current = [self._make_study_ds(
+            "1.1", institution_name="Hospital Alpha")]
+
+        prior_ds = self._make_study_ds(
+            "2.1", study_date="20260301",
+            institution_name="Clinic Beta")
+        prior_series = self._make_series_ds(
+            "2.1.1", institution_name="Clinic Beta")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [
+            current[0], prior_ds]
+        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_local_series.return_value = []
+
+        jobs = self.engine._resolve_priors(
+            mock_ops, current, seen_series=set(), max_images=0)
+
+        assert len(jobs) == 1

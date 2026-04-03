@@ -605,7 +605,15 @@ class TransferEngine:
                 ps_time_raw = getattr(ps, 'StudyTime', '')
                 ps_time = ps_time_raw[:6] if ps_time_raw else ''
 
+                institution = str(
+                    getattr(ps, 'InstitutionName', '')).strip()
                 series_list = dicom_ops.c_find_series(ps_uid)
+                if not institution and series_list:
+                    institution = str(
+                        getattr(series_list[0], 'InstitutionName', '')
+                    ).strip()
+                if not self._passes_institution_filter(institution):
+                    continue
                 local_series = self._fetch_local_series_counts(
                     dicom_ops, ps_uid)
 
