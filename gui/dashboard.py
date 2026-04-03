@@ -5,8 +5,17 @@ the series queue with ETE (estimated time to completion),
 and real-time throughput statistics with color-coded indicators.
 """
 
+import io
+import math
+import os
+import struct
+import tempfile
+import wave
 from datetime import datetime, timedelta
 
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QFont, QAction
+from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
@@ -14,11 +23,57 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMenu, QToolButton, QFrame,
     QMessageBox, QApplication,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QAction
 
 from core.transfer_engine import TransferStats
 from gui.styles import BTN_START, BTN_STOP, BTN_DOWNLOAD_SELECTED
+
+_default_sound_path: str | None = None
+
+
+def _generate_default_sound() -> str:
+    """Generate a two-tone notification WAV (A5 + D6) and return its path.
+
+    Mirrors the JS reference implementation: two overlapping sine tones
+    with exponential attack/decay envelopes.
+    """
+    global _default_sound_path
+    if _default_sound_path and os.path.exists(_default_sound_path):
+        return _default_sound_path
+
+    sample_rate = 44100
+    duration = 0.68  # covers both notes fully
+    n_samples = int(sample_rate * duration)
+
+    def _envelope(t: float, start: float, dur: float) -> float:
+        rel = t - start
+        if rel < 0.02:
+            return 0.001 * (300.0) ** (rel / 0.02)
+        remaining = dur - 0.02
+        return 0.3 * (0.001 / 0.3) ** ((rel - 0.02) / remaining)
+
+    raw = []
+    for i in range(n_samples):
+        t = i / sample_rate
+        val = 0.0
+        if t < 0.4:
+            val += _envelope(t, 0, 0.4) * math.sin(2 * math.pi * 880 * t)
+        if 0.18 <= t < 0.68:
+            val += _envelope(t, 0.18, 0.5) * math.sin(
+                2 * math.pi * 1174 * t)
+        raw.append(int(max(-1.0, min(1.0, val)) * 32767))
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack(f"<{len(raw)}h", *raw))
+
+    fd, path = tempfile.mkstemp(suffix=".wav", prefix="dicom_notify_")
+    os.write(fd, buf.getvalue())
+    os.close(fd)
+    _default_sound_path = path
+    return path
 
 
 class StatsLabel(QLabel):
@@ -797,7 +852,20 @@ class SourceDashboard(QWidget):
                 institution_name, "")
             if group not in set(self.config.active_filter_groups):
                 return
-        QApplication.beep()
+        path = self.config.study_complete_sound_path
+        if path and os.path.isfile(path):
+            self._play_sound(path)
+        else:
+            self._play_sound(_generate_default_sound())
+
+    def _play_sound(self, path: str):
+        """Play a WAV file via QSoundEffect."""
+        if hasattr(self, "_sound_effect") and self._sound_effect is not None:
+            self._sound_effect.stop()
+            self._sound_effect.deleteLater()
+        self._sound_effect = QSoundEffect(self)
+        self._sound_effect.setSource(QUrl.fromLocalFile(path))
+        self._sound_effect.play()
 
     def on_studies_queried(self, studies: list):
         """Slot for the studies_queried signal — receives raw query results."""

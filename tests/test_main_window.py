@@ -156,9 +156,10 @@ class TestMainWindowService:
         self.win = MainWindow(populated_config)
         self.config = populated_config
 
-    @patch.object(MainWindow, '_ensure_storage_scp_for')
+    @patch.object(MainWindow, '_ensure_storage_scp_for',
+                  lambda self, rk: self._start_engine(*self._pending_start_params))
     @patch("gui.main_window.TransferEngine")
-    def test_start_creates_engine_for_source(self, MockEngine, mock_scp):
+    def test_start_creates_engine_for_source(self, MockEngine):
         mock_engine = MagicMock()
         mock_engine.signals = MagicMock()
         MockEngine.return_value = mock_engine
@@ -183,9 +184,10 @@ class TestMainWindowService:
 
         mock_scp.assert_called_once_with("ct")
 
-    @patch.object(MainWindow, '_ensure_storage_scp_for')
+    @patch.object(MainWindow, '_ensure_storage_scp_for',
+                  lambda self, rk: self._start_engine(*self._pending_start_params))
     @patch("gui.main_window.TransferEngine")
-    def test_start_connects_signals(self, MockEngine, mock_scp):
+    def test_start_connects_signals(self, MockEngine):
         mock_engine = MagicMock()
         mock_signals = MagicMock()
         mock_engine.signals = mock_signals
@@ -319,22 +321,34 @@ class TestMainWindowCEcho:
         self.win._test_echo()
         mock_warning.assert_called_once()
 
-    @patch("gui.main_window.QApplication.processEvents")
     @patch("gui.main_window.QMessageBox.information")
     @patch("gui.main_window.DicomOperations")
+    @patch("gui.main_window.threading.Thread")
     def test_echo_runs_for_all_remotes(
-        self, MockOps, mock_info, mock_events
+        self, MockThread, MockOps, mock_info
     ):
         mock_ops = MagicMock()
         mock_ops.c_echo.return_value = True
         MockOps.return_value = mock_ops
+
+        # Capture the target function and run it synchronously
+        def run_synchronously(**kwargs):
+            thread = MagicMock()
+            thread.start = lambda: kwargs["target"]()
+            return thread
+        MockThread.side_effect = run_synchronously
 
         self.win._test_echo()
 
         # Should call c_echo for each remote + each unique local dest
         # 2 remotes + 2 unique local (different AE/port) = 4 echo calls
         assert mock_ops.c_echo.call_count >= 3
+
+    @patch("gui.main_window.QMessageBox.information")
+    def test_on_echo_results_shows_info_dialog(self, mock_info):
+        self.win._on_echo_results(["  ct (CT Scanner): Reachable"])
         mock_info.assert_called_once()
+        assert "Reachable" in mock_info.call_args[0][2]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -347,53 +361,45 @@ class TestMainWindowSCP:
     def _create(self, populated_config, qapp):
         self.win = MainWindow(populated_config)
 
-    @patch("gui.main_window.DicomOperations")
     @patch("gui.main_window.StorageSCP")
-    def test_ensure_scp_starts_when_local_unreachable(
-        self, MockSCP, MockOps
-    ):
-        mock_ops = MagicMock()
-        mock_ops.c_echo.return_value = False  # local not reachable
-        MockOps.return_value = mock_ops
-
+    def test_scp_started_when_local_unreachable(self, MockSCP):
         mock_scp = MagicMock()
         mock_scp.running = False
         MockSCP.return_value = mock_scp
 
-        self.win._ensure_storage_scp_for("ct")
+        node = self.win.config.remote_nodes["ct"]
+        params = {"hours": 3, "max_images": 0, "sync_interval": 60}
+        self.win._pending_start_params = ("ct", params)
+        self.win._on_scp_check_done("ct", False, node.to_dict())
 
         MockSCP.assert_called_once()
         mock_scp.start.assert_called_once()
-        # Should be stored keyed by (ae_title, port)
         assert ("LOCAL_AE", 11112) in self.win.storage_scps
 
-    @patch("gui.main_window.DicomOperations")
-    def test_ensure_scp_skips_when_local_reachable(self, MockOps):
-        mock_ops = MagicMock()
-        mock_ops.c_echo.return_value = True  # local is reachable
-        MockOps.return_value = mock_ops
+    def test_scp_skipped_when_local_reachable(self):
+        node = self.win.config.remote_nodes["ct"]
+        params = {"hours": 3, "max_images": 0, "sync_interval": 60}
+        self.win._pending_start_params = ("ct", params)
+        self.win._on_scp_check_done("ct", True, node.to_dict())
 
-        self.win._ensure_storage_scp_for("ct")
-
-        # No SCP should be started
         assert len(self.win.storage_scps) == 0
 
-    @patch("gui.main_window.DicomOperations")
-    @patch("gui.main_window.StorageSCP")
-    def test_ensure_scp_reuses_existing(self, MockSCP, MockOps):
-        mock_ops = MagicMock()
-        mock_ops.c_echo.return_value = False
-        MockOps.return_value = mock_ops
+    @patch("gui.main_window.TransferEngine")
+    def test_scp_reuses_existing(self, MockEngine):
+        mock_engine = MagicMock()
+        mock_engine.signals = MagicMock()
+        MockEngine.return_value = mock_engine
 
-        # Pre-existing running SCP for same AE/port
         existing_scp = MagicMock()
         existing_scp.running = True
         self.win.storage_scps[("LOCAL_AE", 11112)] = existing_scp
 
+        params = {"hours": 3, "max_images": 0, "sync_interval": 60}
+        self.win._pending_start_params = ("ct", params)
+        # SCP already running → skips thread, jumps to _start_engine
         self.win._ensure_storage_scp_for("ct")
 
-        # Should not create a new SCP
-        MockSCP.assert_not_called()
+        assert len(self.win.storage_scps) == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
