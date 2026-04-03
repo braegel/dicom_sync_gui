@@ -6,23 +6,51 @@ configurable time window — no manual study selection required.
 
 ---
 
+## Standalone App (macOS)
+
+A ready-to-run macOS app is available in the
+[`releases/`](releases/) folder — no Python installation required.
+
+| File | Architecture | Size |
+|---|---|---|
+| `DICOM_Sync_1.0.0_macOS_arm64.dmg` | Apple Silicon (M1/M2/M3/M4) | ~54 MB |
+
+**Installation:**
+
+1. Open the `.dmg` file.
+2. Drag **DICOM Sync** into the **Applications** folder.
+3. On first launch: right-click → **Open** → **Open** to bypass Gatekeeper
+   (the app is not code-signed).
+
+The app is self-contained and stores its configuration in
+`~/Library/Application Support/DicomSyncGUI/dicom_sync_config.json`.
+
+> To build the app yourself, see [Building the standalone app](#building-the-standalone-app) below.
+
+---
+
 ## Features
 
 - **Multiple Source PACS** — configure any number of remote PACS, each with
   its own AE title, IP, port, transfer syntax, and retrieve method (C-MOVE or
   C-GET).
-- **Automatic Service** — Start/Stop a continuous download loop that queries,
+- **Automatic Service** — start/stop a continuous download loop that queries,
   compares, and transfers all new series.
 - **Prior Studies** — optionally download the last N prior studies per patient
   (all modalities or same modality only).
 - **Institution Filter Groups** — create named groups, assign institutions,
   and select which groups appear on the dashboard. Unknown institutions are
   always downloaded and trigger a popup with sound alert.
+- **Custom Notification Sound** — plays a two-tone chime when a patient's
+  studies complete downloading. Optionally select a custom WAV file or disable
+  sound entirely. With active filter groups, sound only plays for matching
+  institutions.
 - **Real-Time Dashboard** —
   - Series queue with Patient, Study, Series, Modality, Images, Pending,
     img/min, Status, and cumulative ETE (estimated time to end).
   - Throughput statistics: Last Series, Median 5, Median 10, Median All
     (images/minute), colour-coded relative to overall median.
+  - Study rate display showing studies/hour from PACS queries.
   - Series with fewer than 10 images are excluded from speed statistics.
 - **Built-in Storage SCP** — automatic fallback when no local DICOM server is
   reachable; images are saved to a configurable folder.
@@ -34,18 +62,18 @@ configurable time window — no manual study selection required.
 
 ---
 
-## Requirements
+## Requirements (from source)
 
-| Dependency | Minimum version |
+| Dependency   | Minimum version |
 |---|---|
-| Python | 3.10+ |
-| PySide6 | 6.5+ |
-| pydicom | 2.4+ |
-| pynetdicom | 2.0+ |
+| Python       | 3.10+           |
+| PySide6      | 6.5+            |
+| pydicom      | 2.4+            |
+| pynetdicom   | 2.0+            |
 
 ---
 
-## Installation
+## Installation (from source)
 
 ### 1. Install Python
 
@@ -192,9 +220,23 @@ so you can assign them.
 
 ---
 
+## Notification sounds
+
+When all series of a patient have been downloaded, a notification sound plays.
+The default is a built-in two-tone chime (A5 + D6). You can:
+
+- **Disable** the sound via the `study_complete_sound_enabled` setting.
+- **Use a custom WAV file** by setting `study_complete_sound_path` in the
+  configuration file to the full path of a `.wav` file.
+
+If filter groups are active, the sound only plays for institutions that belong
+to an active filter group.
+
+---
+
 ## Running tests
 
-The project includes a comprehensive test suite (314 tests).
+The project includes a comprehensive test suite (418 tests).
 
 ```bash
 # Linux / macOS (headless — no display required)
@@ -212,36 +254,70 @@ set QT_QPA_PLATFORM=offscreen && python -m pytest tests/ -v
 
 ---
 
+## Building the standalone app
+
+The macOS `.app` bundle is built with [PyInstaller](https://pyinstaller.org/).
+
+```bash
+pip install pyinstaller
+pyinstaller dicom_sync.spec
+```
+
+The result is in `dist/DICOM Sync.app`. To create a distributable DMG:
+
+```bash
+mkdir -p /tmp/dmg_stage
+cp -R "dist/DICOM Sync.app" "/tmp/dmg_stage/DICOM Sync.app"
+ln -s /Applications "/tmp/dmg_stage/Applications"
+hdiutil create -volname "DICOM Sync" \
+  -srcfolder /tmp/dmg_stage -ov -format UDZO \
+  releases/DICOM_Sync_1.0.0_macOS_arm64.dmg
+rm -rf /tmp/dmg_stage
+```
+
+> **Note:** The current DMG is built for Apple Silicon (arm64). For Intel Macs,
+> build on an Intel machine or use `--target-arch x86_64`.
+
+---
+
 ## Project structure
 
 ```
 dicom_sync_gui/
-├── main.py                  # Entry point, dark theme, dependency check
-├── __init__.py              # Package version
-├── __main__.py              # python -m support
-├── requirements.txt         # pip dependencies
-├── pytest.ini               # Test runner configuration
+├── main.py                         # Entry point, dark theme, dependency check
+├── __init__.py                     # Package version (1.0.0)
+├── __main__.py                     # python -m support
+├── requirements.txt                # pip dependencies
+├── dicom_sync.spec                 # PyInstaller build spec
+├── pytest.ini                      # Test runner configuration
 ├── README.md
 ├── LICENSE
 ├── .gitignore
+├── .gitattributes                  # Git LFS tracking for DMG files
+│
+├── assets/
+│   └── AppIcon.icns                # macOS application icon
+│
+├── releases/
+│   └── DICOM_Sync_1.0.0_macOS_arm64.dmg   # Standalone macOS app
 │
 ├── core/
-│   ├── config.py            # AppConfig, PacsNode, load/save, export/import
-│   ├── dicom_ops.py         # C-ECHO, C-FIND, C-MOVE operations
-│   ├── storage_scp.py       # Built-in DICOM Storage SCP
-│   └── transfer_engine.py   # Service loop, queue, stats, Qt signals
+│   ├── config.py                   # AppConfig, PacsNode, load/save
+│   ├── dicom_ops.py                # C-ECHO, C-FIND, C-MOVE/C-GET operations
+│   ├── storage_scp.py              # Built-in DICOM Storage SCP
+│   └── transfer_engine.py          # Service loop, queue, stats, Qt signals
 │
 ├── gui/
-│   ├── main_window.py       # Main window, menus, engine wiring
-│   ├── dashboard.py         # Dashboard: controls, queue table, stats
-│   ├── settings_dialog.py   # PACS configuration dialog
-│   ├── filter_groups_dialog.py  # Institution filter group editor
+│   ├── main_window.py              # Main window, menus, engine wiring
+│   ├── dashboard.py                # Dashboard: controls, queue, stats, sound
+│   ├── settings_dialog.py          # PACS configuration dialog
+│   ├── filter_groups_dialog.py     # Institution filter group editor
 │   ├── unknown_institution_popup.py  # Alert popup for unknown institutions
-│   ├── log_window.py        # Floating log viewer
-│   └── styles.py            # Shared button stylesheet constants
+│   ├── log_window.py               # Floating log viewer
+│   └── styles.py                   # Shared button stylesheet constants
 │
-└── tests/
-    ├── conftest.py           # Shared fixtures
+└── tests/                          # 418 tests
+    ├── conftest.py                 # Shared fixtures
     ├── test_config.py
     ├── test_dicom_ops.py
     ├── test_transfer_engine.py
@@ -260,9 +336,9 @@ The configuration is stored as JSON in a platform-specific directory:
 
 | Platform | Path |
 |---|---|
-| macOS | `~/Library/Application Support/DicomSyncGUI/dicom_sync_config.json` |
-| Linux | `~/.config/DicomSyncGUI/dicom_sync_config.json` |
-| Windows | `%APPDATA%\DicomSyncGUI\dicom_sync_config.json` |
+| macOS    | `~/Library/Application Support/DicomSyncGUI/dicom_sync_config.json` |
+| Linux    | `~/.config/DicomSyncGUI/dicom_sync_config.json` |
+| Windows  | `%APPDATA%\DicomSyncGUI\dicom_sync_config.json` |
 
 A log file (`dicom_sync_gui.log`) is written to the working directory.
 
@@ -273,4 +349,4 @@ A log file (`dicom_sync_gui.log`) is written to the working directory.
 This project is licensed under the **GNU General Public License v3.0**.
 See [LICENSE](LICENSE) for the full text.
 
-Copyright (C) 2026 Bernd Brägelmann
+Copyright (C) 2026 Bernd Bragelmann
