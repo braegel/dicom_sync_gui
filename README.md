@@ -8,12 +8,13 @@ configurable time window — no manual study selection required.
 
 ## Standalone App (macOS)
 
-A ready-to-run macOS app is available in the
-[`releases/`](releases/) folder — no Python installation required.
+A ready-to-run macOS app is available on the
+[Releases](https://github.com/braegel/dicom_sync_gui/releases) page —
+no Python installation required.
 
 | File | Architecture | Size |
 |---|---|---|
-| `DICOM_Sync_1.0.0_macOS_arm64.dmg` | Apple Silicon (M1/M2/M3/M4) | ~54 MB |
+| [`DICOM_Sync_1.0.0_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.0/DICOM_Sync_1.0.0_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~54 MB |
 
 **Installation:**
 
