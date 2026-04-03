@@ -62,7 +62,13 @@ The app is self-contained and stores its configuration in
 
 ---
 
-## Requirements (from source)
+## Installation (Windows / Linux — from source)
+
+> **macOS users:** use the standalone app from the
+> [Standalone App (macOS)](#standalone-app-macos) section above.
+> No Python installation is needed.
+
+### Requirements
 
 | Dependency   | Minimum version |
 |---|---|
@@ -71,20 +77,7 @@ The app is self-contained and stores its configuration in
 | pydicom      | 2.4+            |
 | pynetdicom   | 2.0+            |
 
----
-
-## Installation (from source)
-
 ### 1. Install Python
-
-#### macOS
-
-```bash
-# Option A: Homebrew (recommended)
-brew install python@3.12
-
-# Option B: Download from https://www.python.org/downloads/macos/
-```
 
 #### Windows
 
@@ -141,7 +134,7 @@ cd dicom_sync_gui
 
 ### 3. Create a virtual environment (recommended)
 
-#### macOS / Linux
+#### Linux
 
 ```bash
 python3 -m venv venv
@@ -174,7 +167,7 @@ This installs PySide6, pydicom, and pynetdicom.
 
 ---
 
-## Running the application
+## Running the application (from source)
 
 ```bash
 # Direct
@@ -340,7 +333,13 @@ The configuration is stored as JSON in a platform-specific directory:
 | Linux    | `~/.config/DicomSyncGUI/dicom_sync_config.json` |
 | Windows  | `%APPDATA%\DicomSyncGUI\dicom_sync_config.json` |
 
-A log file (`dicom_sync_gui.log`) is written to the working directory.
+A log file (`dicom_sync_gui.log`) is written to a platform-specific location:
+
+| Platform | Log path |
+|---|---|
+| macOS    | `~/Library/Logs/dicom_sync_gui.log` |
+| Linux    | `~/.local/state/dicom_sync_gui.log` |
+| Windows  | `%APPDATA%\dicom_sync_gui.log` |
 
 ---
 
