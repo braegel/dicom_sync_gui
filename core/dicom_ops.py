@@ -81,9 +81,11 @@ class DicomOperations:
             assoc = self.ae.associate(config['ip_address'], config['port'],
                                      ae_title=config['ae_title'])
             if assoc.is_established:
-                status = assoc.send_c_echo()
-                assoc.release()
-                return status and status.Status == 0x0000
+                try:
+                    status = assoc.send_c_echo()
+                    return status and status.Status == 0x0000
+                finally:
+                    assoc.release()
         except Exception as e:
             logger.debug(f"C-ECHO failed: {e}")
         return False

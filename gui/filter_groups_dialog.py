@@ -11,6 +11,7 @@ Workflow:
 
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QApplication,
     QProgressDialog, QFileDialog,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QColor
 
 from core.config import AppConfig
@@ -33,6 +34,8 @@ logger = logging.getLogger("dicom_sync")
 
 class FilterGroupsDialog(QDialog):
     """Dialog for creating and managing institution filter groups."""
+
+    _query_results_ready = Signal(set)
 
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
@@ -50,6 +53,7 @@ class FilterGroupsDialog(QDialog):
         self._setup_ui()
         self._refresh_group_list()
         self._refresh_institution_tree()
+        self._query_results_ready.connect(self._on_query_results)
 
     # ── UI ────────────────────────────────────────────────────────────────
 
@@ -370,35 +374,32 @@ class FilterGroupsDialog(QDialog):
 
         self.btn_query.setEnabled(False)
         self.lbl_query_status.setText("Querying...")
-        QApplication.processEvents()
 
-        discovered: Set[str] = set()
+        # Snapshot config data for thread safety
+        remotes = {k: (self.config.get_local_dict(),
+                       v.to_dict(), k)
+                   for k, v in self.config.remote_nodes.items()}
 
-        for remote_key, remote_node in self.config.remote_nodes.items():
-            try:
-                ops = DicomOperations(
-                    self.config.get_local_dict(),
-                    remote_node.to_dict(),
-                    remote_key,
-                )
-                self.lbl_query_status.setText(
-                    f"Querying {remote_key} (study + series level)...")
-                QApplication.processEvents()
+        def run_query():
+            discovered: Set[str] = set()
+            for remote_key, (local_cfg, remote_cfg, name) in remotes.items():
+                try:
+                    ops = DicomOperations(local_cfg, remote_cfg, name)
+                    names = ops.c_find_institution_names(
+                        study_date=date_range)
+                    discovered.update(names)
+                except Exception as e:
+                    logger.error(f"Query failed for {remote_key}: {e}")
+            self._query_results_ready.emit(discovered)
 
-                # Use dedicated method that falls back to series-level
-                # queries when InstitutionName is not at study level
-                names = ops.c_find_institution_names(
-                    study_date=date_range)
-                discovered.update(names)
+        threading.Thread(target=run_query, daemon=True).start()
 
-            except Exception as e:
-                logger.error(f"Query failed for {remote_key}: {e}")
-
-        # Merge discovered institutions with existing ones
+    def _on_query_results(self, discovered: set):
+        """Handle query results on the main thread."""
         new_count = 0
         for inst in discovered:
             if inst not in self._assignments:
-                self._assignments[inst] = ""  # unassigned
+                self._assignments[inst] = ""
                 new_count += 1
 
         self.btn_query.setEnabled(True)
@@ -421,14 +422,12 @@ class FilterGroupsDialog(QDialog):
         if not path:
             return
         try:
-            # Temporarily apply working copies so config can serialise them
-            orig_names = self.config.filter_group_names
-            orig_assign = self.config.institution_assignments
-            self.config.filter_group_names = list(self._group_names)
-            self.config.institution_assignments = dict(self._assignments)
-            self.config.export_filter_groups(path)
-            self.config.filter_group_names = orig_names
-            self.config.institution_assignments = orig_assign
+            data = {
+                "filter_group_names": list(self._group_names),
+                "institution_assignments": dict(self._assignments),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
 
             QMessageBox.information(
                 self, "Export Complete",
@@ -481,21 +480,27 @@ class FilterGroupsDialog(QDialog):
 
         merge = (reply == QMessageBox.Yes)
 
-        # Delegate to config (operates on working copies)
-        orig_names = self.config.filter_group_names
-        orig_assign = self.config.institution_assignments
-        self.config.filter_group_names = list(self._group_names)
-        self.config.institution_assignments = dict(self._assignments)
+        summary = {"groups_added": 0, "institutions_added": 0,
+                    "institutions_updated": 0}
 
-        summary = self.config.import_filter_groups(path, merge=merge)
-
-        # Read back the result into working copies
-        self._group_names = list(self.config.filter_group_names)
-        self._assignments = dict(self.config.institution_assignments)
-
-        # Restore config originals (will be persisted on Save)
-        self.config.filter_group_names = orig_names
-        self.config.institution_assignments = orig_assign
+        if merge:
+            for g in imported_groups:
+                if g not in self._group_names:
+                    self._group_names.append(g)
+                    summary["groups_added"] += 1
+            for inst, grp in imported_assignments.items():
+                if inst in self._assignments:
+                    if self._assignments[inst] != grp:
+                        self._assignments[inst] = grp
+                        summary["institutions_updated"] += 1
+                else:
+                    self._assignments[inst] = grp
+                    summary["institutions_added"] += 1
+        else:
+            summary["groups_added"] = len(imported_groups)
+            summary["institutions_added"] = len(imported_assignments)
+            self._group_names = list(imported_groups)
+            self._assignments = dict(imported_assignments)
 
         if merge:
             QMessageBox.information(

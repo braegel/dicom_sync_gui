@@ -5,6 +5,7 @@ with an independent download service, queue, and statistics.
 """
 
 import logging
+import os
 import threading
 from datetime import datetime
 from typing import Dict, Optional, Tuple
@@ -43,6 +44,8 @@ class MainWindow(QMainWindow):
         # Per-source engines and dashboards
         self.engines: Dict[str, TransferEngine] = {}
         self.dashboards: Dict[str, SourceDashboard] = {}
+        # Pending start params keyed by remote_key (supports concurrent starts)
+        self._pending_start_params: Dict[str, dict] = {}
 
         self.setWindowTitle("DICOM Sync")
         self.setMinimumSize(1000, 750)
@@ -231,7 +234,7 @@ class MainWindow(QMainWindow):
 
         # Check local PACS reachability in a background thread,
         # then start the engine once the check completes.
-        self._pending_start_params = (remote_key, params)
+        self._pending_start_params[remote_key] = params
         self._ensure_storage_scp_for(remote_key)
 
     def _start_engine(self, remote_key: str, params: dict):
@@ -278,16 +281,16 @@ class MainWindow(QMainWindow):
         node = self.config.remote_nodes.get(remote_key)
         if not node:
             # No node — skip SCP check, start engine directly
-            rk, params = self._pending_start_params
-            self._start_engine(rk, params)
+            params = self._pending_start_params.pop(remote_key, {})
+            self._start_engine(remote_key, params)
             return
 
         scp_key = (node.local_ae_title, node.local_port)
 
         # Already running for this AE/port combo?
         if scp_key in self.storage_scps and self.storage_scps[scp_key].running:
-            rk, params = self._pending_start_params
-            self._start_engine(rk, params)
+            params = self._pending_start_params.pop(remote_key, {})
+            self._start_engine(remote_key, params)
             return
 
         # Run echo test in background thread to avoid blocking the UI
@@ -311,7 +314,6 @@ class MainWindow(QMainWindow):
         if not local_reachable:
             fallback = node.fallback_folder
             if fallback:
-                import os
                 storage_path = os.path.join(fallback, remote_key)
                 self._log(
                     f"Local PACS [{node.local_ae_title}:{node.local_port}] "
@@ -332,8 +334,8 @@ class MainWindow(QMainWindow):
                     f"No fallback folder configured.")
 
         # Now start the engine
-        rk, params = self._pending_start_params
-        self._start_engine(rk, params)
+        params = self._pending_start_params.pop(remote_key, {})
+        self._start_engine(remote_key, params)
 
     # ── Engine signal wiring ──────────────────────────────────────────────
 

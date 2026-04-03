@@ -8,10 +8,13 @@ C-MOVE responses are directed correctly per source.
 """
 
 import json
+import logging
 import os
 import platform
 import socket
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("dicom_sync")
 
 DEFAULT_CONFIG_FILE = "dicom_sync_config.json"
 
@@ -30,11 +33,9 @@ RETRIEVE_METHODS = ["C-MOVE", "C-GET"]
 def get_local_ip() -> str:
     """Get local IP address."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
 
@@ -226,12 +227,12 @@ class AppConfig:
                     if legacy_fallback_enabled:
                         node.fallback_folder = legacy_fallback_path
 
-            print(f"Config loaded: {len(self.remote_nodes)} source(s) — "
-                  f"{list(self.remote_nodes.keys())}")
+            logger.info(f"Config loaded: {len(self.remote_nodes)} source(s) — "
+                       f"{list(self.remote_nodes.keys())}")
 
             return True
         except (json.JSONDecodeError, KeyError) as e:
-            print(f"Config load error: {e}")
+            logger.error(f"Config load error: {e}")
             return False
 
     def save(self):

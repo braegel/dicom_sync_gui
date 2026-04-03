@@ -12,10 +12,26 @@ Dependencies:
 
 import logging
 import os
+import platform
 import sys
 
 # Ensure 'core' and 'gui' are importable regardless of how the script is launched
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _log_file_path() -> str:
+    """Return a writable path for the log file."""
+    system = platform.system()
+    if system == "Darwin":
+        log_dir = os.path.expanduser("~/Library/Logs")
+    elif system == "Windows":
+        log_dir = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        log_dir = os.environ.get(
+            "XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, "dicom_sync_gui.log")
+
 
 # Setup logging before imports
 logging.basicConfig(
@@ -24,7 +40,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('dicom_sync_gui.log'),
+        logging.FileHandler(_log_file_path()),
     ]
 )
 logger = logging.getLogger("dicom_sync")

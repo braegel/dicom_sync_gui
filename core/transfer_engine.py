@@ -382,7 +382,7 @@ class TransferEngine:
         # filter) so the dashboard study rate sees every study the PACS
         # returned.  InstitutionName at study level may be empty — it
         # gets patched up in _build_study_jobs from the series fallback.
-        study_metadata: dict[str, dict] = {}
+        study_metadata: Dict[str, dict] = {}
         for s in studies_raw:
             uid = getattr(s, 'StudyInstanceUID', '')
             if uid and uid not in study_metadata:
@@ -419,7 +419,7 @@ class TransferEngine:
     def _build_study_jobs(
             self, dicom_ops: DicomOperations, study_ds,
             seen_series: Set[str], max_images: int,
-            study_metadata: dict[str, dict] | None = None,
+            study_metadata: Optional[Dict[str, dict]] = None,
     ) -> List[SeriesJob]:
         """Build SeriesJob items for one study."""
         study_uid = getattr(study_ds, 'StudyInstanceUID', '')
@@ -685,6 +685,8 @@ class TransferEngine:
         if max_images > 0 and remote_count > max_images:
             return True
         missing = remote_count - local_count
+        # Tolerate 1-2 missing images in larger series — PACS counts
+        # can fluctuate due to pending storage commits or routing delays.
         if remote_count > 10 and missing <= 2:
             return True
         return False

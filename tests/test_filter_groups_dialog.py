@@ -295,16 +295,22 @@ class TestFilterGroupsQuery:
         self.dialog._query_institutions()
         mock_warning.assert_called_once()
 
-    @patch("gui.filter_groups_dialog.QApplication.processEvents")
     @patch("gui.filter_groups_dialog.DicomOperations")
+    @patch("gui.filter_groups_dialog.threading.Thread")
     def test_query_discovers_institutions(
-        self, MockOps, mock_events
+        self, MockThread, MockOps
     ):
         mock_ops = MagicMock()
         mock_ops.c_find_institution_names.return_value = [
             "New Hospital X", "New Hospital Y"
         ]
         MockOps.return_value = mock_ops
+
+        def run_synchronously(**kwargs):
+            thread = MagicMock()
+            thread.start = lambda: kwargs["target"]()
+            return thread
+        MockThread.side_effect = run_synchronously
 
         self.dialog._query_institutions()
 
@@ -313,15 +319,21 @@ class TestFilterGroupsQuery:
         # Status label should mention "Found"
         assert "Found" in self.dialog.lbl_query_status.text()
 
-    @patch("gui.filter_groups_dialog.QApplication.processEvents")
     @patch("gui.filter_groups_dialog.DicomOperations")
+    @patch("gui.filter_groups_dialog.threading.Thread")
     def test_query_does_not_overwrite_existing_assignments(
-        self, MockOps, mock_events
+        self, MockThread, MockOps
     ):
         mock_ops = MagicMock()
         # "Hospital Alpha" already exists with Group A
         mock_ops.c_find_institution_names.return_value = ["Hospital Alpha"]
         MockOps.return_value = mock_ops
+
+        def run_synchronously(**kwargs):
+            thread = MagicMock()
+            thread.start = lambda: kwargs["target"]()
+            return thread
+        MockThread.side_effect = run_synchronously
 
         self.dialog._query_institutions()
 

@@ -157,7 +157,7 @@ class TestMainWindowService:
         self.config = populated_config
 
     @patch.object(MainWindow, '_ensure_storage_scp_for',
-                  lambda self, rk: self._start_engine(*self._pending_start_params))
+                  lambda self, rk: self._start_engine(rk, self._pending_start_params.pop(rk, {})))
     @patch("gui.main_window.TransferEngine")
     def test_start_creates_engine_for_source(self, MockEngine):
         mock_engine = MagicMock()
@@ -185,7 +185,7 @@ class TestMainWindowService:
         mock_scp.assert_called_once_with("ct")
 
     @patch.object(MainWindow, '_ensure_storage_scp_for',
-                  lambda self, rk: self._start_engine(*self._pending_start_params))
+                  lambda self, rk: self._start_engine(rk, self._pending_start_params.pop(rk, {})))
     @patch("gui.main_window.TransferEngine")
     def test_start_connects_signals(self, MockEngine):
         mock_engine = MagicMock()
@@ -369,7 +369,7 @@ class TestMainWindowSCP:
 
         node = self.win.config.remote_nodes["ct"]
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
-        self.win._pending_start_params = ("ct", params)
+        self.win._pending_start_params = {"ct": params}
         self.win._on_scp_check_done("ct", False, node.to_dict())
 
         MockSCP.assert_called_once()
@@ -379,7 +379,7 @@ class TestMainWindowSCP:
     def test_scp_skipped_when_local_reachable(self):
         node = self.win.config.remote_nodes["ct"]
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
-        self.win._pending_start_params = ("ct", params)
+        self.win._pending_start_params = {"ct": params}
         self.win._on_scp_check_done("ct", True, node.to_dict())
 
         assert len(self.win.storage_scps) == 0
@@ -395,7 +395,7 @@ class TestMainWindowSCP:
         self.win.storage_scps[("LOCAL_AE", 11112)] = existing_scp
 
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
-        self.win._pending_start_params = ("ct", params)
+        self.win._pending_start_params = {"ct": params}
         # SCP already running → skips thread, jumps to _start_engine
         self.win._ensure_storage_scp_for("ct")
 
