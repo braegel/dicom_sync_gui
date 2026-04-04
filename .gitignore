@@ -11,6 +11,7 @@ build/
 
 # ─── Virtual Environments ────────────────────────────────
 venv/
+venv_x86/
 .venv/
 env/
 .env/
