@@ -841,10 +841,14 @@ class SourceDashboard(QWidget):
             return "#f1c40f"
         return "#e74c3c"
 
-    def on_patient_studies_completed(self, patient_id: str,
-                                     institution_name: str):
-        """Slot for patient_studies_completed — play notification sound
+    def on_study_completed(self, study_uid: str,
+                           institution_name: str):
+        """Slot for study_completed — play notification sound
         if the institution belongs to an active filter group."""
+        self._play_notification_if_allowed(institution_name)
+
+    def _play_notification_if_allowed(self, institution_name: str):
+        """Play notification sound if enabled and institution passes filter."""
         if not self.config.study_complete_sound_enabled:
             return
         if self.config.filter_groups_enabled:

@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QGroupBox
 
 from gui.dashboard import SourceDashboard, StatsLabel
-from core.transfer_engine import TransferStats
+from core.transfer_engine import TransferStats, TransferEngine, SeriesJob
 from core.config import AppConfig, PacsNode
 
 
@@ -962,46 +962,46 @@ class TestStudyCompleteSound:
         self.dashboard = SourceDashboard(
             config=populated_config, remote_key="ct")
 
-    def test_has_on_patient_studies_completed_slot(self):
-        assert hasattr(self.dashboard, "on_patient_studies_completed")
-        assert callable(self.dashboard.on_patient_studies_completed)
+    def test_has_on_study_completed_slot(self):
+        assert hasattr(self.dashboard, "on_study_completed")
+        assert callable(self.dashboard.on_study_completed)
 
     def test_sound_played_for_active_group(self):
         """Institution in active filter group → play sound."""
         with patch.object(self.dashboard, "_play_sound") as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Hospital Alpha")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Hospital Alpha")
         mock_play.assert_called_once()
 
     def test_no_sound_for_inactive_group(self):
         """Institution in inactive group → no sound."""
         with patch.object(self.dashboard, "_play_sound") as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Clinic Beta")  # Group B, not active
+            self.dashboard.on_study_completed(
+                "1.2.3", "Clinic Beta")  # Group B, not active
         mock_play.assert_not_called()
 
     def test_no_sound_when_disabled(self):
         """Setting study_complete_sound_enabled=False suppresses sound."""
         self.config.study_complete_sound_enabled = False
         with patch.object(self.dashboard, "_play_sound") as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Hospital Alpha")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Hospital Alpha")
         mock_play.assert_not_called()
 
     def test_sound_plays_when_filter_disabled(self):
         """With filtering off, sound plays for any institution."""
         self.config.filter_groups_enabled = False
         with patch.object(self.dashboard, "_play_sound") as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Whatever Hospital")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Whatever Hospital")
         mock_play.assert_called_once()
 
     def test_sound_for_unassigned_institution_when_filter_on(self):
         """Unassigned institution with filter on → no sound (not in any
         active group)."""
         with patch.object(self.dashboard, "_play_sound") as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Nonexistent Hospital")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Nonexistent Hospital")
         mock_play.assert_not_called()
 
 
@@ -1029,8 +1029,8 @@ class TestCustomStudyCompleteSound:
         with patch.object(
             self.dashboard, "_play_sound"
         ) as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Hospital Alpha")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Hospital Alpha")
         mock_play.assert_called_once_with(str(self.sound_file))
 
     def test_custom_sound_not_played_for_inactive_group(self):
@@ -1038,8 +1038,8 @@ class TestCustomStudyCompleteSound:
         with patch.object(
             self.dashboard, "_play_sound"
         ) as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Clinic Beta")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Clinic Beta")
         mock_play.assert_not_called()
 
     def test_custom_sound_not_played_when_disabled(self):
@@ -1048,8 +1048,8 @@ class TestCustomStudyCompleteSound:
         with patch.object(
             self.dashboard, "_play_sound"
         ) as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Hospital Alpha")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Hospital Alpha")
         mock_play.assert_not_called()
 
     def test_custom_sound_plays_when_filter_disabled(self):
@@ -1058,8 +1058,8 @@ class TestCustomStudyCompleteSound:
         with patch.object(
             self.dashboard, "_play_sound"
         ) as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Whatever Hospital")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Whatever Hospital")
         mock_play.assert_called_once_with(str(self.sound_file))
 
     @patch("gui.dashboard._generate_default_sound",
@@ -1070,8 +1070,8 @@ class TestCustomStudyCompleteSound:
         with patch.object(
             self.dashboard, "_play_sound"
         ) as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Hospital Alpha")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Hospital Alpha")
         mock_gen.assert_called_once()
         mock_play.assert_called_once_with("/tmp/default.wav")
 
@@ -1083,8 +1083,8 @@ class TestCustomStudyCompleteSound:
         with patch.object(
             self.dashboard, "_play_sound"
         ) as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Hospital Alpha")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Hospital Alpha")
         mock_gen.assert_called_once()
         mock_play.assert_called_once_with("/tmp/default.wav")
 
@@ -1093,14 +1093,121 @@ class TestCustomStudyCompleteSound:
         with patch.object(
             self.dashboard, "_play_sound"
         ) as mock_play:
-            self.dashboard.on_patient_studies_completed(
-                "P1", "Nonexistent Hospital")
+            self.dashboard.on_study_completed(
+                "1.2.3", "Nonexistent Hospital")
         mock_play.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Config — study_complete_sound_enabled / study_complete_sound_path
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# End-to-end: Engine → Dashboard sound (per study, not per series)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSoundPerStudyNotPerSeries:
+    """The notification sound must play once per completed STUDY
+    (study_uid), not per series and not per patient.  Each study
+    carries its own institution, so the filter is per study."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.study_complete_sound_enabled = True
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A"]
+        self.engine = TransferEngine(self.config, "ct")
+        self.dashboard = SourceDashboard(
+            config=self.config, remote_key="ct")
+        self.engine.signals.study_completed.connect(
+            self.dashboard.on_study_completed)
+
+    def test_no_sound_while_series_pending(self):
+        """Study S1 has 3 series — only 1 done → no sound."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="queued", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.3",
+                      status="queued", institution_name="Hospital Alpha"),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_not_called()
+
+    def test_sound_when_all_series_of_study_done(self):
+        """All 3 series of study S1 are done → exactly one sound."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.3",
+                      status="done", institution_name="Hospital Alpha"),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_called_once()
+
+    def test_no_repeat_sound_on_second_check(self):
+        """Calling _check_study_complete again must not play a second sound."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+            self.engine._check_study_complete("S1")
+        mock_play.assert_called_once()
+
+    def test_no_sound_for_inactive_group(self):
+        """Study complete but institution is in inactive group → no sound."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Clinic Beta"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="done", institution_name="Clinic Beta"),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_not_called()
+
+    def test_two_studies_same_patient_two_sounds(self):
+        """Patient P1 has two studies from active group — each completing
+        triggers its own sound."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
+                      status="done", institution_name="Hospital Alpha"),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+            self.engine._check_study_complete("S2")
+        assert mock_play.call_count == 2
+
+    def test_active_study_sounds_inactive_study_silent(self):
+        """Same patient, two studies from different groups — only the
+        active group's study triggers a sound."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
+                      status="done", institution_name="Clinic Beta"),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+            self.engine._check_study_complete("S2")
+        mock_play.assert_called_once()
+
+    def test_series_completed_signal_does_not_trigger_sound(self):
+        """The series_completed signal (per series) must NOT play sound."""
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine.signals.series_completed.emit("1.1", 50)
+        mock_play.assert_not_called()
+
 
 class TestConfigStudyCompleteSound:
 

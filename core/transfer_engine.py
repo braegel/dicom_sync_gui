@@ -198,6 +198,8 @@ class TransferSignals(QObject):
     studies_queried = Signal(list)  # list[{study_uid, study_date, study_time, institution_name}]
     # All series for a patient (incl. priors) finished downloading
     patient_studies_completed = Signal(str, str)  # patient_id, institution_name
+    # All series of a single study finished downloading
+    study_completed = Signal(str, str)  # study_uid, institution_name
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +226,7 @@ class TransferEngine:
         self._selection_event = threading.Event()
         self._selected_uids: Set[str] = set()
         self._completed_patients: Set[str] = set()
+        self._completed_studies: Set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -308,6 +311,7 @@ class TransferEngine:
     def _run_one_cycle(self, hours: int, max_images: int) -> int:
         """Query the source PACS, build queue, transfer everything."""
         self._completed_patients.clear()
+        self._completed_studies.clear()
         now = datetime.now()
         cutoff = now - timedelta(hours=hours)
         yesterday = now - timedelta(days=1)
@@ -514,6 +518,7 @@ class TransferEngine:
                 job.status = "done"
                 self.signals.series_completed.emit(job.series_uid, images)
                 self.signals.stats_updated.emit(self.stats)
+                self._check_study_complete(job.study_uid)
                 self._check_patient_complete(job.patient_id)
                 return images
         except Exception as e:
@@ -523,6 +528,20 @@ class TransferEngine:
         self.signals.series_error.emit(
             job.series_uid, "Transfer failed")
         return 0
+
+    def _check_study_complete(self, study_uid: str):
+        """Emit study_completed when all series of a study are done."""
+        if study_uid in self._completed_studies:
+            return
+        study_series = [j for j in self._queue
+                        if j.study_uid == study_uid]
+        if not study_series:
+            return
+        if all(j.status in ("done", "error", "skipped")
+               for j in study_series):
+            self._completed_studies.add(study_uid)
+            institution = study_series[0].institution_name
+            self.signals.study_completed.emit(study_uid, institution)
 
     def _check_patient_complete(self, patient_id: str):
         """Emit patient_studies_completed if all series for this patient
