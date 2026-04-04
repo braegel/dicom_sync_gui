@@ -1,0 +1,58 @@
+name: Build macOS DMG
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest        # Apple Silicon (arm64)
+            arch: arm64
+          - runner: macos-13            # Intel (x86_64)
+            arch: x86_64
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set version in spec
+        run: |
+          sed -i '' "s/CFBundleShortVersionString.*/CFBundleShortVersionString\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
+          sed -i '' "s/CFBundleVersion.*/CFBundleVersion\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
+
+      - name: Build app
+        run: pyinstaller dicom_sync.spec -y
+
+      - name: Create DMG
+        run: |
+          mkdir -p /tmp/dmg_staging
+          cp -R "dist/DICOM Sync.app" "/tmp/dmg_staging/DICOM Sync.app"
+          ln -s /Applications "/tmp/dmg_staging/Applications"
+          hdiutil create -volname "DICOM Sync" \
+            -srcfolder /tmp/dmg_staging -ov -format UDZO \
+            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_${{ matrix.arch }}.dmg"
+
+      - name: Upload DMG to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_${{ matrix.arch }}.dmg" \
+            --clobber
