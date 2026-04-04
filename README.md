@@ -15,6 +15,7 @@ no Python installation required.
 | File | Architecture | Size |
 |---|---|---|
 | [`DICOM_Sync_1.0.1_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.1/DICOM_Sync_1.0.1_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~54 MB |
+| [`DICOM_Sync_1.0.1_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.1/DICOM_Sync_1.0.1_macOS_x86_64.dmg) | Intel | ~58 MB |
 
 **Installation:**
 
