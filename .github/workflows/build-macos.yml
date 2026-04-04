@@ -1,18 +1,17 @@
 name: Build macOS DMG
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [created]
 
 jobs:
   build:
     strategy:
       matrix:
         include:
-          - runner: macos-latest        # Apple Silicon (arm64)
+          - runner: macos-latest
             arch: arm64
-          - runner: macos-13            # Intel (x86_64)
+          - runner: macos-latest
             arch: x86_64
 
     runs-on: ${{ matrix.runner }}
@@ -37,8 +36,13 @@ jobs:
           sed -i '' "s/CFBundleShortVersionString.*/CFBundleShortVersionString\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
           sed -i '' "s/CFBundleVersion.*/CFBundleVersion\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
 
-      - name: Build app
+      - name: Build app (arm64)
+        if: matrix.arch == 'arm64'
         run: pyinstaller dicom_sync.spec -y
+
+      - name: Build app (x86_64 via Rosetta)
+        if: matrix.arch == 'x86_64'
+        run: arch -x86_64 pyinstaller dicom_sync.spec -y
 
       - name: Create DMG
         run: |
