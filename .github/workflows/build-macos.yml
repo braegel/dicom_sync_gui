@@ -9,16 +9,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest        # Apple Silicon (arm64)
-            arch: arm64
-          - runner: macos-13            # Intel (x86_64) — still available as macos-13-large is gone but macos-13 works
-            arch: x86_64
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -50,12 +41,12 @@ jobs:
           ln -s /Applications "/tmp/dmg_staging/Applications"
           hdiutil create -volname "DICOM Sync" \
             -srcfolder /tmp/dmg_staging -ov -format UDZO \
-            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_${{ matrix.arch }}.dmg"
+            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_arm64.dmg"
 
       - name: Upload DMG to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ github.ref_name }}" \
-            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_${{ matrix.arch }}.dmg" \
+            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_arm64.dmg" \
             --clobber
