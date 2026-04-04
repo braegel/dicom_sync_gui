@@ -4,14 +4,18 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - runner: macos-latest
+          - runner: macos-latest        # Apple Silicon (arm64)
             arch: arm64
-          - runner: macos-latest
+          - runner: macos-13            # Intel (x86_64) — still available as macos-13-large is gone but macos-13 works
             arch: x86_64
 
     runs-on: ${{ matrix.runner }}
@@ -36,13 +40,8 @@ jobs:
           sed -i '' "s/CFBundleShortVersionString.*/CFBundleShortVersionString\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
           sed -i '' "s/CFBundleVersion.*/CFBundleVersion\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
 
-      - name: Build app (arm64)
-        if: matrix.arch == 'arm64'
+      - name: Build app
         run: pyinstaller dicom_sync.spec -y
-
-      - name: Build app (x86_64 via Rosetta)
-        if: matrix.arch == 'x86_64'
-        run: arch -x86_64 pyinstaller dicom_sync.spec -y
 
       - name: Create DMG
         run: |
