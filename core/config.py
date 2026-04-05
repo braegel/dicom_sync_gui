@@ -60,7 +60,9 @@ class PacsNode:
                  local_ae_title: str = "LOCAL_AE",
                  local_port: int = 11112,
                  local_syntax: str = "JPEG2000Lossless",
-                 fallback_folder: str = ""):
+                 fallback_folder: str = "",
+                 notification_sound_enabled: bool = True,
+                 notification_sound_path: str = ""):
         self.name = name
         self.ae_title = ae_title
         self.ip_address = ip_address
@@ -76,6 +78,8 @@ class PacsNode:
         self.local_port = local_port
         self.local_syntax = local_syntax
         self.fallback_folder = fallback_folder
+        self.notification_sound_enabled = notification_sound_enabled
+        self.notification_sound_path = notification_sound_path
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -92,6 +96,8 @@ class PacsNode:
             "local_port": self.local_port,
             "local_syntax": self.local_syntax,
             "fallback_folder": self.fallback_folder,
+            "notification_sound_enabled": self.notification_sound_enabled,
+            "notification_sound_path": self.notification_sound_path,
         }
 
     @classmethod
@@ -110,6 +116,8 @@ class PacsNode:
             local_port=data.get("local_port", 11112),
             local_syntax=data.get("local_syntax", "JPEG2000Lossless"),
             fallback_folder=data.get("fallback_folder", ""),
+            notification_sound_enabled=data.get("notification_sound_enabled", True),
+            notification_sound_path=data.get("notification_sound_path", ""),
         )
 
 
@@ -132,8 +140,6 @@ class AppConfig:
         self.filter_allow_small_series: bool = False  # download small series regardless of group
         self.filter_small_series_max: int = 20  # max images per series for the above
         self.high_load_alert_enabled: bool = True  # popup when ≥12 studies/hour
-        self.study_complete_sound_enabled: bool = True  # sound on study download complete
-        self.study_complete_sound_path: str = ""  # custom WAV path; empty = default tone
 
         # Legacy fields — kept for backward-compatible config loading.
         # New code reads per-source values from PacsNode directly.
@@ -204,10 +210,6 @@ class AppConfig:
                 "filter_small_series_max", 20)
             self.high_load_alert_enabled = data.get(
                 "high_load_alert_enabled", True)
-            self.study_complete_sound_enabled = data.get(
-                "study_complete_sound_enabled", True)
-            self.study_complete_sound_path = data.get(
-                "study_complete_sound_path", "")
 
             # ── Migration: inject per-source fields from legacy globals ──
             remotes_raw = data.get("remotes", {})
@@ -249,8 +251,6 @@ class AppConfig:
             "filter_allow_small_series": self.filter_allow_small_series,
             "filter_small_series_max": self.filter_small_series_max,
             "high_load_alert_enabled": self.high_load_alert_enabled,
-            "study_complete_sound_enabled": self.study_complete_sound_enabled,
-            "study_complete_sound_path": self.study_complete_sound_path,
             # Legacy globals (kept for downgrade compatibility)
             "default_hours": self.default_hours,
             "max_images": self.max_images,

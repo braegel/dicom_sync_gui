@@ -191,6 +191,14 @@ class SourceDashboard(QWidget):
             "After each query, pause and let you choose which series to download.")
         form.addRow("", self.manual_selection_check)
 
+        self.sound_check = QCheckBox("Sound notification on download")
+        self.sound_check.setToolTip(
+            "Play a notification sound when a study completes downloading.")
+        self.sound_check.setChecked(
+            node.notification_sound_enabled if node else True)
+        self.sound_check.toggled.connect(self._on_sound_toggled)
+        form.addRow("", self.sound_check)
+
         ctrl_layout.addLayout(form)
         ctrl_layout.addStretch()
 
@@ -487,6 +495,12 @@ class SourceDashboard(QWidget):
         self._update_filter_button_text()
         self._update_filter_enabled_state()
         self._rebuild_study_rate_labels()
+
+    def _on_sound_toggled(self, checked: bool):
+        node = self._remote_node
+        if node:
+            node.notification_sound_enabled = checked
+            self.config.save()
 
     # ── Service control handlers ──────────────────────────────────────────
 
@@ -849,14 +863,15 @@ class SourceDashboard(QWidget):
 
     def _play_notification_if_allowed(self, institution_name: str):
         """Play notification sound if enabled and institution passes filter."""
-        if not self.config.study_complete_sound_enabled:
+        node = self._remote_node
+        if not node or not node.notification_sound_enabled:
             return
         if self.config.filter_groups_enabled:
             group = self.config.institution_assignments.get(
                 institution_name, "")
             if group not in set(self.config.active_filter_groups):
                 return
-        path = self.config.study_complete_sound_path
+        path = node.notification_sound_path
         if path and os.path.isfile(path):
             self._play_sound(path)
         else:

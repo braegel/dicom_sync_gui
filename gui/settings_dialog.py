@@ -72,6 +72,7 @@ class PacsNodeEditor(QWidget):
         self.local_syntax_combo = None
         self.fallback_edit = None
         self.fallback_btn = None
+        self.notification_sound_edit = None
 
         if not is_local:
             self.retrieve_combo = QComboBox()
@@ -130,6 +131,23 @@ class PacsNodeEditor(QWidget):
             fb_widget.setLayout(fb_layout)
             layout.addRow("Fallback Folder:", fb_widget)
 
+            # ── Notification sound ──
+            self._add_separator(layout, "Notification Sound")
+
+            self.notification_sound_edit = QLineEdit()
+            self.notification_sound_edit.setPlaceholderText(
+                "Custom WAV file (leave empty for default tone)")
+            ns_btn = QPushButton("Browse...")
+            ns_btn.clicked.connect(self._browse_notification_sound)
+
+            ns_layout = QHBoxLayout()
+            ns_layout.setContentsMargins(0, 0, 0, 0)
+            ns_layout.addWidget(self.notification_sound_edit)
+            ns_layout.addWidget(ns_btn)
+            ns_widget = QWidget()
+            ns_widget.setLayout(ns_layout)
+            layout.addRow("Sound File:", ns_widget)
+
     @staticmethod
     def _add_separator(layout: QFormLayout, title: str):
         sep = QLabel("\u2500" * 30)
@@ -149,6 +167,14 @@ class PacsNodeEditor(QWidget):
             self.fallback_edit.text() if self.fallback_edit else "")
         if path:
             self.fallback_edit.setText(path)
+
+    def _browse_notification_sound(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Notification Sound",
+            self.notification_sound_edit.text() if self.notification_sound_edit else "",
+            "WAV Files (*.wav);;All Files (*)")
+        if path:
+            self.notification_sound_edit.setText(path)
 
     def set_node(self, node: PacsNode):
         self.name_edit.setText(node.name)
@@ -178,6 +204,8 @@ class PacsNodeEditor(QWidget):
                 self.local_syntax_combo.setCurrentIndex(idx)
         if self.fallback_edit:
             self.fallback_edit.setText(node.fallback_folder)
+        if self.notification_sound_edit:
+            self.notification_sound_edit.setText(node.notification_sound_path)
 
     def get_node(self) -> PacsNode:
         return PacsNode(
@@ -202,6 +230,8 @@ class PacsNodeEditor(QWidget):
                           if self.local_syntax_combo else "JPEG2000Lossless"),
             fallback_folder=(self.fallback_edit.text().strip()
                              if self.fallback_edit else ""),
+            notification_sound_path=(self.notification_sound_edit.text().strip()
+                                     if self.notification_sound_edit else ""),
         )
 
     def clear_fields(self):
@@ -226,6 +256,8 @@ class PacsNodeEditor(QWidget):
             self.local_syntax_combo.setCurrentIndex(0)
         if self.fallback_edit:
             self.fallback_edit.clear()
+        if self.notification_sound_edit:
+            self.notification_sound_edit.clear()
 
     def has_minimum_data(self) -> bool:
         """True if at least name and AE title are filled in."""

@@ -228,6 +228,31 @@ class TestPacsNodeEditorRemote:
         assert self.editor.local_port_spin.value() == 11112
         assert self.editor.fallback_edit.text() == ""
 
+    def test_has_notification_sound_field(self):
+        """Remote editor has a notification sound path field."""
+        assert self.editor.notification_sound_edit is not None
+
+    def test_set_node_with_notification_sound(self):
+        node = PacsNode(
+            name="CT", ae_title="CT_AE",
+            ip_address="10.0.0.1", port=104,
+            notification_sound_path="/sounds/ding.wav",
+        )
+        self.editor.set_node(node)
+        assert self.editor.notification_sound_edit.text() == "/sounds/ding.wav"
+
+    def test_get_node_includes_notification_sound(self):
+        self.editor.name_edit.setText("CT")
+        self.editor.ae_title_edit.setText("CT_AE")
+        self.editor.notification_sound_edit.setText("/my/sound.wav")
+        node = self.editor.get_node()
+        assert node.notification_sound_path == "/my/sound.wav"
+
+    def test_clear_resets_notification_sound(self):
+        self.editor.notification_sound_edit.setText("/some/file.wav")
+        self.editor.clear_fields()
+        assert self.editor.notification_sound_edit.text() == ""
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SettingsDialog — initialization and loading

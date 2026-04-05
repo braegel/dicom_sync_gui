@@ -947,18 +947,54 @@ class TestConfigHighLoadAlert:
 # SourceDashboard — study completion notification sound
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestStudyCompleteSound:
-    """When all series of a patient (including priors) are done and the
-    patient's institution belongs to an active filter group, the dashboard
-    must play a notification sound."""
+class TestPerPacsSoundCheckbox:
+    """The dashboard must have a checkbox to toggle notification sound
+    per source PACS, reading/writing from the PacsNode."""
 
     @pytest.fixture(autouse=True)
     def _create(self, populated_config, qapp):
         self.config = populated_config
-        # populated_config: filter_groups_enabled=True,
-        # active_filter_groups=["Group A"],
-        # institution_assignments: "Hospital Alpha" → "Group A"
-        self.config.study_complete_sound_enabled = True
+        self.node = self.config.remote_nodes["ct"]
+        self.node.notification_sound_enabled = True
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def test_checkbox_exists(self):
+        """Dashboard has a sound notification checkbox."""
+        assert hasattr(self.dashboard, "sound_check")
+        assert self.dashboard.sound_check.isChecked()
+
+    def test_checkbox_reflects_node_disabled(self):
+        """When node has sound disabled, checkbox is unchecked."""
+        self.node.notification_sound_enabled = False
+        dashboard = SourceDashboard(
+            config=self.config, remote_key="ct")
+        assert not dashboard.sound_check.isChecked()
+
+    def test_toggling_checkbox_saves_to_node(self):
+        """Unchecking the checkbox sets node.notification_sound_enabled=False."""
+        self.dashboard.sound_check.setChecked(False)
+        assert self.node.notification_sound_enabled is False
+
+    def test_toggling_checkbox_on_saves_to_node(self):
+        self.dashboard.sound_check.setChecked(False)
+        self.node.notification_sound_enabled = False  # confirm off
+        self.dashboard.sound_check.setChecked(True)
+        assert self.node.notification_sound_enabled is True
+
+
+class TestStudyCompleteSound:
+    """Sound notification respects per-PACS settings (node-level),
+    not global config."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A"]
+        self.node = self.config.remote_nodes["ct"]
+        self.node.notification_sound_enabled = True
+        self.node.notification_sound_path = ""
         self.dashboard = SourceDashboard(
             config=populated_config, remote_key="ct")
 
@@ -980,9 +1016,9 @@ class TestStudyCompleteSound:
                 "1.2.3", "Clinic Beta")  # Group B, not active
         mock_play.assert_not_called()
 
-    def test_no_sound_when_disabled(self):
-        """Setting study_complete_sound_enabled=False suppresses sound."""
-        self.config.study_complete_sound_enabled = False
+    def test_no_sound_when_node_disabled(self):
+        """node.notification_sound_enabled=False → no sound."""
+        self.node.notification_sound_enabled = False
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.dashboard.on_study_completed(
                 "1.2.3", "Hospital Alpha")
@@ -1004,103 +1040,81 @@ class TestStudyCompleteSound:
                 "1.2.3", "Nonexistent Hospital")
         mock_play.assert_not_called()
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SourceDashboard — custom notification sound file
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestCustomStudyCompleteSound:
-    """When study_complete_sound_path points to a valid .wav file, the
-    dashboard must play that file instead of QApplication.beep().
-    Filter-group gating still applies."""
-
-    @pytest.fixture(autouse=True)
-    def _create(self, populated_config, qapp, tmp_path):
-        self.config = populated_config
-        self.config.study_complete_sound_enabled = True
-        self.sound_file = tmp_path / "notify.wav"
-        self.sound_file.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")
-        self.config.study_complete_sound_path = str(self.sound_file)
-        self.dashboard = SourceDashboard(
-            config=populated_config, remote_key="ct")
-
-    def test_custom_sound_played_for_active_group(self):
-        """Institution in active filter group → play custom sound file."""
-        with patch.object(
-            self.dashboard, "_play_sound"
-        ) as mock_play:
+    def test_custom_sound_per_pacs(self, tmp_path):
+        """When node has a custom sound path, that file is played."""
+        wav = tmp_path / "custom.wav"
+        wav.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+        self.node.notification_sound_path = str(wav)
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.dashboard.on_study_completed(
                 "1.2.3", "Hospital Alpha")
-        mock_play.assert_called_once_with(str(self.sound_file))
+        mock_play.assert_called_once_with(str(wav))
 
-    def test_custom_sound_not_played_for_inactive_group(self):
-        """Institution in inactive group → no sound at all."""
-        with patch.object(
-            self.dashboard, "_play_sound"
-        ) as mock_play:
-            self.dashboard.on_study_completed(
-                "1.2.3", "Clinic Beta")
-        mock_play.assert_not_called()
-
-    def test_custom_sound_not_played_when_disabled(self):
-        """study_complete_sound_enabled=False → no custom sound."""
-        self.config.study_complete_sound_enabled = False
-        with patch.object(
-            self.dashboard, "_play_sound"
-        ) as mock_play:
-            self.dashboard.on_study_completed(
-                "1.2.3", "Hospital Alpha")
-        mock_play.assert_not_called()
-
-    def test_custom_sound_plays_when_filter_disabled(self):
-        """With filtering off, custom sound plays for any institution."""
-        self.config.filter_groups_enabled = False
-        with patch.object(
-            self.dashboard, "_play_sound"
-        ) as mock_play:
-            self.dashboard.on_study_completed(
-                "1.2.3", "Whatever Hospital")
-        mock_play.assert_called_once_with(str(self.sound_file))
-
-    @patch("gui.dashboard._generate_default_sound",
-           return_value="/tmp/default.wav")
-    def test_default_sound_when_path_empty(self, mock_gen):
-        """Empty sound path → play default generated sound."""
-        self.config.study_complete_sound_path = ""
-        with patch.object(
-            self.dashboard, "_play_sound"
-        ) as mock_play:
-            self.dashboard.on_study_completed(
-                "1.2.3", "Hospital Alpha")
+    def test_default_sound_when_node_path_empty(self):
+        """Empty node sound path → play default generated sound."""
+        self.node.notification_sound_path = ""
+        with patch(
+            "gui.dashboard._generate_default_sound",
+            return_value="/tmp/default.wav"
+        ) as mock_gen:
+            with patch.object(self.dashboard, "_play_sound") as mock_play:
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
         mock_gen.assert_called_once()
         mock_play.assert_called_once_with("/tmp/default.wav")
 
-    @patch("gui.dashboard._generate_default_sound",
-           return_value="/tmp/default.wav")
-    def test_default_sound_when_file_missing(self, mock_gen):
-        """Sound path points to non-existent file → play default."""
-        self.config.study_complete_sound_path = "/no/such/file.wav"
-        with patch.object(
-            self.dashboard, "_play_sound"
-        ) as mock_play:
-            self.dashboard.on_study_completed(
-                "1.2.3", "Hospital Alpha")
-        mock_gen.assert_called_once()
-        mock_play.assert_called_once_with("/tmp/default.wav")
-
-    def test_unassigned_institution_no_custom_sound(self):
-        """Unassigned institution with filter on → no sound."""
-        with patch.object(
-            self.dashboard, "_play_sound"
-        ) as mock_play:
-            self.dashboard.on_study_completed(
-                "1.2.3", "Nonexistent Hospital")
-        mock_play.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Config — study_complete_sound_enabled / study_complete_sound_path
+# Config — PacsNode notification sound fields
 # ═══════════════════════════════════════════════════════════════════════════
+
+class TestPacsNodeNotificationSound:
+
+    def test_default_enabled(self):
+        node = PacsNode(name="CT", ae_title="CT_AE")
+        assert node.notification_sound_enabled is True
+
+    def test_default_path_empty(self):
+        node = PacsNode(name="CT", ae_title="CT_AE")
+        assert node.notification_sound_path == ""
+
+    def test_roundtrip(self, tmp_config_path):
+        config = AppConfig(config_path=tmp_config_path)
+        config.remote_nodes = {
+            "ct": PacsNode(name="CT", ae_title="CT_AE",
+                           notification_sound_enabled=False,
+                           notification_sound_path="/sounds/ding.wav"),
+        }
+        config.save()
+        config2 = AppConfig(config_path=tmp_config_path)
+        config2.load()
+        node = config2.remote_nodes["ct"]
+        assert node.notification_sound_enabled is False
+        assert node.notification_sound_path == "/sounds/ding.wav"
+
+    def test_to_dict_includes_sound_fields(self):
+        node = PacsNode(name="CT", ae_title="CT_AE",
+                        notification_sound_enabled=False,
+                        notification_sound_path="/a.wav")
+        d = node.to_dict()
+        assert d["notification_sound_enabled"] is False
+        assert d["notification_sound_path"] == "/a.wav"
+
+    def test_from_dict_reads_sound_fields(self):
+        d = {"name": "CT", "ae_title": "CT_AE",
+             "notification_sound_enabled": False,
+             "notification_sound_path": "/b.wav"}
+        node = PacsNode.from_dict(d)
+        assert node.notification_sound_enabled is False
+        assert node.notification_sound_path == "/b.wav"
+
+    def test_from_dict_defaults_when_missing(self):
+        """Old config files without sound fields → defaults."""
+        d = {"name": "CT", "ae_title": "CT_AE"}
+        node = PacsNode.from_dict(d)
+        assert node.notification_sound_enabled is True
+        assert node.notification_sound_path == ""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # End-to-end: Engine → Dashboard sound (per study, not per series)
@@ -1114,9 +1128,11 @@ class TestSoundPerStudyNotPerSeries:
     @pytest.fixture(autouse=True)
     def _create(self, populated_config, qapp):
         self.config = populated_config
-        self.config.study_complete_sound_enabled = True
         self.config.filter_groups_enabled = True
         self.config.active_filter_groups = ["Group A"]
+        self.node = self.config.remote_nodes["ct"]
+        self.node.notification_sound_enabled = True
+        self.node.notification_sound_path = ""
         self.engine = TransferEngine(self.config, "ct")
         self.dashboard = SourceDashboard(
             config=self.config, remote_key="ct")
@@ -1209,41 +1225,3 @@ class TestSoundPerStudyNotPerSeries:
         mock_play.assert_not_called()
 
 
-class TestConfigStudyCompleteSound:
-
-    def test_default_true(self, tmp_config_path):
-        config = AppConfig(config_path=tmp_config_path)
-        assert config.study_complete_sound_enabled is True
-
-    def test_roundtrip(self, tmp_config_path):
-        config = AppConfig(config_path=tmp_config_path)
-        config.study_complete_sound_enabled = False
-        config.save()
-        config2 = AppConfig(config_path=tmp_config_path)
-        config2.load()
-        assert config2.study_complete_sound_enabled is False
-
-
-class TestConfigStudyCompleteSoundPath:
-
-    def test_default_empty(self, tmp_config_path):
-        """Default sound path is empty string (= use default tone)."""
-        config = AppConfig(config_path=tmp_config_path)
-        assert config.study_complete_sound_path == ""
-
-    def test_roundtrip(self, tmp_config_path):
-        config = AppConfig(config_path=tmp_config_path)
-        config.study_complete_sound_path = "/sounds/custom.wav"
-        config.save()
-        config2 = AppConfig(config_path=tmp_config_path)
-        config2.load()
-        assert config2.study_complete_sound_path == "/sounds/custom.wav"
-
-    def test_roundtrip_empty(self, tmp_config_path):
-        """Saving empty string preserves it correctly."""
-        config = AppConfig(config_path=tmp_config_path)
-        config.study_complete_sound_path = ""
-        config.save()
-        config2 = AppConfig(config_path=tmp_config_path)
-        config2.load()
-        assert config2.study_complete_sound_path == ""

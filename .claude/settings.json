@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./venv/bin/python -m pytest tests/ -q --no-header --tb=line)",
+      "Bash(./venv/bin/python -m pytest tests/test_dashboard.py::TestDashboardReset -q --no-header --tb=short)",
+      "Bash(./venv/bin/python -m pytest tests/test_dashboard.py::TestDashboardFilterUI -q --no-header --tb=short)",
+      "Bash(./venv/bin/python -m pytest tests/test_dashboard.py::TestStudyRateCalculation -q --no-header --tb=short)",
+      "Bash(./venv/bin/python -m pytest tests/test_main_window.py::TestMainWindowService::test_start_creates_engine_for_source -q --no-header --tb=long)",
+      "Bash(git commit -m ':*)",
+      "Bash(./venv/bin/python -m pytest tests/test_dashboard.py::TestStudyRateCalculation tests/test_dashboard.py::TestStudyRateDisplay tests/test_dashboard.py::TestStudiesQueriedSignal tests/test_dashboard.py::TestHighLoadPopup -v --no-header --tb=line)",
+      "Bash(./venv/bin/python -m pytest tests/test_dashboard.py::TestStudyRateDisplay::test_on_queue_updated_does_not_update_study_rate -v --no-header --tb=short)",
+      "Bash(./venv/bin/python -m pytest tests/test_dashboard.py::TestStudyRateCalculation tests/test_dashboard.py::TestStudyRateDisplay tests/test_dashboard.py::TestStudiesQueriedSignal tests/test_dashboard.py::TestHighLoadPopup tests/test_dashboard.py::TestConfigHighLoadAlert --no-header --tb=no -q)",
+      "Bash(./venv/bin/python -m pytest tests/test_dashboard.py::TestStudyRateCalculation tests/test_dashboard.py::TestStudyRateDisplay tests/test_dashboard.py::TestStudiesQueriedSignal tests/test_dashboard.py::TestHighLoadPopup tests/test_dashboard.py::TestConfigHighLoadAlert -v --no-header --tb=short)",
+      "Bash(./venv/bin/python -m pytest tests/test_transfer_engine.py::TestStudiesQueriedEmission -v --no-header --tb=short)",
+      "Bash(./venv/bin/python -c ':*)",
+      "Bash(./venv/bin/python -m pytest tests/test_transfer_engine.py::TestStudiesQueriedEmission::test_filtered_out_studies_still_emitted -v --no-header)",
+      "Bash(xargs ls:*)",
+      "Bash(./venv/bin/python -m pytest tests/test_transfer_engine.py::TestPatientStudiesCompleted tests/test_dashboard.py::TestStudyCompleteSound tests/test_dashboard.py::TestConfigStudyCompleteSound --no-header --tb=no -q)",
+      "Bash(./venv/bin/python -m pytest tests/test_transfer_engine.py::TestPatientStudiesCompleted tests/test_dashboard.py::TestStudyCompleteSound tests/test_dashboard.py::TestConfigStudyCompleteSound -v --no-header --tb=short)"
+    ]
+  }
+}
