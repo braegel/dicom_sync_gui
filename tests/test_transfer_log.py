@@ -1,0 +1,619 @@
+"""
+Tests for core.transfer_log — SQLite-based transfer performance logging.
+
+The transfer log records per-series and per-study transfer metrics for
+regulatory compliance documentation (StrlSchV / DIN 6868-159).
+Patient-identifiable fields (PatientID, AccessionNumber) are stored as
+SHA-256 hashes so that a specific examination can be traced back when
+the original identifiers are known, without storing PII locally.
+"""
+
+import hashlib
+import os
+import sqlite3
+import threading
+import time
+from datetime import datetime
+
+import pytest
+
+from core.transfer_log import (
+    TransferLog,
+    MODALITY_BYTES_PER_IMAGE,
+    estimate_bytes,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _sha256(value: str) -> str:
+    """Reproduce the hash the production code should use."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fixtures
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def db_path(tmp_path):
+    return str(tmp_path / "transfer_log.sqlite")
+
+
+@pytest.fixture
+def log(db_path):
+    tl = TransferLog(db_path)
+    yield tl
+    tl.close()
+
+
+@pytest.fixture
+def sample_series_kwargs():
+    """Minimal kwargs for recording a series transfer."""
+    return dict(
+        source_pacs="ct_scanner",
+        study_uid="1.2.3.4",
+        series_uid="1.2.3.4.5",
+        patient_id="PAT001",
+        accession_number="ACC001",
+        study_date="20260405",
+        study_time="143000",
+        modality="CT",
+        study_description="CT Abdomen",
+        series_description="Axial 5mm",
+        series_number="3",
+        image_count=350,
+        duration_seconds=45.0,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Database creation and schema
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSchema:
+
+    def test_creates_database_file(self, db_path):
+        tl = TransferLog(db_path)
+        tl.close()
+        assert os.path.exists(db_path)
+
+    def test_creates_series_table(self, log, db_path):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='series_transfer'")
+        assert cursor.fetchone() is not None
+        conn.close()
+
+    def test_creates_study_table(self, log, db_path):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='study_transfer'")
+        assert cursor.fetchone() is not None
+        conn.close()
+
+    def test_series_table_columns(self, log, db_path):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(series_transfer)")
+        columns = {row[1] for row in cursor.fetchall()}
+        expected = {
+            "id", "timestamp", "source_pacs",
+            "study_uid_hash", "series_uid_hash",
+            "patient_id_hash", "accession_number_hash",
+            "study_date", "study_time",
+            "modality", "study_description", "series_description",
+            "series_number",
+            "image_count", "duration_seconds", "images_per_minute",
+            "estimated_bytes", "estimated_mbps",
+        }
+        conn.close()
+        assert expected.issubset(columns)
+
+    def test_study_table_columns(self, log, db_path):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(study_transfer)")
+        columns = {row[1] for row in cursor.fetchall()}
+        expected = {
+            "id", "timestamp", "source_pacs",
+            "study_uid_hash", "patient_id_hash", "accession_number_hash",
+            "study_date", "study_time",
+            "modality", "study_description",
+            "total_series", "total_images",
+            "total_duration_seconds", "wall_clock_seconds",
+            "total_estimated_bytes", "estimated_mbps",
+        }
+        conn.close()
+        assert expected.issubset(columns)
+
+    def test_reopen_existing_db(self, db_path):
+        """Opening an existing DB does not fail or lose data."""
+        tl1 = TransferLog(db_path)
+        tl1.record_series(
+            source_pacs="x", study_uid="1", series_uid="2",
+            patient_id="P", accession_number="A",
+            study_date="20260101", study_time="120000",
+            modality="CT", study_description="Test",
+            series_description="Axial", series_number="1",
+            image_count=100, duration_seconds=10.0,
+        )
+        tl1.close()
+
+        tl2 = TransferLog(db_path)
+        rows = tl2.query_series()
+        tl2.close()
+        assert len(rows) == 1
+
+    def test_creates_parent_directories(self, tmp_path):
+        """TransferLog creates intermediate directories if needed."""
+        nested = str(tmp_path / "sub" / "dir" / "transfer_log.sqlite")
+        tl = TransferLog(nested)
+        tl.close()
+        assert os.path.exists(nested)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Byte estimation
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestByteEstimation:
+
+    def test_ct_estimate(self):
+        """CT: 512x512x2 = 524288 bytes per image."""
+        result = estimate_bytes("CT", 100)
+        assert result == 100 * MODALITY_BYTES_PER_IMAGE["CT"]
+
+    def test_mr_estimate(self):
+        result = estimate_bytes("MR", 200)
+        assert result == 200 * MODALITY_BYTES_PER_IMAGE["MR"]
+
+    def test_cr_estimate(self):
+        result = estimate_bytes("CR", 2)
+        assert result == 2 * MODALITY_BYTES_PER_IMAGE["CR"]
+
+    def test_dx_estimate(self):
+        result = estimate_bytes("DX", 1)
+        assert result == MODALITY_BYTES_PER_IMAGE["DX"]
+
+    def test_unknown_modality_uses_fallback(self):
+        """Unknown modalities should use a sensible default."""
+        result = estimate_bytes("XZ_UNKNOWN", 10)
+        assert result > 0
+
+    def test_zero_images(self):
+        assert estimate_bytes("CT", 0) == 0
+
+    def test_us_estimate(self):
+        result = estimate_bytes("US", 50)
+        assert result == 50 * MODALITY_BYTES_PER_IMAGE["US"]
+
+    def test_pt_nm_modalities(self):
+        """Nuclear medicine modalities should have estimates."""
+        for mod in ("PT", "NM"):
+            assert estimate_bytes(mod, 10) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Recording series transfers
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRecordSeries:
+
+    def test_record_inserts_row(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        rows = log.query_series()
+        assert len(rows) == 1
+
+    def test_patient_id_is_hashed(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        rows = log.query_series()
+        row = rows[0]
+        assert row["patient_id_hash"] == _sha256("PAT001")
+        assert "PAT001" not in str(row.values())
+
+    def test_accession_number_is_hashed(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        rows = log.query_series()
+        row = rows[0]
+        assert row["accession_number_hash"] == _sha256("ACC001")
+
+    def test_study_uid_is_hashed(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        rows = log.query_series()
+        assert rows[0]["study_uid_hash"] == _sha256("1.2.3.4")
+
+    def test_series_uid_is_hashed(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        rows = log.query_series()
+        assert rows[0]["series_uid_hash"] == _sha256("1.2.3.4.5")
+
+    def test_cleartext_fields_preserved(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        assert row["source_pacs"] == "ct_scanner"
+        assert row["study_date"] == "20260405"
+        assert row["study_time"] == "143000"
+        assert row["modality"] == "CT"
+        assert row["study_description"] == "CT Abdomen"
+        assert row["series_description"] == "Axial 5mm"
+        assert row["series_number"] == "3"
+        assert row["image_count"] == 350
+
+    def test_duration_and_speed(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        assert row["duration_seconds"] == pytest.approx(45.0)
+        assert row["images_per_minute"] == pytest.approx((350 / 45.0) * 60)
+
+    def test_estimated_bytes_computed(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        expected_bytes = estimate_bytes("CT", 350)
+        assert row["estimated_bytes"] == expected_bytes
+        assert row["estimated_bytes"] > 0
+
+    def test_estimated_mbps_computed(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        expected_bytes = estimate_bytes("CT", 350)
+        expected_mbps = (expected_bytes * 8) / (45.0 * 1_000_000)
+        assert row["estimated_mbps"] == pytest.approx(expected_mbps, rel=0.01)
+
+    def test_timestamp_is_iso_format(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        # Should parse without error
+        dt = datetime.fromisoformat(row["timestamp"])
+        assert dt.year >= 2026
+
+    def test_multiple_records(self, log, sample_series_kwargs):
+        for i in range(5):
+            kw = {**sample_series_kwargs, "series_uid": f"1.2.3.4.{i}"}
+            log.record_series(**kw)
+        assert len(log.query_series()) == 5
+
+    def test_zero_duration_no_division_error(self, log, sample_series_kwargs):
+        sample_series_kwargs["duration_seconds"] = 0.0
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        assert row["images_per_minute"] == 0.0
+        assert row["estimated_mbps"] == 0.0
+
+    def test_empty_accession_hashed(self, log, sample_series_kwargs):
+        """Even empty accession numbers are hashed (not stored as empty)."""
+        sample_series_kwargs["accession_number"] = ""
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        assert row["accession_number_hash"] == _sha256("")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Recording study transfers
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRecordStudy:
+
+    def test_record_study_inserts_row(self, log):
+        log.record_study(
+            source_pacs="ct",
+            study_uid="1.2.3.4",
+            patient_id="PAT001",
+            accession_number="ACC001",
+            study_date="20260405",
+            study_time="143000",
+            modality="CT",
+            study_description="CT Abdomen",
+            total_series=3,
+            total_images=900,
+            total_duration_seconds=120.0,
+            wall_clock_seconds=130.0,
+        )
+        rows = log.query_studies()
+        assert len(rows) == 1
+
+    def test_study_patient_id_hashed(self, log):
+        log.record_study(
+            source_pacs="ct", study_uid="1.2.3",
+            patient_id="PAT999", accession_number="ACC999",
+            study_date="20260405", study_time="120000",
+            modality="CT", study_description="Test",
+            total_series=1, total_images=100,
+            total_duration_seconds=10.0, wall_clock_seconds=12.0,
+        )
+        row = log.query_studies()[0]
+        assert row["patient_id_hash"] == _sha256("PAT999")
+
+    def test_study_estimated_bytes(self, log):
+        log.record_study(
+            source_pacs="ct", study_uid="1.2.3",
+            patient_id="P", accession_number="A",
+            study_date="20260405", study_time="120000",
+            modality="CT", study_description="Test",
+            total_series=2, total_images=500,
+            total_duration_seconds=60.0, wall_clock_seconds=65.0,
+        )
+        row = log.query_studies()[0]
+        assert row["total_estimated_bytes"] == estimate_bytes("CT", 500)
+
+    def test_study_wall_clock_vs_total_duration(self, log):
+        """wall_clock >= total_duration (includes gaps between series)."""
+        log.record_study(
+            source_pacs="ct", study_uid="1.2.3",
+            patient_id="P", accession_number="A",
+            study_date="20260405", study_time="120000",
+            modality="CT", study_description="Test",
+            total_series=3, total_images=600,
+            total_duration_seconds=90.0, wall_clock_seconds=110.0,
+        )
+        row = log.query_studies()[0]
+        assert row["wall_clock_seconds"] == pytest.approx(110.0)
+        assert row["total_duration_seconds"] == pytest.approx(90.0)
+
+    def test_study_mbps_uses_wall_clock(self, log):
+        """Bandwidth estimate should be based on wall-clock time."""
+        log.record_study(
+            source_pacs="ct", study_uid="1.2.3",
+            patient_id="P", accession_number="A",
+            study_date="20260405", study_time="120000",
+            modality="CT", study_description="Test",
+            total_series=1, total_images=200,
+            total_duration_seconds=30.0, wall_clock_seconds=35.0,
+        )
+        row = log.query_studies()[0]
+        expected_bytes = estimate_bytes("CT", 200)
+        expected_mbps = (expected_bytes * 8) / (35.0 * 1_000_000)
+        assert row["estimated_mbps"] == pytest.approx(expected_mbps, rel=0.01)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Querying and filtering
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestQuerying:
+
+    def _insert_series(self, log, study_date, modality="CT", source="ct"):
+        log.record_series(
+            source_pacs=source, study_uid="1.2.3", series_uid=f"1.2.3.{time.time()}",
+            patient_id="P", accession_number="A",
+            study_date=study_date, study_time="120000",
+            modality=modality, study_description="Test",
+            series_description="Axial", series_number="1",
+            image_count=100, duration_seconds=10.0,
+        )
+
+    def test_query_series_by_date_range(self, log):
+        self._insert_series(log, "20260401")
+        self._insert_series(log, "20260405")
+        self._insert_series(log, "20260410")
+        rows = log.query_series(date_from="20260404", date_to="20260406")
+        assert len(rows) == 1
+        assert rows[0]["study_date"] == "20260405"
+
+    def test_query_series_by_source(self, log):
+        self._insert_series(log, "20260405", source="ct")
+        self._insert_series(log, "20260405", source="mri")
+        rows = log.query_series(source_pacs="ct")
+        assert len(rows) == 1
+
+    def test_query_series_by_modality(self, log):
+        self._insert_series(log, "20260405", modality="CT")
+        self._insert_series(log, "20260405", modality="MR")
+        rows = log.query_series(modality="CT")
+        assert len(rows) == 1
+
+    def test_query_series_by_patient_hash(self, log):
+        log.record_series(
+            source_pacs="ct", study_uid="1", series_uid="1.1",
+            patient_id="PAT_A", accession_number="A1",
+            study_date="20260405", study_time="120000",
+            modality="CT", study_description="Test",
+            series_description="Axial", series_number="1",
+            image_count=100, duration_seconds=10.0,
+        )
+        log.record_series(
+            source_pacs="ct", study_uid="2", series_uid="2.1",
+            patient_id="PAT_B", accession_number="A2",
+            study_date="20260405", study_time="130000",
+            modality="CT", study_description="Test",
+            series_description="Axial", series_number="1",
+            image_count=100, duration_seconds=10.0,
+        )
+        rows = log.query_series(patient_id="PAT_A")
+        assert len(rows) == 1
+        assert rows[0]["patient_id_hash"] == _sha256("PAT_A")
+
+    def test_query_series_by_accession(self, log):
+        log.record_series(
+            source_pacs="ct", study_uid="1", series_uid="1.1",
+            patient_id="P", accession_number="ACC_TARGET",
+            study_date="20260405", study_time="120000",
+            modality="CT", study_description="Test",
+            series_description="Axial", series_number="1",
+            image_count=100, duration_seconds=10.0,
+        )
+        log.record_series(
+            source_pacs="ct", study_uid="2", series_uid="2.1",
+            patient_id="P", accession_number="ACC_OTHER",
+            study_date="20260405", study_time="130000",
+            modality="CT", study_description="Test",
+            series_description="Axial", series_number="1",
+            image_count=100, duration_seconds=10.0,
+        )
+        rows = log.query_series(accession_number="ACC_TARGET")
+        assert len(rows) == 1
+
+    def test_query_returns_dicts(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        rows = log.query_series()
+        assert isinstance(rows, list)
+        assert isinstance(rows[0], dict)
+
+    def test_query_studies_by_date(self, log):
+        log.record_study(
+            source_pacs="ct", study_uid="1", patient_id="P",
+            accession_number="A", study_date="20260401",
+            study_time="120000", modality="CT",
+            study_description="Test", total_series=1,
+            total_images=100, total_duration_seconds=10.0,
+            wall_clock_seconds=12.0,
+        )
+        log.record_study(
+            source_pacs="ct", study_uid="2", patient_id="P",
+            accession_number="A", study_date="20260410",
+            study_time="120000", modality="CT",
+            study_description="Test", total_series=1,
+            total_images=100, total_duration_seconds=10.0,
+            wall_clock_seconds=12.0,
+        )
+        rows = log.query_studies(date_from="20260405")
+        assert len(rows) == 1
+        assert rows[0]["study_date"] == "20260410"
+
+    def test_query_empty_db(self, log):
+        assert log.query_series() == []
+        assert log.query_studies() == []
+
+    def test_query_combined_filters(self, log):
+        """Multiple filters are AND-combined."""
+        self._insert_series(log, "20260405", modality="CT", source="ct")
+        self._insert_series(log, "20260405", modality="MR", source="ct")
+        self._insert_series(log, "20260405", modality="CT", source="mri")
+        rows = log.query_series(modality="CT", source_pacs="ct")
+        assert len(rows) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Hash reproducibility (for tracing back examinations)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestHashReproducibility:
+
+    def test_same_input_same_hash(self, log, sample_series_kwargs):
+        """Recording the same patient_id twice produces the same hash."""
+        log.record_series(**sample_series_kwargs)
+        kw2 = {**sample_series_kwargs, "series_uid": "1.2.3.4.99"}
+        log.record_series(**kw2)
+        rows = log.query_series()
+        assert rows[0]["patient_id_hash"] == rows[1]["patient_id_hash"]
+
+    def test_different_input_different_hash(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        kw2 = {**sample_series_kwargs,
+               "patient_id": "PAT002", "series_uid": "1.2.3.4.99"}
+        log.record_series(**kw2)
+        rows = log.query_series()
+        assert rows[0]["patient_id_hash"] != rows[1]["patient_id_hash"]
+
+    def test_hash_is_sha256_hex(self, log, sample_series_kwargs):
+        log.record_series(**sample_series_kwargs)
+        row = log.query_series()[0]
+        h = row["patient_id_hash"]
+        assert len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)
+
+    def test_can_find_by_known_patient_id(self, log, sample_series_kwargs):
+        """Given the original PatientID, the hash can be reproduced to query."""
+        log.record_series(**sample_series_kwargs)
+        target_hash = _sha256("PAT001")
+        rows = log.query_series(patient_id="PAT001")
+        assert len(rows) == 1
+        assert rows[0]["patient_id_hash"] == target_hash
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DB path resolution (platform-specific)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDefaultDbPath:
+
+    def test_default_path_function_exists(self):
+        from core.transfer_log import default_db_path
+        path = default_db_path()
+        assert path.endswith("transfer_log.sqlite")
+
+    def test_default_path_is_absolute(self):
+        from core.transfer_log import default_db_path
+        assert os.path.isabs(default_db_path())
+
+    def test_default_path_platform_appropriate(self):
+        """On macOS should be in ~/Library/Logs/, on Linux in state dir."""
+        import platform as plat
+        from core.transfer_log import default_db_path
+        path = default_db_path()
+        system = plat.system()
+        if system == "Darwin":
+            assert "Library/Logs" in path
+        elif system == "Linux":
+            assert ".local/state" in path or "XDG_STATE_HOME" in os.environ
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Thread safety
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestThreadSafety:
+
+    def test_concurrent_writes(self, log, sample_series_kwargs):
+        """Multiple threads recording simultaneously should not lose data."""
+        errors = []
+
+        def worker(idx):
+            try:
+                kw = {**sample_series_kwargs,
+                      "series_uid": f"1.2.3.4.{idx}"}
+                log.record_series(**kw)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+        assert len(log.query_series()) == 20
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Export-friendliness (the data should be usable in other systems)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestExportFriendliness:
+
+    def test_raw_sql_access(self, log, db_path, sample_series_kwargs):
+        """DB can be opened with plain sqlite3 and queried."""
+        log.record_series(**sample_series_kwargs)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM series_transfer").fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert dict(rows[0])["modality"] == "CT"
+
+    def test_study_aggregation_via_sql(self, log, db_path):
+        """Series-level data can be aggregated to study-level via SQL."""
+        for i in range(3):
+            log.record_series(
+                source_pacs="ct", study_uid="1.2.3",
+                series_uid=f"1.2.3.{i}",
+                patient_id="P", accession_number="A",
+                study_date="20260405", study_time="120000",
+                modality="CT", study_description="CT Abdomen",
+                series_description=f"Series {i}", series_number=str(i),
+                image_count=100, duration_seconds=10.0,
+            )
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("""
+            SELECT study_uid_hash,
+                   COUNT(*) as num_series,
+                   SUM(image_count) as total_images,
+                   SUM(duration_seconds) as total_duration,
+                   SUM(estimated_bytes) as total_bytes
+            FROM series_transfer
+            GROUP BY study_uid_hash
+        """).fetchone()
+        conn.close()
+        assert row[1] == 3   # num_series
+        assert row[2] == 300  # total_images

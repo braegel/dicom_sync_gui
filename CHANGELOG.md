@@ -2,6 +2,21 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.3] — 2026-04-05
+
+### Added
+- Transfer performance log (SQLite) for regulatory compliance documentation
+  (StrlSchV § 123 / DIN 6868-159)
+  - Per-series and per-study transfer metrics (image count, duration,
+    estimated bandwidth)
+  - Patient-identifiable fields (PatientID, AccessionNumber, UIDs) stored
+    as SHA-256 hashes — traceable with original identifiers, no PII on disk
+  - Approximate byte estimation per modality (CT, MR, CR, DX, US, PT, NM,
+    MG, XA) for Mbit/s calculation
+  - Filterable queries by date range, source PACS, modality, patient,
+    and accession number
+  - SQLite database at platform-standard location for easy external analysis
+
 ## [1.0.2] — 2026-04-05
 
 ### Added
