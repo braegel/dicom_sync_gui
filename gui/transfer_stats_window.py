@@ -5,15 +5,34 @@ Displays statistical analysis of the SQLite transfer performance log,
 accessible via the View menu.
 """
 
+from collections import defaultdict
+from datetime import datetime
+
 from PySide6.QtCore import Qt
+from PySide6.QtCharts import QChart, QChartView, QBoxPlotSeries, QBoxSet
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
     QPushButton, QComboBox, QTabWidget,
 )
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QPainter
 
 from core.transfer_log import TransferLog
+
+
+def _quartiles(vals):
+    """Return (min, Q1, median, Q3, max) for a sorted list of floats."""
+    n = len(vals)
+    if n == 0:
+        return (0, 0, 0, 0, 0)
+    s = sorted(vals)
+    mid = n // 2
+    median = s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+    lower = s[:mid]
+    upper = s[mid + 1:] if n % 2 else s[mid:]
+    q1 = lower[len(lower) // 2] if lower else s[0]
+    q3 = upper[len(upper) // 2] if upper else s[-1]
+    return (s[0], q1, median, q3, s[-1])
 
 
 class TransferStatsWindow(QWidget):
@@ -65,6 +84,25 @@ class TransferStatsWindow(QWidget):
         sg.addWidget(QLabel("Median Mbit/s:"), 1, 4)
         sg.addWidget(self.lbl_median_mbps, 1, 5)
         layout.addWidget(self.summary_group)
+
+        # ── Boxplot chart ────────────────────────────────────────────
+        chart_row = QHBoxLayout()
+        chart_row.addWidget(QLabel("Aggregate by:"))
+        self.combo_aggregation = QComboBox()
+        self.combo_aggregation.addItems(["Hour", "Day", "Week", "Month"])
+        self.combo_aggregation.setCurrentIndex(1)  # Day
+        self.combo_aggregation.currentIndexChanged.connect(self._refresh)
+        chart_row.addWidget(self.combo_aggregation)
+        chart_row.addStretch()
+        layout.addLayout(chart_row)
+
+        self._chart = QChart()
+        self._chart.setTitle("Estimated Mbit/s")
+        self._chart.setAnimationOptions(QChart.NoAnimation)
+        self.chart_view = QChartView(self._chart)
+        self.chart_view.setRenderHint(QPainter.Antialiasing)
+        self.chart_view.setMinimumHeight(400)
+        layout.addWidget(self.chart_view)
 
         # ── Breakdown tables ─────────────────────────────────────────
         breakdown = QHBoxLayout()
@@ -182,6 +220,7 @@ class TransferStatsWindow(QWidget):
         log.close()
 
         self._update_summary(series, studies)
+        self._update_boxplot(series)
         self._update_source_table(series, studies)
         self._update_modality_table(series)
         self._update_study_table(studies)
@@ -214,6 +253,61 @@ class TransferStatsWindow(QWidget):
         else:
             self.lbl_date_range.setText("—")
             self.lbl_median_mbps.setText("—")
+
+    # ── Boxplot ──────────────────────────────────────────────────────
+
+    def _bucket_key(self, study_date: str, study_time: str) -> str:
+        """Return a bucket key based on current aggregation level."""
+        agg = self.combo_aggregation.currentText().lower()
+        # study_date = YYYYMMDD, study_time = HHMMSS
+        if agg == "hour":
+            return study_time[:2] + ":00"
+        if agg == "day":
+            return study_date
+        if agg == "week":
+            try:
+                dt = datetime.strptime(study_date, "%Y%m%d")
+                iso = dt.isocalendar()
+                return f"{iso[0]}-W{iso[1]:02d}"
+            except ValueError:
+                return study_date
+        if agg == "month":
+            return study_date[:6]
+        return study_date
+
+    def _update_boxplot(self, series):
+        self._chart.removeAllSeries()
+        for axis in self._chart.axes():
+            self._chart.removeAxis(axis)
+
+        if not series:
+            return
+
+        buckets = defaultdict(list)
+        for r in series:
+            key = self._bucket_key(r["study_date"], r["study_time"])
+            if r["estimated_mbps"] > 0:
+                buckets[key].append(r["estimated_mbps"])
+
+        if not buckets:
+            return
+
+        bp_series = QBoxPlotSeries()
+        for key in sorted(buckets.keys()):
+            vals = buckets[key]
+            lo, q1, med, q3, hi = _quartiles(vals)
+            box = QBoxSet(key)
+            box.setValue(QBoxSet.LowerExtreme, lo)
+            box.setValue(QBoxSet.LowerQuartile, q1)
+            box.setValue(QBoxSet.Median, med)
+            box.setValue(QBoxSet.UpperQuartile, q3)
+            box.setValue(QBoxSet.UpperExtreme, hi)
+            bp_series.append(box)
+
+        self._chart.addSeries(bp_series)
+        self._chart.createDefaultAxes()
+        for axis in self._chart.axes(Qt.Vertical):
+            axis.setTitleText("Mbit/s")
 
     # ── Source table ─────────────────────────────────────────────────
 

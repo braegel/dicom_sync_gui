@@ -488,3 +488,225 @@ class TestStudyTable:
                 window.filter_source.setCurrentIndex(i)
                 break
         assert window.study_table.rowCount() == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Boxplot chart — Mbit/s over time
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _populate_log_multi_day(log: TransferLog):
+    """Insert series spread across multiple days/hours for boxplot testing."""
+    # 7 days of data, multiple series per day at varying speeds
+    base_series = 0
+    for day in range(1, 8):  # 20260401–20260407
+        date = f"2026040{day}"
+        for hour in (8, 12, 16, 20):
+            base_series += 1
+            # Vary duration to create spread in Mbit/s values
+            duration = 10.0 + day * 2 + hour * 0.5
+            log.record_series(
+                source_pacs="ct_scanner",
+                study_uid=f"1.2.{day}.{hour}",
+                series_uid=f"1.2.{day}.{hour}.1",
+                patient_id=f"PAT_{day}_{hour}",
+                accession_number=f"ACC_{day}_{hour}",
+                study_date=date,
+                study_time=f"{hour:02d}0000",
+                modality="CT",
+                study_description="CT Abdomen",
+                series_description="Axial",
+                series_number="1",
+                image_count=300,
+                duration_seconds=duration,
+            )
+
+
+@pytest.fixture
+def boxplot_log(db_path):
+    tl = TransferLog(db_path)
+    _populate_log_multi_day(tl)
+    yield tl
+    tl.close()
+
+
+@pytest.fixture
+def boxplot_window(boxplot_log, db_path, qapp):
+    win = TransferStatsWindow(db_path)
+    yield win
+    win.close()
+
+
+class TestBoxplotWidgets:
+    """The chart area and aggregation selector exist and are wired up."""
+
+    def test_has_chart_view(self, boxplot_window):
+        """Window should contain a QChartView for the boxplot."""
+        from PySide6.QtCharts import QChartView
+        assert boxplot_window.chart_view is not None
+        assert isinstance(boxplot_window.chart_view, QChartView)
+
+    def test_has_aggregation_combo(self, boxplot_window):
+        """Combo box to select hour/day/week/month aggregation."""
+        assert boxplot_window.combo_aggregation is not None
+        assert isinstance(boxplot_window.combo_aggregation, QComboBox)
+
+    def test_aggregation_options(self, boxplot_window):
+        texts = [boxplot_window.combo_aggregation.itemText(i)
+                 for i in range(boxplot_window.combo_aggregation.count())]
+        assert len(texts) == 4
+        # Check all four granularities exist (case-insensitive)
+        lower = [t.lower() for t in texts]
+        assert any("hour" in t for t in lower)
+        assert any("day" in t or "tag" in t for t in lower)
+        assert any("week" in t or "woche" in t for t in lower)
+        assert any("month" in t or "monat" in t for t in lower)
+
+    def test_default_aggregation_is_day(self, boxplot_window):
+        """Day should be the default aggregation level."""
+        current = boxplot_window.combo_aggregation.currentText().lower()
+        assert "day" in current or "tag" in current
+
+    def test_chart_has_title(self, boxplot_window):
+        title = boxplot_window.chart_view.chart().title()
+        assert "mbit" in title.lower() or "mbps" in title.lower()
+
+
+class TestBoxplotChart:
+    """The chart renders correct data for each aggregation level."""
+
+    def test_day_aggregation_box_count(self, boxplot_window):
+        """Per-day: 7 days of data → 7 boxes."""
+        _set_aggregation(boxplot_window, "day")
+        series = _get_boxplot_series(boxplot_window)
+        assert series is not None
+        assert series.count() == 7
+
+    def test_hour_aggregation_box_count(self, boxplot_window):
+        """Per-hour: 4 distinct hours (08, 12, 16, 20) → 4 boxes."""
+        _set_aggregation(boxplot_window, "hour")
+        series = _get_boxplot_series(boxplot_window)
+        assert series is not None
+        assert series.count() == 4
+
+    def test_week_aggregation_box_count(self, boxplot_window):
+        """20260401–20260407 spans 2 ISO weeks (W14 Mon–Sun, W15 Mon)."""
+        _set_aggregation(boxplot_window, "week")
+        series = _get_boxplot_series(boxplot_window)
+        assert series is not None
+        assert series.count() >= 1
+
+    def test_month_aggregation_box_count(self, boxplot_window):
+        """All data is in April 2026 → 1 box."""
+        _set_aggregation(boxplot_window, "month")
+        series = _get_boxplot_series(boxplot_window)
+        assert series is not None
+        assert series.count() == 1
+
+    def test_box_values_are_positive(self, boxplot_window):
+        """All box values (min, Q1, median, Q3, max) should be > 0."""
+        _set_aggregation(boxplot_window, "day")
+        series = _get_boxplot_series(boxplot_window)
+        for i in range(series.count()):
+            box_set = series.boxSets()[i]
+            for val_idx in range(5):  # 0=lower, 1=Q1, 2=median, 3=Q3, 4=upper
+                assert box_set.at(val_idx) >= 0
+
+    def test_changing_aggregation_updates_chart(self, boxplot_window):
+        """Switching aggregation should change the number of boxes."""
+        _set_aggregation(boxplot_window, "day")
+        day_count = _get_boxplot_series(boxplot_window).count()
+        _set_aggregation(boxplot_window, "month")
+        month_count = _get_boxplot_series(boxplot_window).count()
+        assert day_count != month_count
+
+    def test_chart_y_axis_label_contains_mbit(self, boxplot_window):
+        """Y axis should be labeled with Mbit/s."""
+        chart = boxplot_window.chart_view.chart()
+        for axis in chart.axes():
+            if axis.alignment().name == b"AlignLeft":
+                assert "mbit" in axis.titleText().lower() or \
+                       "mbps" in axis.titleText().lower()
+                return
+        # If no left axis found, check any axis
+        labels = [a.titleText().lower() for a in chart.axes()]
+        assert any("mbit" in l or "mbps" in l for l in labels)
+
+
+class TestBoxplotFilters:
+    """Source/modality filters should also affect the boxplot."""
+
+    def test_source_filter_affects_chart(self, boxplot_window, db_path):
+        """Adding MR data then filtering to CT should exclude it."""
+        # Add some MR series on a different date
+        log2 = TransferLog(db_path)
+        log2.record_series(
+            source_pacs="mri_unit", study_uid="9.9.9",
+            series_uid="9.9.9.1", patient_id="P",
+            accession_number="A", study_date="20260408",
+            study_time="100000", modality="MR",
+            study_description="MR", series_description="T1",
+            series_number="1", image_count=100, duration_seconds=20.0,
+        )
+        log2.close()
+        boxplot_window.btn_refresh.click()
+        _set_aggregation(boxplot_window, "day")
+
+        # Unfiltered: 8 days
+        count_all = _get_boxplot_series(boxplot_window).count()
+
+        # Filter to ct_scanner only
+        for i in range(boxplot_window.filter_source.count()):
+            if boxplot_window.filter_source.itemText(i) == "ct_scanner":
+                boxplot_window.filter_source.setCurrentIndex(i)
+                break
+        count_ct = _get_boxplot_series(boxplot_window).count()
+        assert count_ct < count_all  # day 8 (MR only) excluded
+
+
+class TestBoxplotEmpty:
+    """Boxplot with no data should not crash."""
+
+    def test_empty_db_no_crash(self, empty_window):
+        """Empty DB → chart exists but has no boxes."""
+        from PySide6.QtCharts import QChartView
+        assert isinstance(empty_window.chart_view, QChartView)
+        series = _get_boxplot_series(empty_window)
+        assert series is None or series.count() == 0
+
+    def test_single_series_shows_one_box(self, log, db_path, qapp):
+        """A single data point should still render one box."""
+        log.record_series(
+            source_pacs="ct", study_uid="1", series_uid="1.1",
+            patient_id="P", accession_number="A",
+            study_date="20260401", study_time="120000",
+            modality="CT", study_description="Test",
+            series_description="Axial", series_number="1",
+            image_count=100, duration_seconds=10.0,
+        )
+        win = TransferStatsWindow(db_path)
+        _set_aggregation(win, "day")
+        series = _get_boxplot_series(win)
+        assert series is not None
+        assert series.count() == 1
+        win.close()
+
+
+# ── Boxplot test helpers ─────────────────────────────────────────────────
+
+def _set_aggregation(window, keyword: str):
+    """Set the aggregation combo to the item matching keyword."""
+    for i in range(window.combo_aggregation.count()):
+        if keyword.lower() in window.combo_aggregation.itemText(i).lower():
+            window.combo_aggregation.setCurrentIndex(i)
+            return
+    raise ValueError(f"No aggregation option matching '{keyword}'")
+
+
+def _get_boxplot_series(window):
+    """Return the first QBoxPlotSeries from the chart, or None."""
+    from PySide6.QtCharts import QBoxPlotSeries
+    chart = window.chart_view.chart()
+    for s in chart.series():
+        if isinstance(s, QBoxPlotSeries):
+            return s
+    return None

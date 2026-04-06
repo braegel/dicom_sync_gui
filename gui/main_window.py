@@ -27,6 +27,8 @@ from gui.log_window import LogWindow
 from gui.filter_groups_dialog import FilterGroupsDialog
 from gui.unknown_institution_popup import UnknownInstitutionPopup
 from gui.transfer_stats_window import TransferStatsWindow
+from gui.examination_lookup import ExaminationLookupDialog
+from gui.live_completions import LiveCompletionsWindow
 
 logger = logging.getLogger("dicom_sync")
 
@@ -90,10 +92,18 @@ class MainWindow(QMainWindow):
         stats_action.triggered.connect(self._open_transfer_stats)
         view_menu.addAction(stats_action)
 
+        completions_action = QAction("Download Completions", self)
+        completions_action.triggered.connect(self._show_completions_window)
+        view_menu.addAction(completions_action)
+
         tools_menu = menubar.addMenu("Tools")
         self._echo_action = QAction("C-ECHO Test...", self)
         self._echo_action.triggered.connect(self._test_echo)
         tools_menu.addAction(self._echo_action)
+
+        lookup_action = QAction("Examination Lookup...", self)
+        lookup_action.triggered.connect(self._open_examination_lookup)
+        tools_menu.addAction(lookup_action)
 
     # ── Central UI ────────────────────────────────────────────────────────
 
@@ -111,6 +121,7 @@ class MainWindow(QMainWindow):
 
         # Log window (created once, shown/hidden on demand)
         self.log_window = LogWindow(self)
+        self.completions_window = LiveCompletionsWindow(self)
 
     def _rebuild_tabs(self):
         """Create one SourceDashboard tab per configured source PACS."""
@@ -224,10 +235,36 @@ class MainWindow(QMainWindow):
         self._stats_window.raise_()
         self._stats_window.activateWindow()
 
+    def _open_examination_lookup(self):
+        from core.transfer_log import default_db_path
+        dlg = ExaminationLookupDialog(default_db_path(), self)
+        dlg.exec()
+
+    def _show_completions_window(self):
+        self.completions_window.show()
+        self.completions_window.raise_()
+        self.completions_window.activateWindow()
+
     def _show_log_window(self):
         self.log_window.show()
         self.log_window.raise_()
         self.log_window.activateWindow()
+
+    def _on_study_completed_live(self, engine, study_uid: str,
+                                   fully_complete: bool):
+        """Add a completion entry to the live completions window."""
+        if not fully_complete:
+            return
+        for job in engine._queue:
+            if job.study_uid == study_uid and job.status == "done":
+                self.completions_window.add_completion(
+                    patient_name=job.patient_name,
+                    study_description=job.study_description,
+                    study_time=job.study_time,
+                    completed_time=datetime.now().strftime("%H:%M:%S"),
+                    institution_name=job.institution_name,
+                )
+                return
 
     def _log(self, msg: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -362,6 +399,9 @@ class MainWindow(QMainWindow):
         e.signals.studies_queried.connect(dashboard.on_studies_queried)
         e.signals.study_completed.connect(
             dashboard.on_study_completed)
+        e.signals.study_completed.connect(
+            lambda uid, inst, full, eng=engine:
+                self._on_study_completed_live(eng, uid, full))
         e.signals.series_started.connect(dashboard.on_series_started)
         e.signals.stats_updated.connect(dashboard.on_stats_updated)
         e.signals.cycle_started.connect(dashboard.on_cycle_started)

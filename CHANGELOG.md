@@ -2,6 +2,22 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.5] — 2026-04-06
+
+### Added
+- Mbit/s boxplot chart in Transfer Performance Statistics window
+  - Aggregation by hour, day, week, or month
+  - Responds to source/modality filters
+- Examination Lookup dialog (Tools menu): enter PatientID / AccessionNumber /
+  StudyDate in cleartext to find transfer details for a specific examination
+  - Shows acquisition time, download start/end, duration, Mbit/s per series
+  - Warns when series were likely resent (Mbit/s < median − 2σ)
+- Download Completions window (View menu): live overview of completed studies
+  - PatientName, StudyDescription, Institution, acquisition time, download
+    time, and delay (acquisition → download)
+  - Median delay label, color-coded delay cells (red > median + 1σ,
+    green < median − 1σ)
+
 ## [1.0.4] — 2026-04-06
 
 ### Added
