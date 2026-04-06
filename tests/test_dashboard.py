@@ -2,6 +2,7 @@
 Tests for gui.dashboard — SourceDashboard and StatsLabel.
 """
 
+import os
 import time
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
@@ -1009,6 +1010,13 @@ class TestStudyCompleteSound:
                 "1.2.3", "Hospital Alpha")
         mock_play.assert_called_once()
 
+    def test_no_sound_for_partial_download(self):
+        """Study not fully downloaded (small-series only) → no sound."""
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.dashboard.on_study_completed(
+                "1.2.3", "Hospital Alpha", fully_complete=False)
+        mock_play.assert_not_called()
+
     def test_no_sound_for_inactive_group(self):
         """Institution in inactive group → no sound."""
         with patch.object(self.dashboard, "_play_sound") as mock_play:
@@ -1063,6 +1071,150 @@ class TestStudyCompleteSound:
         mock_gen.assert_called_once()
         mock_play.assert_called_once_with("/tmp/default.wav")
 
+
+class TestSadSound:
+    """When median-5 speed is red (< median_all * 0.8), the default
+    notification sound should be 'sad' — second tone lower instead of higher."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.filter_groups_enabled = False
+        self.node = self.config.remote_nodes["ct"]
+        self.node.notification_sound_enabled = True
+        self.node.notification_sound_path = ""
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def _set_stats(self, median5, median_all):
+        """Set up _current_stats with controlled median values."""
+        stats = MagicMock(spec=TransferStats)
+        stats.median_n_ipm.return_value = median5
+        stats.median_all_ipm.return_value = median_all
+        stats.completed_count = 5
+        self.dashboard._current_stats = stats
+
+    def test_sad_sound_when_speed_red(self):
+        """median5 < median_all * 0.8 → _generate_default_sound(sad=True)."""
+        self._set_stats(median5=50.0, median_all=100.0)  # 50 < 80 → red
+        with patch(
+            "gui.dashboard._generate_default_sound",
+            return_value="/tmp/sad.wav"
+        ) as mock_gen:
+            with patch.object(self.dashboard, "_play_sound"):
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
+        mock_gen.assert_called_once_with(sad=True)
+
+    def test_normal_sound_when_speed_ok(self):
+        """median5 >= median_all * 0.8 → _generate_default_sound(sad=False)."""
+        self._set_stats(median5=90.0, median_all=100.0)  # 90 >= 80 → ok
+        with patch(
+            "gui.dashboard._generate_default_sound",
+            return_value="/tmp/normal.wav"
+        ) as mock_gen:
+            with patch.object(self.dashboard, "_play_sound"):
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
+        mock_gen.assert_called_once_with(sad=False)
+
+    def test_normal_sound_when_speed_green(self):
+        """Well above baseline → normal sound."""
+        self._set_stats(median5=150.0, median_all=100.0)
+        with patch(
+            "gui.dashboard._generate_default_sound",
+            return_value="/tmp/normal.wav"
+        ) as mock_gen:
+            with patch.object(self.dashboard, "_play_sound"):
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
+        mock_gen.assert_called_once_with(sad=False)
+
+    def test_normal_sound_when_no_stats(self):
+        """No stats yet → default to normal sound (not sad)."""
+        self.dashboard._current_stats = None
+        with patch(
+            "gui.dashboard._generate_default_sound",
+            return_value="/tmp/normal.wav"
+        ) as mock_gen:
+            with patch.object(self.dashboard, "_play_sound"):
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
+        mock_gen.assert_called_once_with(sad=False)
+
+    def test_normal_sound_when_insufficient_data(self):
+        """median_all < 1 (not enough data) → normal sound."""
+        self._set_stats(median5=0.5, median_all=0.5)
+        with patch(
+            "gui.dashboard._generate_default_sound",
+            return_value="/tmp/normal.wav"
+        ) as mock_gen:
+            with patch.object(self.dashboard, "_play_sound"):
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
+        mock_gen.assert_called_once_with(sad=False)
+
+    def test_sad_sound_at_exact_threshold(self):
+        """median5 == median_all * 0.8 is NOT red (boundary is <, not <=)."""
+        self._set_stats(median5=80.0, median_all=100.0)  # exactly at boundary
+        with patch(
+            "gui.dashboard._generate_default_sound",
+            return_value="/tmp/normal.wav"
+        ) as mock_gen:
+            with patch.object(self.dashboard, "_play_sound"):
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
+        mock_gen.assert_called_once_with(sad=False)
+
+    def test_custom_sound_ignores_speed(self):
+        """Custom WAV path → always plays that file, regardless of speed."""
+        self._set_stats(median5=30.0, median_all=100.0)  # very red
+        self.node.notification_sound_path = "/tmp/custom.wav"
+        with patch("os.path.isfile", return_value=True):
+            with patch.object(self.dashboard, "_play_sound") as mock_play:
+                self.dashboard.on_study_completed(
+                    "1.2.3", "Hospital Alpha")
+        mock_play.assert_called_once_with("/tmp/custom.wav")
+
+
+class TestSadSoundGeneration:
+    """Verify the WAV generation produces different tones for sad vs normal."""
+
+    def test_sad_flag_accepted(self):
+        """_generate_default_sound accepts sad parameter."""
+        from gui.dashboard import _generate_default_sound
+        path = _generate_default_sound(sad=False)
+        assert path.endswith(".wav")
+        assert os.path.exists(path)
+
+    def test_sad_and_normal_produce_different_files(self):
+        """sad=True and sad=False should produce different WAV data."""
+        from gui.dashboard import _generate_default_sound
+        import gui.dashboard as mod
+        # Clear cache to force regeneration
+        mod._default_sound_path = None
+        mod._sad_sound_path = None
+        normal = _generate_default_sound(sad=False)
+        sad = _generate_default_sound(sad=True)
+        assert normal != sad
+        with open(normal, "rb") as f:
+            normal_data = f.read()
+        with open(sad, "rb") as f:
+            sad_data = f.read()
+        assert normal_data != sad_data
+
+    def test_sad_sound_second_tone_lower(self):
+        """In sad mode, the second tone should be lower than 880 Hz (A5),
+        creating a descending interval instead of ascending."""
+        from gui.dashboard import _generate_default_sound, _SAD_FREQ_2
+        assert _SAD_FREQ_2 < 880, (
+            f"Sad second tone ({_SAD_FREQ_2} Hz) should be below A5 (880 Hz)")
+
+    def test_normal_sound_second_tone_higher(self):
+        """In normal mode, the second tone should be higher than 880 Hz."""
+        from gui.dashboard import _NORMAL_FREQ_2
+        assert _NORMAL_FREQ_2 > 880, (
+            f"Normal second tone ({_NORMAL_FREQ_2} Hz) should be above A5 (880 Hz)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1163,6 +1315,7 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.3",
                       status="done", institution_name="Hospital Alpha"),
         ]
+        self.engine._study_total_series["S1"] = 3
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
         mock_play.assert_called_once()
@@ -1173,6 +1326,7 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha"),
         ]
+        self.engine._study_total_series["S1"] = 1
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
             self.engine._check_study_complete("S1")
@@ -1199,6 +1353,8 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
                       status="done", institution_name="Hospital Alpha"),
         ]
+        self.engine._study_total_series["S1"] = 1
+        self.engine._study_total_series["S2"] = 1
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
             self.engine._check_study_complete("S2")
@@ -1213,10 +1369,26 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
                       status="done", institution_name="Clinic Beta"),
         ]
+        self.engine._study_total_series["S1"] = 1
+        self.engine._study_total_series["S2"] = 1
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
             self.engine._check_study_complete("S2")
         mock_play.assert_called_once()
+
+    def test_no_sound_for_partial_study(self):
+        """Study has 5 series on remote but only 2 small ones in queue
+        (filter_allow_small_series) → no sound."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha"),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="done", institution_name="Hospital Alpha"),
+        ]
+        self.engine._study_total_series["S1"] = 5  # 5 on remote, only 2 queued
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_not_called()
 
     def test_series_completed_signal_does_not_trigger_sound(self):
         """The series_completed signal (per series) must NOT play sound."""

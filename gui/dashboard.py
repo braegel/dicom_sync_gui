@@ -28,20 +28,26 @@ from core.transfer_engine import TransferStats
 from gui.styles import BTN_START, BTN_STOP, BTN_DOWNLOAD_SELECTED
 
 _default_sound_path: str | None = None
+_sad_sound_path: str | None = None
+
+_NORMAL_FREQ_2 = 1174  # D6 — ascending interval from A5
+_SAD_FREQ_2 = 660      # E5 — descending interval from A5
 
 
-def _generate_default_sound() -> str:
-    """Generate a two-tone notification WAV (A5 + D6) and return its path.
+def _generate_default_sound(sad: bool = False) -> str:
+    """Generate a two-tone notification WAV and return its path.
 
-    Mirrors the JS reference implementation: two overlapping sine tones
-    with exponential attack/decay envelopes.
+    Normal mode: A5 (880 Hz) → D6 (1174 Hz) — ascending, cheerful.
+    Sad mode:    A5 (880 Hz) → E5 (660 Hz)  — descending, somber.
     """
-    global _default_sound_path
-    if _default_sound_path and os.path.exists(_default_sound_path):
-        return _default_sound_path
+    global _default_sound_path, _sad_sound_path
+    cached = _sad_sound_path if sad else _default_sound_path
+    if cached and os.path.exists(cached):
+        return cached
 
+    freq2 = _SAD_FREQ_2 if sad else _NORMAL_FREQ_2
     sample_rate = 44100
-    duration = 0.68  # covers both notes fully
+    duration = 0.68
     n_samples = int(sample_rate * duration)
 
     def _envelope(t: float, start: float, dur: float) -> float:
@@ -59,7 +65,7 @@ def _generate_default_sound() -> str:
             val += _envelope(t, 0, 0.4) * math.sin(2 * math.pi * 880 * t)
         if 0.18 <= t < 0.68:
             val += _envelope(t, 0.18, 0.5) * math.sin(
-                2 * math.pi * 1174 * t)
+                2 * math.pi * freq2 * t)
         raw.append(int(max(-1.0, min(1.0, val)) * 32767))
 
     buf = io.BytesIO()
@@ -72,7 +78,10 @@ def _generate_default_sound() -> str:
     fd, path = tempfile.mkstemp(suffix=".wav", prefix="dicom_notify_")
     os.write(fd, buf.getvalue())
     os.close(fd)
-    _default_sound_path = path
+    if sad:
+        _sad_sound_path = path
+    else:
+        _default_sound_path = path
     return path
 
 
@@ -856,9 +865,12 @@ class SourceDashboard(QWidget):
         return "#e74c3c"
 
     def on_study_completed(self, study_uid: str,
-                           institution_name: str):
+                           institution_name: str,
+                           fully_complete: bool = True):
         """Slot for study_completed — play notification sound
-        if the institution belongs to an active filter group."""
+        only when the study was fully downloaded."""
+        if not fully_complete:
+            return
         self._play_notification_if_allowed(institution_name)
 
     def _play_notification_if_allowed(self, institution_name: str):
@@ -875,7 +887,17 @@ class SourceDashboard(QWidget):
         if path and os.path.isfile(path):
             self._play_sound(path)
         else:
-            self._play_sound(_generate_default_sound())
+            self._play_sound(_generate_default_sound(sad=self._is_speed_red()))
+
+    def _is_speed_red(self) -> bool:
+        """Return True if median-5 speed is below the red threshold."""
+        stats = self._current_stats
+        if not stats or stats.completed_count < 1:
+            return False
+        median_all = stats.median_all_ipm()
+        if median_all < 1:
+            return False
+        return stats.median_n_ipm(5) < median_all * 0.8
 
     def _play_sound(self, path: str):
         """Play a WAV file via QSoundEffect."""

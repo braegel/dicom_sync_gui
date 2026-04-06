@@ -92,8 +92,8 @@ class TestSeriesJob:
             "patient_name", "patient_id", "study_description",
             "series_description", "modality", "series_number",
             "study_uid", "series_uid", "remote_count", "local_count",
-            "status", "institution_name", "images_per_minute",
-            "study_date", "study_time",
+            "status", "institution_name", "accession_number",
+            "images_per_minute", "study_date", "study_time",
         }
         assert set(d.keys()) == expected
 

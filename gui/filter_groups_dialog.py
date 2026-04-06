@@ -12,6 +12,7 @@ Workflow:
 import json
 import logging
 import threading
+import weakref
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
@@ -380,6 +381,12 @@ class FilterGroupsDialog(QDialog):
                        v.to_dict(), k)
                    for k, v in self.config.remote_nodes.items()}
 
+        # Use a weak reference so the background thread does not prevent
+        # GC of the dialog on the main thread.  Without this, closing the
+        # dialog while a query is running causes the QDialog destructor to
+        # run on the background thread → segfault.
+        weak_self = weakref.ref(self)
+
         def run_query():
             discovered: Set[str] = set()
             for remote_key, (local_cfg, remote_cfg, name) in remotes.items():
@@ -390,7 +397,9 @@ class FilterGroupsDialog(QDialog):
                     discovered.update(names)
                 except Exception as e:
                     logger.error(f"Query failed for {remote_key}: {e}")
-            self._query_results_ready.emit(discovered)
+            obj = weak_self()
+            if obj is not None:
+                obj._query_results_ready.emit(discovered)
 
         threading.Thread(target=run_query, daemon=True).start()
 

@@ -26,6 +26,7 @@ from gui.dashboard import SourceDashboard
 from gui.log_window import LogWindow
 from gui.filter_groups_dialog import FilterGroupsDialog
 from gui.unknown_institution_popup import UnknownInstitutionPopup
+from gui.transfer_stats_window import TransferStatsWindow
 
 logger = logging.getLogger("dicom_sync")
 
@@ -83,6 +84,11 @@ class MainWindow(QMainWindow):
         log_action.setShortcut("Ctrl+L")
         log_action.triggered.connect(self._show_log_window)
         view_menu.addAction(log_action)
+
+        stats_action = QAction("Transfer Performance Statistics...", self)
+        stats_action.setShortcut("Ctrl+T")
+        stats_action.triggered.connect(self._open_transfer_stats)
+        view_menu.addAction(stats_action)
 
         tools_menu = menubar.addMenu("Tools")
         self._echo_action = QAction("C-ECHO Test...", self)
@@ -209,6 +215,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     # ── Log ───────────────────────────────────────────────────────────────
+
+    def _open_transfer_stats(self):
+        from core.transfer_log import default_db_path
+        if not hasattr(self, '_stats_window') or self._stats_window is None:
+            self._stats_window = TransferStatsWindow(default_db_path(), self)
+        self._stats_window.show()
+        self._stats_window.raise_()
+        self._stats_window.activateWindow()
 
     def _show_log_window(self):
         self.log_window.show()

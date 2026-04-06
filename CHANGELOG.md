@@ -2,6 +2,29 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.4] — 2026-04-06
+
+### Added
+- Transfer Performance Statistics window (View menu, Ctrl+T)
+  - Summary metrics, per-source and per-modality breakdown tables
+  - Filterable study- and series-level detail tables
+  - Data sourced from the SQLite transfer log
+- Transfer log integration: series and study transfers are now recorded
+  automatically during download
+- Sad notification sound when transfer speed is below threshold
+  (descending tone instead of ascending)
+- AccessionNumber tracked per series for examination traceability
+
+### Changed
+- Notification sound only plays when a study is fully downloaded
+  (not for partial downloads via small-series filter exception)
+
+### Fixed
+- Segfault when closing Filter Groups dialog during background institution
+  query (QDialog destroyed on wrong thread)
+- Study-level transfer log used incorrect image count and reconstructed
+  duration instead of actual measured values
+
 ## [1.0.3] — 2026-04-05
 
 ### Added

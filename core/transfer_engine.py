@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal
 
 from core.dicom_ops import DicomOperations
+from core.transfer_log import TransferLog, default_db_path
 
 logger = logging.getLogger("dicom_sync")
 
@@ -38,7 +39,10 @@ class SeriesJob:
     local_count: int = 0
     status: str = "queued"  # queued, transferring, done, error, skipped
     institution_name: str = ""
+    accession_number: str = ""
     images_per_minute: float = 0.0
+    transferred_images: int = 0
+    duration_seconds: float = 0.0
     study_date: str = ""
     study_time: str = ""
 
@@ -60,6 +64,7 @@ class SeriesJob:
             "local_count": self.local_count,
             "status": self.status,
             "institution_name": self.institution_name,
+            "accession_number": self.accession_number,
             "images_per_minute": self.images_per_minute,
             "study_date": self.study_date,
             "study_time": self.study_time,
@@ -199,7 +204,7 @@ class TransferSignals(QObject):
     # All series for a patient (incl. priors) finished downloading
     patient_studies_completed = Signal(str, str)  # patient_id, institution_name
     # All series of a single study finished downloading
-    study_completed = Signal(str, str)  # study_uid, institution_name
+    study_completed = Signal(str, str, bool)  # study_uid, institution_name, fully_complete
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +232,9 @@ class TransferEngine:
         self._selected_uids: Set[str] = set()
         self._completed_patients: Set[str] = set()
         self._completed_studies: Set[str] = set()
+        self._transfer_log = TransferLog(default_db_path())
+        self._series_start_times: Dict[str, float] = {}  # study_uid → first series start
+        self._study_total_series: Dict[str, int] = {}  # study_uid → total series on remote
 
     @property
     def is_running(self) -> bool:
@@ -432,10 +440,14 @@ class TransferEngine:
         study_desc = getattr(study_ds, 'StudyDescription', 'N/A')
         study_date = getattr(study_ds, 'StudyDate', '')
         study_time = getattr(study_ds, 'StudyTime', '')[:6] if getattr(study_ds, 'StudyTime', '') else ''
+        accession = getattr(study_ds, 'AccessionNumber', '') or ''
         institution = str(
             getattr(study_ds, 'InstitutionName', '')).strip()
 
         series_list = dicom_ops.c_find_series(study_uid)
+
+        # Track total series count on remote for fully_complete detection
+        self._study_total_series[study_uid] = len(series_list)
 
         # InstitutionName fallback: read from first series
         if not institution and series_list:
@@ -486,6 +498,7 @@ class TransferEngine:
                 remote_count=remote_count,
                 local_count=local_count,
                 institution_name=institution,
+                accession_number=accession,
                 study_date=study_date,
                 study_time=study_time,
             ))
@@ -515,7 +528,31 @@ class TransferEngine:
                     job.series_uid, images, t_elapsed)
                 ipm = (images / t_elapsed) * 60 if t_elapsed > 0 else 0.0
                 job.images_per_minute = ipm
+                job.transferred_images = images
+                job.duration_seconds = t_elapsed
                 job.status = "done"
+                # Track wall-clock start for this study
+                if job.study_uid not in self._series_start_times:
+                    self._series_start_times[job.study_uid] = t_start
+                # Log to SQLite
+                try:
+                    self._transfer_log.record_series(
+                        source_pacs=self.remote_key,
+                        study_uid=job.study_uid,
+                        series_uid=job.series_uid,
+                        patient_id=job.patient_id,
+                        accession_number=job.accession_number,
+                        study_date=job.study_date,
+                        study_time=job.study_time,
+                        modality=job.modality,
+                        study_description=job.study_description,
+                        series_description=job.series_description,
+                        series_number=job.series_number,
+                        image_count=images,
+                        duration_seconds=t_elapsed,
+                    )
+                except Exception as e:
+                    logger.warning(f"TransferLog.record_series failed: {e}")
                 self.signals.series_completed.emit(job.series_uid, images)
                 self.signals.stats_updated.emit(self.stats)
                 self._check_study_complete(job.study_uid)
@@ -541,7 +578,41 @@ class TransferEngine:
                for j in study_series):
             self._completed_studies.add(study_uid)
             institution = study_series[0].institution_name
-            self.signals.study_completed.emit(study_uid, institution)
+            # Log study-level aggregate to SQLite
+            done_series = [j for j in study_series if j.status == "done"]
+            if done_series:
+                first = done_series[0]
+                total_images = sum(j.transferred_images for j in done_series)
+                total_duration = sum(j.duration_seconds for j in done_series)
+                wall_start = self._series_start_times.get(
+                    study_uid, time.time())
+                wall_clock = time.time() - wall_start
+                try:
+                    self._transfer_log.record_study(
+                        source_pacs=self.remote_key,
+                        study_uid=study_uid,
+                        patient_id=first.patient_id,
+                        accession_number=first.accession_number,
+                        study_date=first.study_date,
+                        study_time=first.study_time,
+                        modality=first.modality,
+                        study_description=first.study_description,
+                        total_series=len(done_series),
+                        total_images=total_images,
+                        total_duration_seconds=total_duration,
+                        wall_clock_seconds=wall_clock,
+                    )
+                except Exception as e:
+                    logger.warning(f"TransferLog.record_study failed: {e}")
+                self._series_start_times.pop(study_uid, None)
+            # fully_complete = all remote series were queued and done
+            total_remote = self._study_total_series.pop(study_uid, 0)
+            done_count = len([j for j in study_series
+                              if j.status == "done"])
+            fully_complete = (total_remote > 0
+                              and done_count >= total_remote)
+            self.signals.study_completed.emit(
+                study_uid, institution, fully_complete)
 
     def _check_patient_complete(self, patient_id: str):
         """Emit patient_studies_completed if all series for this patient
