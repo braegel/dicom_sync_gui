@@ -495,15 +495,18 @@ class TestStudyTable:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _populate_log_multi_day(log: TransferLog):
-    """Insert series spread across multiple days/hours for boxplot testing."""
-    # 7 days of data, multiple series per day at varying speeds
+    """Insert series spread across multiple days/hours for boxplot testing.
+
+    Each series gets an explicit ``timestamp`` (download time) so the
+    boxplot buckets reflect real download times, not DICOM acquisition.
+    """
     base_series = 0
     for day in range(1, 8):  # 20260401–20260407
         date = f"2026040{day}"
         for hour in (8, 12, 16, 20):
             base_series += 1
-            # Vary duration to create spread in Mbit/s values
             duration = 10.0 + day * 2 + hour * 0.5
+            ts = f"2026-04-0{day}T{hour:02d}:00:00"
             log.record_series(
                 source_pacs="ct_scanner",
                 study_uid=f"1.2.{day}.{hour}",
@@ -518,6 +521,7 @@ def _populate_log_multi_day(log: TransferLog):
                 series_number="1",
                 image_count=300,
                 duration_seconds=duration,
+                timestamp=ts,
             )
 
 
@@ -582,11 +586,11 @@ class TestBoxplotChart:
         assert series.count() == 7
 
     def test_hour_aggregation_box_count(self, boxplot_window):
-        """Per-hour: 4 distinct hours (08, 12, 16, 20) → 4 boxes."""
+        """Per-hour: 7 days × 4 hours = 28 distinct hour buckets."""
         _set_aggregation(boxplot_window, "hour")
         series = _get_boxplot_series(boxplot_window)
         assert series is not None
-        assert series.count() == 4
+        assert series.count() == 28
 
     def test_week_aggregation_box_count(self, boxplot_window):
         """20260401–20260407 spans 2 ISO weeks (W14 Mon–Sun, W15 Mon)."""
@@ -646,6 +650,7 @@ class TestBoxplotFilters:
             study_time="100000", modality="MR",
             study_description="MR", series_description="T1",
             series_number="1", image_count=100, duration_seconds=20.0,
+            timestamp="2026-04-08T10:00:00",
         )
         log2.close()
         boxplot_window.btn_refresh.click()

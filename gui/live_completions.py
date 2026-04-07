@@ -8,6 +8,7 @@ and the delay between acquisition and download with color coding.
 
 import math
 from datetime import datetime, timedelta
+from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
@@ -63,7 +64,8 @@ class LiveCompletionsWindow(QWidget):
         self.completions_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.completions_table.setAlternatingRowColors(True)
         headers = ["Patient", "Study Description", "Institution",
-                    "Time Acquired", "Download Completed", "Delay"]
+                    "Time Acquired", "Download Completed",
+                    "Download Duration", "Delay"]
         self.completions_table.setColumnCount(len(headers))
         self.completions_table.setHorizontalHeaderLabels(headers)
         layout.addWidget(self.completions_table, 1)
@@ -80,7 +82,8 @@ class LiveCompletionsWindow(QWidget):
 
     def add_completion(self, *, patient_name: str, study_description: str,
                        study_time: str, completed_time: str,
-                       institution_name: str = ""):
+                       institution_name: str = "",
+                       download_duration_seconds: Optional[float] = None):
         # Format study_time HHMMSS → HH:MM:SS
         acq = _parse_time(study_time)
         comp = _parse_time(completed_time)
@@ -105,13 +108,19 @@ class LiveCompletionsWindow(QWidget):
         if delay_seconds is not None:
             self._delays.insert(0, delay_seconds)
 
+        if download_duration_seconds is not None:
+            dl_text = _format_delay(int(download_duration_seconds))
+        else:
+            dl_text = "—"
+
         self.completions_table.insertRow(0)
         self.completions_table.setItem(0, 0, QTableWidgetItem(patient_name))
         self.completions_table.setItem(0, 1, QTableWidgetItem(study_description))
         self.completions_table.setItem(0, 2, QTableWidgetItem(institution_name))
         self.completions_table.setItem(0, 3, QTableWidgetItem(formatted_acq))
         self.completions_table.setItem(0, 4, QTableWidgetItem(formatted_comp))
-        self.completions_table.setItem(0, 5, QTableWidgetItem(delay_text))
+        self.completions_table.setItem(0, 5, QTableWidgetItem(dl_text))
+        self.completions_table.setItem(0, 6, QTableWidgetItem(delay_text))
 
         self._update_stats()
 
@@ -136,7 +145,7 @@ class LiveCompletionsWindow(QWidget):
         if stddev < 0.001:
             return
 
-        delay_col = 5
+        delay_col = 6
         for row in range(self.completions_table.rowCount()):
             idx = row  # _delays[0] = newest = row 0
             if idx >= len(self._delays):

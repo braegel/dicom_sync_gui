@@ -113,10 +113,12 @@ class TransferLog:
                       study_time: str, modality: str,
                       study_description: str, series_description: str,
                       series_number: str, image_count: int,
-                      duration_seconds: float):
+                      duration_seconds: float,
+                      timestamp: Optional[str] = None):
         ipm = (image_count / duration_seconds) * 60 if duration_seconds > 0 else 0.0
         est_bytes = estimate_bytes(modality, image_count)
         est_mbps = (est_bytes * 8) / (duration_seconds * 1_000_000) if duration_seconds > 0 else 0.0
+        ts = timestamp if timestamp is not None else datetime.now().isoformat()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO series_transfer "
@@ -126,7 +128,7 @@ class TransferLog:
                 "image_count, duration_seconds, images_per_minute, "
                 "estimated_bytes, estimated_mbps) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (datetime.now().isoformat(),
+                (ts,
                  source_pacs,
                  _sha256(study_uid),
                  _sha256(series_uid),

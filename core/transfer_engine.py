@@ -234,6 +234,7 @@ class TransferEngine:
         self._completed_studies: Set[str] = set()
         self._transfer_log = TransferLog(default_db_path())
         self._series_start_times: Dict[str, float] = {}  # study_uid → first series start
+        self._study_wall_clock: Dict[str, float] = {}  # study_uid → wall-clock seconds, populated at completion
         self._study_total_series: Dict[str, int] = {}  # study_uid → total series on remote
 
     @property
@@ -605,6 +606,7 @@ class TransferEngine:
                 except Exception as e:
                     logger.warning(f"TransferLog.record_study failed: {e}")
                 self._series_start_times.pop(study_uid, None)
+                self._study_wall_clock[study_uid] = wall_clock
             # fully_complete = all remote series were queued and done
             total_remote = self._study_total_series.pop(study_uid, 0)
             done_count = len([j for j in study_series

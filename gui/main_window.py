@@ -255,16 +255,20 @@ class MainWindow(QMainWindow):
         """Add a completion entry to the live completions window."""
         if not fully_complete:
             return
-        for job in engine._queue:
-            if job.study_uid == study_uid and job.status == "done":
-                self.completions_window.add_completion(
-                    patient_name=job.patient_name,
-                    study_description=job.study_description,
-                    study_time=job.study_time,
-                    completed_time=datetime.now().strftime("%H:%M:%S"),
-                    institution_name=job.institution_name,
-                )
-                return
+        study_jobs = [j for j in engine._queue
+                       if j.study_uid == study_uid and j.status == "done"]
+        if not study_jobs:
+            return
+        first = study_jobs[0]
+        wall_clock = engine._study_wall_clock.pop(study_uid, None)
+        self.completions_window.add_completion(
+            patient_name=first.patient_name,
+            study_description=first.study_description,
+            study_time=first.study_time,
+            completed_time=datetime.now().strftime("%H:%M:%S"),
+            institution_name=first.institution_name,
+            download_duration_seconds=wall_clock,
+        )
 
     def _log(self, msg: str):
         timestamp = datetime.now().strftime("%H:%M:%S")

@@ -256,24 +256,28 @@ class TransferStatsWindow(QWidget):
 
     # ── Boxplot ──────────────────────────────────────────────────────
 
-    def _bucket_key(self, study_date: str, study_time: str) -> str:
-        """Return a bucket key based on current aggregation level."""
+    def _bucket_key(self, timestamp: str) -> str:
+        """Return a bucket key based on the actual download timestamp.
+
+        ``timestamp`` is the ISO-formatted download completion time
+        recorded in the SQLite log (not the DICOM acquisition date —
+        that would put prior studies into the wrong bucket).
+        """
         agg = self.combo_aggregation.currentText().lower()
-        # study_date = YYYYMMDD, study_time = HHMMSS
+        try:
+            dt = datetime.fromisoformat(timestamp)
+        except (ValueError, TypeError):
+            return timestamp
         if agg == "hour":
-            return study_time[:2] + ":00"
+            return dt.strftime("%Y-%m-%d %H:00")
         if agg == "day":
-            return study_date
+            return dt.strftime("%Y-%m-%d")
         if agg == "week":
-            try:
-                dt = datetime.strptime(study_date, "%Y%m%d")
-                iso = dt.isocalendar()
-                return f"{iso[0]}-W{iso[1]:02d}"
-            except ValueError:
-                return study_date
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
         if agg == "month":
-            return study_date[:6]
-        return study_date
+            return dt.strftime("%Y-%m")
+        return dt.strftime("%Y-%m-%d")
 
     def _update_boxplot(self, series):
         self._chart.removeAllSeries()
@@ -285,7 +289,7 @@ class TransferStatsWindow(QWidget):
 
         buckets = defaultdict(list)
         for r in series:
-            key = self._bucket_key(r["study_date"], r["study_time"])
+            key = self._bucket_key(r["timestamp"])
             if r["estimated_mbps"] > 0:
                 buckets[key].append(r["estimated_mbps"])
 

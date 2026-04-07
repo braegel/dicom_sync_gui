@@ -418,7 +418,7 @@ def _find_delay_column(window):
         h = t.horizontalHeaderItem(c)
         if h:
             txt = h.text().lower()
-            if "delay" in txt or "diff" in txt or "duration" in txt:
+            if "delay" in txt or "diff" in txt:
                 return c
     raise ValueError("Delay column not found")
 
@@ -427,3 +427,86 @@ def _get_delay_text(window, row: int) -> str:
     col = _find_delay_column(window)
     item = window.completions_table.item(row, col)
     return item.text() if item else ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Download duration column (wall-clock for entire study)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDownloadDurationColumn:
+    """Show how long the full study took to download (wall-clock,
+    not per-series duration)."""
+
+    def test_table_has_download_duration_column(self, window):
+        headers = _get_headers(window)
+        assert any("download" in h and ("duration" in h or "time" in h)
+                    for h in headers) or any(
+                        "wall" in h for h in headers)
+
+    def test_download_duration_shown(self, window):
+        window.add_completion(
+            patient_name="Test",
+            study_description="CT",
+            study_time="080000",
+            completed_time="08:05:30",
+            institution_name="X",
+            download_duration_seconds=125.0,
+        )
+        col = _find_download_duration_column(window)
+        item = window.completions_table.item(0, col)
+        assert item is not None
+        # 125s = 2:05
+        assert "2" in item.text()
+        assert "05" in item.text()
+
+    def test_download_duration_formatted_minutes_seconds(self, window):
+        window.add_completion(
+            patient_name="Test",
+            study_description="CT",
+            study_time="080000",
+            completed_time="08:01:42",
+            institution_name="X",
+            download_duration_seconds=42.0,
+        )
+        col = _find_download_duration_column(window)
+        item = window.completions_table.item(0, col)
+        assert ":" in item.text()
+
+    def test_download_duration_optional(self, window):
+        """add_completion without duration param should not crash."""
+        window.add_completion(
+            patient_name="Test",
+            study_description="CT",
+            study_time="080000",
+            completed_time="08:05:30",
+            institution_name="X",
+        )
+        col = _find_download_duration_column(window)
+        item = window.completions_table.item(0, col)
+        assert item is not None  # cell exists, may show "—"
+
+    def test_download_duration_long_study(self, window):
+        """A 15-minute download should display as 15:00."""
+        window.add_completion(
+            patient_name="Test",
+            study_description="CT",
+            study_time="080000",
+            completed_time="08:30:00",
+            institution_name="X",
+            download_duration_seconds=900.0,
+        )
+        col = _find_download_duration_column(window)
+        item = window.completions_table.item(0, col)
+        assert "15" in item.text()
+
+
+def _find_download_duration_column(window):
+    """Return the column index of the download duration column."""
+    t = window.completions_table
+    for c in range(t.columnCount()):
+        h = t.horizontalHeaderItem(c)
+        if h:
+            txt = h.text().lower()
+            if "download duration" in txt or "wall" in txt:
+                return c
+    raise ValueError("Download duration column not found")
