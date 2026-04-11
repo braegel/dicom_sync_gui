@@ -1191,3 +1191,50 @@ class TestRetryBlacklist:
         assert ("1.2.3", True) in received, (
             "study with a blacklisted series must still fire "
             "study_completed with fully_complete=True")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — _fetch_local_series_counts must not silently swallow errors
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFetchLocalSeriesCounts:
+    """A failing local PACS query (timeout, AE rejection, network blip)
+    must be logged. Silently returning an empty dict makes the engine
+    think nothing is locally stored and re-download the whole study
+    every cycle — wasting bandwidth without any user-visible signal."""
+
+    def test_returns_empty_dict_on_exception(self, caplog):
+        ops = MagicMock()
+        ops.c_find_local_series.side_effect = RuntimeError("timeout")
+        result = TransferEngine._fetch_local_series_counts(
+            ops, study_uid="1.2.3")
+        assert result == {}
+
+    def test_logs_warning_on_exception(self, caplog):
+        import logging
+        ops = MagicMock()
+        ops.c_find_local_series.side_effect = RuntimeError(
+            "AE rejected association")
+        with caplog.at_level(logging.WARNING, logger="dicom_sync"):
+            TransferEngine._fetch_local_series_counts(
+                ops, study_uid="1.2.3.4")
+        assert any("Local PACS query failed" in rec.message
+                   for rec in caplog.records), (
+            "_fetch_local_series_counts must log a WARNING when the "
+            "local query fails — otherwise re-downloads happen silently")
+        # Study UID should appear in the log so the user can pinpoint
+        # which study failed.
+        assert any("1.2.3.4" in rec.message for rec in caplog.records)
+
+    def test_returns_counts_on_success(self):
+        ops = MagicMock()
+        s1 = MagicMock()
+        s1.SeriesInstanceUID = "1.2.3.1"
+        s1.NumberOfSeriesRelatedInstances = 50
+        s2 = MagicMock()
+        s2.SeriesInstanceUID = "1.2.3.2"
+        s2.NumberOfSeriesRelatedInstances = 100
+        ops.c_find_local_series.return_value = [s1, s2]
+        result = TransferEngine._fetch_local_series_counts(
+            ops, study_uid="1.2.3")
+        assert result == {"1.2.3.1": 50, "1.2.3.2": 100}

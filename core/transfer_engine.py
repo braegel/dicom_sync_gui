@@ -819,7 +819,13 @@ class TransferEngine:
     @staticmethod
     def _fetch_local_series_counts(
             dicom_ops: DicomOperations, study_uid: str) -> Dict[str, int]:
-        """Query local PACS and return {series_uid: image_count}."""
+        """Query local PACS and return {series_uid: image_count}.
+
+        Returns an empty dict on failure. Failures are logged at WARNING
+        because a swallowed local-query error makes the engine think
+        nothing is locally stored, causing it to re-download the entire
+        study every cycle until the local PACS recovers.
+        """
         counts: Dict[str, int] = {}
         try:
             for ls in dicom_ops.c_find_local_series(study_uid):
@@ -828,8 +834,11 @@ class TransferEngine:
                     getattr(ls, 'NumberOfSeriesRelatedInstances', 0) or 0)
                 if uid:
                     counts[uid] = cnt
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                f"Local PACS query failed for study {study_uid}: {e} — "
+                f"engine will treat the study as empty locally and may "
+                f"re-download series until the local PACS recovers")
         return counts
 
     def _make_dicom_ops(self) -> DicomOperations:
