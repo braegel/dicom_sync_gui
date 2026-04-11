@@ -2,6 +2,56 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.6] — 2026-04-11
+
+### Added
+- UI localization: English, German, French, Spanish
+  - Language picker in Settings → General
+  - Copy button in the Download Completions window produces its
+    clipboard text in the configured language (e.g. German:
+    "Abschluss Bildübertragung: HH:MM:SS") for pasting into reports
+- Series retry blacklist: after 2 failed C-MOVE attempts for the
+  same series, it is permanently excluded from future query cycles
+  - Failure counts persist across app restarts in the SQLite
+    transfer log (new `series_failures` table)
+  - Successful transfers reset the counter
+  - Stops the "stuck tiny series" re-download loop that previously
+    could run every sync interval forever
+- Download Completions window improvements:
+  - New "Download Duration" column showing true wall-clock download
+    time, color-coded red/green at ±2σ from the median
+  - Per-row "Copy" button that copies
+    "Image transfer completed: HH:MM:SS" (localized) to the clipboard
+  - Columns auto-resize to fit header text so labels are never
+    truncated (e.g. "Download Completed")
+- Transfer Performance Statistics boxplot now buckets by the actual
+  download timestamp rather than the DICOM acquisition date, so prior
+  studies no longer skew historical buckets
+
+### Fixed
+- Quitting the app while a download was in progress no longer kills
+  the in-flight C-MOVE — the engine thread is now joined (up to 30 s)
+  so the current series completes and the SQLite transfer log stays
+  consistent with what actually arrived on disk
+- Local-PACS query failures in `_fetch_local_series_counts` were
+  silently swallowed, causing the engine to treat the study as empty
+  locally and re-download every series until the local PACS
+  recovered. Failures are now logged at WARNING with the study UID
+  so the root cause is traceable
+
+### Changed
+- Removed the stale `dicom_sync_gui/` duplicate package directory
+  (March 2026 snapshot that had drifted ~5 weeks behind the active
+  tree). No live code referenced it, but it could have been imported
+  by accident or picked up by PyInstaller
+
+### Internal
+- Test suite grew from 613 to 689 tests (+76 covering retry
+  blacklist, duration coloring, auto column width, copy button,
+  localization, closeEvent join, local-query logging, and the
+  `study_completed(fully_complete=True)` regression when a study
+  contains a blacklisted series)
+
 ## [1.0.5] — 2026-04-06
 
 ### Added

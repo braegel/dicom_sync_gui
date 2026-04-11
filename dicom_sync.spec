@@ -58,8 +58,8 @@ app = BUNDLE(
     bundle_identifier="com.dicomsync.gui",
     info_plist={
         "CFBundleDisplayName": "DICOM Sync",
-        "CFBundleShortVersionString": "1.0.5",
-        "CFBundleVersion": "1.0.5",
+        "CFBundleShortVersionString": "1.0.6",
+        "CFBundleVersion": "1.0.6",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "12.0",
         "NSLocalNetworkUsageDescription":
