@@ -53,3 +53,7 @@ Desktop.ini
 *.swo
 *.sublime-project
 *.sublime-workspace
+
+# ─── Claude Code local tool state ────────────────────────
+# Per-session permission allowlist; machine-specific.
+.claude/
