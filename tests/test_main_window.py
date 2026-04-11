@@ -438,6 +438,36 @@ class TestMainWindowClose:
         event.accept.assert_called_once()
 
     @patch("gui.main_window.QMessageBox.question",
+           return_value=16384)  # Yes
+    def test_close_waits_for_engine_thread(self, mock_question):
+        """After Quit-Anyway, the engine thread must be join()ed so
+        the in-flight C-MOVE can finish — otherwise the daemon thread
+        is killed mid-transfer and the SQLite log is inconsistent."""
+        mock_engine = MagicMock()
+        mock_engine.is_running = True
+        mock_engine._thread.is_alive.return_value = True
+        self.win.engines["ct"] = mock_engine
+        event = MagicMock()
+        self.win.closeEvent(event)
+        mock_engine.stop.assert_called_once()
+        mock_engine._thread.join.assert_called_once()
+        # Sanity: a finite timeout was supplied (don't hang forever).
+        _, kwargs = mock_engine._thread.join.call_args
+        assert "timeout" in kwargs and kwargs["timeout"] > 0
+
+    @patch("gui.main_window.QMessageBox.question",
+           return_value=16384)  # Yes
+    def test_close_skips_join_when_thread_already_dead(self, mock_question):
+        """Don't call join on a thread that already finished."""
+        mock_engine = MagicMock()
+        mock_engine.is_running = True
+        mock_engine._thread.is_alive.return_value = False
+        self.win.engines["ct"] = mock_engine
+        event = MagicMock()
+        self.win.closeEvent(event)
+        mock_engine._thread.join.assert_not_called()
+
+    @patch("gui.main_window.QMessageBox.question",
            return_value=65536)  # No
     def test_close_with_running_engine_cancel(self, mock_question):
         mock_engine = MagicMock()

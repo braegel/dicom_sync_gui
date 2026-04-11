@@ -12,7 +12,7 @@ from typing import Dict, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox,
-    QTabWidget, QLabel,
+    QTabWidget, QLabel, QApplication,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QFont
@@ -464,6 +464,16 @@ class MainWindow(QMainWindow):
                 return
             for engine in self.engines.values():
                 engine.stop()
+            # Wait for the in-flight C-MOVE to finish so the SQLite
+            # transfer log reflects what actually arrived locally.
+            # Daemon threads would otherwise be killed mid-stream.
+            self.statusBar().showMessage(
+                "Waiting for current downloads to finish...")
+            QApplication.processEvents()
+            for engine in self.engines.values():
+                thread = getattr(engine, "_thread", None)
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=30)
 
         for scp in self.storage_scps.values():
             if scp.running:
