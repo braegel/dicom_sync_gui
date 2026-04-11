@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QTableWidget
+from PySide6.QtWidgets import QApplication, QTableWidget, QPushButton
 
 from core.transfer_engine import TransferEngine, SeriesJob
 from gui.live_completions import LiveCompletionsWindow
@@ -510,3 +510,298 @@ def _find_download_duration_column(window):
             if "download duration" in txt or "wall" in txt:
                 return c
     raise ValueError("Download duration column not found")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Download duration color coding (2 stddev threshold)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDownloadDurationColorCoding:
+    """Download duration cell colored red if > median + 2 stddev,
+    green if < median - 2 stddev. Uses 2σ (not 1σ like Delay) because
+    download time is more variable per study size."""
+
+    def _add_with_durations(self, window, durations):
+        """Add a completion for each duration in seconds."""
+        for i, dur in enumerate(durations):
+            window.add_completion(
+                patient_name=f"P{i}",
+                study_description="CT",
+                study_time=f"{8 + i:02d}0000",
+                completed_time=f"{8 + i:02d}:01:00",
+                institution_name="X",
+                download_duration_seconds=float(dur),
+            )
+
+    def test_slow_download_is_red(self, window):
+        """One large outlier (> median + 2σ) → red.
+        Durations: 100×8 + 500. median=100, σ≈119.5, 2σ≈239 → 500>339."""
+        durations = [100] * 8 + [500]
+        self._add_with_durations(window, durations)
+        # 500 was added last → row 0
+        col = _find_download_duration_column(window)
+        item = window.completions_table.item(0, col)
+        assert item is not None
+        fg = item.foreground().color().name()
+        bg = item.background().color().name()
+        assert ("#e74c3c" in fg or "#e74c3c" in bg
+                or "red" in fg or "red" in bg)
+
+    def test_fast_download_is_green(self, window):
+        """One small outlier (< median - 2σ) → green.
+        Durations: 10 + 100×8. median=100, σ≈28.3, 2σ≈56.6 → 10<43.4."""
+        durations = [10] + [100] * 8
+        self._add_with_durations(window, durations)
+        # 10 was added first → bottom row
+        last_row = window.completions_table.rowCount() - 1
+        col = _find_download_duration_column(window)
+        item = window.completions_table.item(last_row, col)
+        assert item is not None
+        fg = item.foreground().color().name()
+        bg = item.background().color().name()
+        assert ("#2ecc71" in fg or "#2ecc71" in bg
+                or "green" in fg or "green" in bg)
+
+    def test_normal_download_no_color(self, window):
+        """A duration near the median is not colored red or green."""
+        durations = [100] * 8 + [500]
+        self._add_with_durations(window, durations)
+        col = _find_download_duration_column(window)
+        # Pick a row with a 100s value (not the row 0 outlier).
+        item = window.completions_table.item(1, col)
+        assert item is not None
+        fg = item.foreground().color().name()
+        assert "#e74c3c" not in fg
+        assert "#2ecc71" not in fg
+
+    def test_one_stddev_does_not_trigger(self, window):
+        """A value > median + 1σ but < median + 2σ stays neutral
+        (the Delay column uses 1σ, this column must use 2σ)."""
+        # Durations: 100×8 + 250.
+        # mean=116.67, σ≈47.1, 2σ≈94.3 → 250>194.3? Yes. Bad example.
+        # Need value in (median+1σ, median+2σ).
+        # Use [100]*10 + [180]: mean=107.27, σ≈22.6, 1σ→129.9, 2σ→152.5.
+        # 180 > 152.5. Still triggers. Try [100]*20 + [150]:
+        # mean=102.38, σ≈10.7, 1σ→113.1, 2σ→123.7. 150>123.7. Still red.
+        # The outlier dominates σ. Use two close-ish outliers:
+        # [100]*20 + [140, 140]: mean=103.64, var≈
+        #   20*(3.64²)+2*(36.36²) = 264.99+2644.1 = 2909/22=132.2,
+        #   σ≈11.5, median=100, 1σ→111.5, 2σ→123. 140>123. Still red.
+        # Try [100]*50 + [130]: mean=100.59, σ≈4.2, 2σ→108.8. 130>108.8.
+        # Conclusion: with many identical values, σ collapses → any
+        # outlier is "extreme". So instead build a naturally-spread set.
+        durations = [80, 90, 100, 100, 100, 100, 100, 100, 110, 120, 135]
+        # n=11, sum=1135, mean≈103.18
+        # variance: (23.18²+13.18²+3.18²×6+6.82²+16.82²+31.82²)/11
+        #   ≈ (537+174+61+47+283+1013)/11 ≈ 2115/11 ≈ 192.3, σ≈13.87
+        # median=100. 1σ→113.87, 2σ→127.74. 120 is between → neutral.
+        self._add_with_durations(window, durations)
+        col = _find_download_duration_column(window)
+        # 120 was added 10th (index 9) → row 1 from top
+        # (rows are inserted at 0, so newest=row 0, oldest=last row)
+        # Index 9 in input → row = (n-1) - 9 = 1
+        item = window.completions_table.item(1, col)
+        assert item is not None
+        fg = item.foreground().color().name()
+        assert "#e74c3c" not in fg, (
+            "120s is > median+1σ but < median+2σ — must NOT be red")
+
+    def test_colors_update_when_new_entry_changes_stats(self, window):
+        """Adding a new outlier should re-color earlier duration cells."""
+        # First add 9 identical 100s entries → no coloring (σ=0).
+        self._add_with_durations(window, [100] * 9)
+        col = _find_download_duration_column(window)
+        # Now add a big outlier.
+        window.add_completion(
+            patient_name="X",
+            study_description="CT",
+            study_time="200000",
+            completed_time="20:01:00",
+            institution_name="X",
+            download_duration_seconds=600.0,
+        )
+        item = window.completions_table.item(0, col)
+        fg = item.foreground().color().name()
+        bg = item.background().color().name()
+        assert ("#e74c3c" in fg or "#e74c3c" in bg
+                or "red" in fg or "red" in bg)
+
+    def test_missing_duration_does_not_crash_coloring(self, window):
+        """Entries without download_duration_seconds must not break
+        the color update for entries that do have it."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:00",
+            institution_name="X",
+        )  # no duration
+        # Should not raise.
+        self._add_with_durations(window, [100] * 8 + [500])
+        col = _find_download_duration_column(window)
+        # The 500s outlier (newest, row 0) should still be red.
+        item = window.completions_table.item(0, col)
+        assert item is not None
+        fg = item.foreground().color().name()
+        bg = item.background().color().name()
+        assert ("#e74c3c" in fg or "#e74c3c" in bg
+                or "red" in fg or "red" in bg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Auto column width — every column wide enough to show its header label
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAutoColumnWidth:
+    """Each column must be wide enough to display its header text fully,
+    so the user never sees truncated headers like 'Down…'."""
+
+    def _assert_columns_fit_headers(self, window):
+        t = window.completions_table
+        fm = t.horizontalHeader().fontMetrics()
+        for c in range(t.columnCount()):
+            h = t.horizontalHeaderItem(c)
+            if h is None:
+                continue
+            label = h.text()
+            if not label:
+                continue
+            needed = fm.horizontalAdvance(label)
+            actual = t.columnWidth(c)
+            assert actual >= needed, (
+                f"Column {c} ({label!r}) width {actual}px < "
+                f"header text width {needed}px")
+
+    def test_columns_fit_headers_when_empty(self, window):
+        """Even with no rows, headers must be fully readable."""
+        self._assert_columns_fit_headers(window)
+
+    def test_columns_fit_headers_after_add(self, window):
+        window.add_completion(
+            patient_name="Doe^John",
+            study_description="CT Abdomen",
+            study_time="080000",
+            completed_time="08:15:30",
+            institution_name="St. Mary's Hospital",
+            download_duration_seconds=120.0,
+        )
+        self._assert_columns_fit_headers(window)
+
+    def test_columns_fit_headers_after_long_content(self, window):
+        """Long cell content must not push the header into ellipsis."""
+        window.add_completion(
+            patient_name="VeryLongLastName^VeryLongFirstName",
+            study_description="CT Thorax / Abdomen / Pelvis with contrast",
+            study_time="080000",
+            completed_time="09:45:11",
+            institution_name="Some Very Long Institution Name e.V.",
+            download_duration_seconds=345.0,
+        )
+        self._assert_columns_fit_headers(window)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Per-row "copy completion time to clipboard" button
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCopyCompletedTimeButton:
+    """Each row has a button that copies a string like
+    'Image transfer completed: HH:MM:SS' to the system clipboard,
+    so it can be pasted into a radiology report."""
+
+    def test_each_row_has_a_copy_button(self, window):
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        btn = _find_copy_button(window, row=0)
+        assert btn is not None, "row 0 has no copy button"
+        assert isinstance(btn, QPushButton)
+
+    def test_copy_button_puts_completed_time_on_clipboard(self, window, qapp):
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        clipboard = QApplication.clipboard()
+        clipboard.clear()
+        _find_copy_button(window, row=0).click()
+        text = clipboard.text()
+        assert "08:15:30" in text
+        assert "transfer" in text.lower()
+        assert "complet" in text.lower()  # completed / completet
+
+    def test_copy_button_format(self, window, qapp):
+        """The clipboard string follows the canonical template."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        QApplication.clipboard().clear()
+        _find_copy_button(window, row=0).click()
+        text = QApplication.clipboard().text().strip()
+        assert text == "Image transfer completed: 08:15:30"
+
+    def test_each_row_button_copies_its_own_time(self, window, qapp):
+        """Per-row buttons must not all copy the same row's time."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        window.add_completion(
+            patient_name="B", study_description="CT",
+            study_time="090000", completed_time="09:22:11",
+            institution_name="X",
+        )
+        # newest at row 0 → 09:22:11; older at row 1 → 08:15:30
+        clipboard = QApplication.clipboard()
+
+        clipboard.clear()
+        _find_copy_button(window, row=0).click()
+        assert "09:22:11" in clipboard.text()
+        assert "08:15:30" not in clipboard.text()
+
+        clipboard.clear()
+        _find_copy_button(window, row=1).click()
+        assert "08:15:30" in clipboard.text()
+        assert "09:22:11" not in clipboard.text()
+
+    def test_copy_button_survives_clear(self, window, qapp):
+        """After Clear, new rows still get working buttons."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        window._clear()
+        window.add_completion(
+            patient_name="B", study_description="CT",
+            study_time="090000", completed_time="09:22:11",
+            institution_name="X",
+        )
+        QApplication.clipboard().clear()
+        _find_copy_button(window, row=0).click()
+        assert "09:22:11" in QApplication.clipboard().text()
+
+
+def _find_copy_button(window, row: int):
+    """Find the per-row copy button for the given row.
+
+    The button is a QPushButton placed as a cellWidget in some column
+    of the completions table. Returns None if not found.
+    """
+    t = window.completions_table
+    for c in range(t.columnCount()):
+        w = t.cellWidget(row, c)
+        if w is None:
+            continue
+        if isinstance(w, QPushButton):
+            return w
+        # Maybe wrapped in a container widget
+        children = w.findChildren(QPushButton)
+        if children:
+            return children[0]
+    return None
+
