@@ -50,6 +50,15 @@ class TestMainWindowInit:
     def test_tab_count_matches_remotes(self):
         assert self.win.tab_widget.count() == 2
 
+    def test_completions_window_uses_config_language(
+            self, populated_config, qapp):
+        """MainWindow must pass config.language into the
+        LiveCompletionsWindow so the Copy button produces localized
+        clipboard text."""
+        populated_config.language = "de"
+        win = MainWindow(populated_config)
+        assert win.completions_window._language == "de"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MainWindow — no sources placeholder

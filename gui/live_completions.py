@@ -10,6 +10,8 @@ import math
 from datetime import datetime, timedelta
 from typing import Optional
 
+from core.i18n import tr
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
@@ -49,11 +51,12 @@ def _format_delay(total_seconds: int) -> str:
 
 class LiveCompletionsWindow(QWidget):
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, language: str = "en"):
         super().__init__(parent)
         self.setWindowTitle("Download Completions")
         self.setWindowFlags(Qt.Window)
         self.setMinimumSize(600, 300)
+        self._language = language
         self._delays: list[float] = []
         self._durations: list[Optional[float]] = []
         self._setup_ui()
@@ -128,10 +131,10 @@ class LiveCompletionsWindow(QWidget):
         self.completions_table.setItem(0, 6, QTableWidgetItem(delay_text))
 
         copy_btn = QPushButton("Copy")
+        prefix = tr("image_transfer_completed", self._language)
         copy_btn.clicked.connect(
-            lambda checked=False, t=formatted_comp:
-                QApplication.clipboard().setText(
-                    f"Image transfer completed: {t}"))
+            lambda checked=False, t=formatted_comp, p=prefix:
+                QApplication.clipboard().setText(f"{p}: {t}"))
         self.completions_table.setCellWidget(0, 7, copy_btn)
 
         self._update_stats()

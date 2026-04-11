@@ -22,6 +22,7 @@ from PySide6.QtGui import QFont
 from core.config import (
     AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES, RETRIEVE_METHODS, get_local_ip,
 )
+from core.i18n import SUPPORTED_LANGUAGES
 from gui.styles import BTN_GREEN, BTN_BLUE
 
 
@@ -372,6 +373,14 @@ class SettingsDialog(QDialog):
         group.setLayout(pl)
         gl.addRow(group)
 
+        # Language
+        self.language_combo = QComboBox()
+        _LANG_LABELS = {"en": "English", "de": "Deutsch",
+                        "fr": "Français", "es": "Español"}
+        for code in SUPPORTED_LANGUAGES:
+            self.language_combo.addItem(_LANG_LABELS.get(code, code), code)
+        gl.addRow("Language:", self.language_combo)
+
         tabs.addTab(general_tab, "General")
 
         layout.addWidget(tabs)
@@ -414,6 +423,11 @@ class SettingsDialog(QDialog):
         self.prior_spin.setValue(self.config.prior_studies_count)
         self.prior_modality_check.setChecked(
             self.config.prior_studies_same_modality)
+
+        idx = self.language_combo.findData(self.config.language)
+        if idx < 0:
+            idx = self.language_combo.findData("en")
+        self.language_combo.setCurrentIndex(max(idx, 0))
 
         # Load remotes
         self._remote_keys = []
@@ -543,6 +557,7 @@ class SettingsDialog(QDialog):
         self.config.prior_studies_count = self.prior_spin.value()
         self.config.prior_studies_same_modality = (
             self.prior_modality_check.isChecked())
+        self.config.language = self.language_combo.currentData() or "en"
 
         self.config.save()
         self.accept()

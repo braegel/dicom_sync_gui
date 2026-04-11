@@ -805,3 +805,84 @@ def _find_copy_button(window, row: int):
             return children[0]
     return None
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Copy button localization — clipboard text in the configured language
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCopyButtonLocalization:
+    """LiveCompletionsWindow takes a language parameter; the copy
+    button's clipboard text is produced in that language.  Required
+    languages: en, de, fr, es."""
+
+    def _make_window(self, qapp, language):
+        win = LiveCompletionsWindow(language=language)
+        return win
+
+    def _add_row_and_click(self, win):
+        win.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        QApplication.clipboard().clear()
+        _find_copy_button(win, row=0).click()
+        return QApplication.clipboard().text().strip()
+
+    def test_default_language_is_english(self, qapp):
+        """No explicit language → English."""
+        win = LiveCompletionsWindow()
+        try:
+            win.add_completion(
+                patient_name="A", study_description="CT",
+                study_time="080000", completed_time="08:15:30",
+                institution_name="X",
+            )
+            QApplication.clipboard().clear()
+            _find_copy_button(win, row=0).click()
+            text = QApplication.clipboard().text().strip()
+            assert text == "Image transfer completed: 08:15:30"
+        finally:
+            win.close()
+
+    def test_english_explicit(self, qapp):
+        win = self._make_window(qapp, "en")
+        try:
+            assert self._add_row_and_click(win) == \
+                "Image transfer completed: 08:15:30"
+        finally:
+            win.close()
+
+    def test_german(self, qapp):
+        """Clipboard format in German: 'Abschluss Bildübertragung: HH:MM:SS'."""
+        win = self._make_window(qapp, "de")
+        try:
+            assert self._add_row_and_click(win) == \
+                "Abschluss Bildübertragung: 08:15:30"
+        finally:
+            win.close()
+
+    def test_french(self, qapp):
+        win = self._make_window(qapp, "fr")
+        try:
+            assert self._add_row_and_click(win) == \
+                "Transfert d'images terminé: 08:15:30"
+        finally:
+            win.close()
+
+    def test_spanish(self, qapp):
+        win = self._make_window(qapp, "es")
+        try:
+            assert self._add_row_and_click(win) == \
+                "Transferencia de imágenes completada: 08:15:30"
+        finally:
+            win.close()
+
+    def test_unknown_language_falls_back_to_english(self, qapp):
+        """A bad language value must not break the UI."""
+        win = self._make_window(qapp, "xx")
+        try:
+            assert self._add_row_and_click(win) == \
+                "Image transfer completed: 08:15:30"
+        finally:
+            win.close()

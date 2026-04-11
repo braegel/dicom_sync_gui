@@ -121,7 +121,8 @@ class MainWindow(QMainWindow):
 
         # Log window (created once, shown/hidden on demand)
         self.log_window = LogWindow(self)
-        self.completions_window = LiveCompletionsWindow(self)
+        self.completions_window = LiveCompletionsWindow(
+            self, language=getattr(self.config, "language", "en"))
 
     def _rebuild_tabs(self):
         """Create one SourceDashboard tab per configured source PACS."""

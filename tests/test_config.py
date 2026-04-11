@@ -204,6 +204,52 @@ class TestAppConfigDefaults:
         assert default_config.max_images == 0
         assert default_config.sync_interval == 60
 
+    def test_default_language_is_english(self, default_config):
+        """A fresh config must default to English."""
+        assert default_config.language == "en"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AppConfig — language setting
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAppConfigLanguage:
+    """The language is chosen in the settings dialog from a fixed list
+    of supported locales (en, de, fr, es). It must round-trip through
+    save/load so a restart preserves the choice."""
+
+    def test_language_can_be_set_to_german(self, default_config):
+        default_config.language = "de"
+        assert default_config.language == "de"
+
+    @pytest.mark.parametrize("lang", ["en", "de", "fr", "es"])
+    def test_language_roundtrip(self, tmp_config_path, lang):
+        cfg = AppConfig(config_path=tmp_config_path)
+        cfg.language = lang
+        cfg.save()
+
+        loaded = AppConfig(config_path=tmp_config_path)
+        loaded.load()
+        assert loaded.language == lang
+
+    def test_load_missing_language_defaults_to_english(
+            self, tmp_config_path):
+        """Older config files don't contain a language key — loading
+        them must not crash and must fall back to English."""
+        with open(tmp_config_path, "w") as f:
+            json.dump({"remotes": {}}, f)
+
+        loaded = AppConfig(config_path=tmp_config_path)
+        loaded.load()
+        assert loaded.language == "en"
+
+    def test_save_writes_language_key(self, default_config):
+        default_config.language = "fr"
+        default_config.save()
+        with open(default_config.config_path) as f:
+            data = json.load(f)
+        assert data.get("language") == "fr"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AppConfig — save and load

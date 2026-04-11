@@ -141,6 +141,9 @@ class AppConfig:
         self.filter_small_series_max: int = 20  # max images per series for the above
         self.high_load_alert_enabled: bool = True  # popup when ≥12 studies/hour
 
+        # UI language (en, de, fr, es)
+        self.language: str = "en"
+
         # Legacy fields — kept for backward-compatible config loading.
         # New code reads per-source values from PacsNode directly.
         self.default_hours: int = 3
@@ -210,6 +213,7 @@ class AppConfig:
                 "filter_small_series_max", 20)
             self.high_load_alert_enabled = data.get(
                 "high_load_alert_enabled", True)
+            self.language = data.get("language", "en")
 
             # ── Migration: inject per-source fields from legacy globals ──
             remotes_raw = data.get("remotes", {})
@@ -251,6 +255,7 @@ class AppConfig:
             "filter_allow_small_series": self.filter_allow_small_series,
             "filter_small_series_max": self.filter_small_series_max,
             "high_load_alert_enabled": self.high_load_alert_enabled,
+            "language": self.language,
             # Legacy globals (kept for downgrade compatibility)
             "default_hours": self.default_hours,
             "max_images": self.max_images,

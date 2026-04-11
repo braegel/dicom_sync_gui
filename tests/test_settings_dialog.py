@@ -425,3 +425,55 @@ class TestSettingsDialogRemove:
         initial_count = self.dialog.remote_list.count()
         self.dialog._remove_remote()
         assert self.dialog.remote_list.count() == initial_count
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SettingsDialog — UI language selector
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSettingsDialogLanguage:
+    """The General tab exposes a language combo box for picking the
+    UI language (en / de / fr / es). The choice is persisted to
+    AppConfig.language and written to disk on Save."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.config = populated_config
+        self.dialog = SettingsDialog(self.config)
+
+    def test_has_language_combo(self):
+        assert hasattr(self.dialog, "language_combo")
+
+    def test_language_combo_contains_all_four_languages(self):
+        codes = [self.dialog.language_combo.itemData(i)
+                 for i in range(self.dialog.language_combo.count())]
+        assert set(codes) == {"en", "de", "fr", "es"}
+
+    def test_language_combo_loads_current_config_value(
+            self, populated_config, qapp):
+        populated_config.language = "fr"
+        dialog = SettingsDialog(populated_config)
+        assert dialog.language_combo.currentData() == "fr"
+
+    def test_language_combo_defaults_to_english_when_unset(self):
+        assert self.dialog.language_combo.currentData() == "en"
+
+    def test_save_writes_language_to_config(self):
+        # Pick German.
+        idx = self.dialog.language_combo.findData("de")
+        self.dialog.language_combo.setCurrentIndex(idx)
+        with patch.object(self.config, "save"):
+            self.dialog._save()
+        assert self.config.language == "de"
+
+    def test_save_persists_language_to_disk(self, tmp_config_path):
+        import json
+        cfg = AppConfig(config_path=tmp_config_path)
+        cfg.remote_nodes = dict(self.config.remote_nodes)
+        dlg = SettingsDialog(cfg)
+        idx = dlg.language_combo.findData("es")
+        dlg.language_combo.setCurrentIndex(idx)
+        dlg._save()
+        with open(tmp_config_path) as f:
+            data = json.load(f)
+        assert data["language"] == "es"
