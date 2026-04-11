@@ -34,8 +34,8 @@ The app is self-contained and stores its configuration in
 ## Features
 
 - **Multiple Source PACS** — configure any number of remote PACS, each with
-  its own AE title, IP, port, transfer syntax, and retrieve method (C-MOVE or
-  C-GET).
+  its own AE title, IP, port, transfer syntax, retrieve method (C-MOVE or
+  C-GET), and *its own* local destination (AE title, port, fallback folder).
 - **Automatic Service** — start/stop a continuous download loop that queries,
   compares, and transfers all new series.
 - **Prior Studies** — optionally download the last N prior studies per patient
@@ -43,19 +43,49 @@ The app is self-contained and stores its configuration in
 - **Institution Filter Groups** — create named groups, assign institutions,
   and select which groups appear on the dashboard. Unknown institutions are
   always downloaded and trigger a popup with sound alert.
+- **UI Localization** — English, German, French, Spanish. Pick the language
+  in Settings → General. The "Copy" button in the Download Completions window
+  writes its clipboard text in the configured language (e.g. German:
+  `Abschluss Bildübertragung: HH:MM:SS`) so it can be pasted directly into
+  a radiology report.
+- **Retry Blacklist** — small series that repeatedly fail to transfer
+  (e.g. tiny localizers the source PACS refuses to send) are automatically
+  skipped after 2 failed C-MOVE attempts. Failure counts persist across
+  restarts; a successful transfer resets the counter.
 - **Custom Notification Sound** — plays a two-tone chime when a patient's
   studies complete downloading. Optionally select a custom WAV file or disable
   sound entirely. With active filter groups, sound only plays for matching
-  institutions.
+  institutions. A descending "sad" tone plays when transfer speed is below the
+  red threshold.
 - **Real-Time Dashboard** —
   - Series queue with Patient, Study, Series, Modality, Images, Pending,
     img/min, Status, and cumulative ETE (estimated time to end).
   - Throughput statistics: Last Series, Median 5, Median 10, Median All
     (images/minute), colour-coded relative to overall median.
-  - Study rate display showing studies/hour from PACS queries.
+  - Study rate display showing studies/hour from PACS queries, with a
+    high-load popup at ≥12 studies/hour.
   - Series with fewer than 10 images are excluded from speed statistics.
-- **Built-in Storage SCP** — automatic fallback when no local DICOM server is
-  reachable; images are saved to a configurable folder.
+- **Download Completions Window** (View → Download Completions) — live log
+  of completed studies with Patient, Study Description, Institution, Time
+  Acquired, Download Completed, Download Duration, and Delay columns. Delay
+  cells are ±1σ colour-coded, Download Duration cells are ±2σ colour-coded,
+  and each row has a per-row Copy button that puts
+  `Image transfer completed: HH:MM:SS` (localized) on the clipboard.
+- **Transfer Performance Statistics** (View → Transfer Performance, Ctrl+T) —
+  summary metrics, per-source and per-modality breakdown tables, and a
+  Mbit/s boxplot aggregatable by hour/day/week/month (bucketed by actual
+  download time, not DICOM acquisition date). Sourced from the SQLite
+  transfer log.
+- **Examination Lookup** (Tools → Examination Lookup) — enter cleartext
+  PatientID / AccessionNumber / StudyDate to find transfer details for a
+  specific examination. Warns when series were likely resent (Mbit/s is a
+  low outlier).
+- **Transfer Performance Log** — every series and study transfer is recorded
+  in a local SQLite database (patient-identifiable fields SHA-256 hashed)
+  for regulatory compliance documentation (StrlSchV / DIN 6868-159).
+- **Built-in Storage SCP** — automatic fallback per source PACS when the
+  configured local destination is not reachable; images are saved to a
+  configurable folder.
 - **Filter Groups Export/Import** — back up or share institution assignments
   as JSON (merge or replace mode).
 - **Dark Theme** — modern dark UI, platform-independent via PySide6/Qt.
@@ -232,7 +262,7 @@ to an active filter group.
 
 ## Running tests
 
-The project includes a comprehensive test suite (418 tests).
+The project includes a comprehensive test suite (689 tests).
 
 ```bash
 # Linux / macOS (headless — no display required)
@@ -267,7 +297,7 @@ cp -R "dist/DICOM Sync.app" "/tmp/dmg_stage/DICOM Sync.app"
 ln -s /Applications "/tmp/dmg_stage/Applications"
 hdiutil create -volname "DICOM Sync" \
   -srcfolder /tmp/dmg_stage -ov -format UDZO \
-  releases/DICOM_Sync_1.0.2_macOS_arm64.dmg
+  releases/DICOM_Sync_1.0.6_macOS_arm64.dmg
 rm -rf /tmp/dmg_stage
 ```
 
@@ -281,7 +311,7 @@ rm -rf /tmp/dmg_stage
 ```
 dicom_sync_gui/
 ├── main.py                         # Entry point, dark theme, dependency check
-├── __init__.py                     # Package version (1.0.2)
+├── __init__.py                     # Package version (1.0.6)
 ├── __main__.py                     # python -m support
 ├── requirements.txt                # pip dependencies
 ├── dicom_sync.spec                 # PyInstaller build spec
@@ -295,13 +325,15 @@ dicom_sync_gui/
 │   └── AppIcon.icns                # macOS application icon
 │
 ├── releases/
-│   └── DICOM_Sync_1.0.2_macOS_arm64.dmg   # Standalone macOS app
+│   └── DICOM_Sync_1.0.6_macOS_*.dmg   # Standalone macOS app
 │
 ├── core/
 │   ├── config.py                   # AppConfig, PacsNode, load/save
 │   ├── dicom_ops.py                # C-ECHO, C-FIND, C-MOVE/C-GET operations
+│   ├── i18n.py                     # UI translations (en/de/fr/es)
 │   ├── storage_scp.py              # Built-in DICOM Storage SCP
-│   └── transfer_engine.py          # Service loop, queue, stats, Qt signals
+│   ├── transfer_engine.py          # Service loop, queue, stats, Qt signals
+│   └── transfer_log.py             # SQLite transfer performance log
 │
 ├── gui/
 │   ├── main_window.py              # Main window, menus, engine wiring
@@ -309,19 +341,27 @@ dicom_sync_gui/
 │   ├── settings_dialog.py          # PACS configuration dialog
 │   ├── filter_groups_dialog.py     # Institution filter group editor
 │   ├── unknown_institution_popup.py  # Alert popup for unknown institutions
+│   ├── live_completions.py         # Download Completions window
+│   ├── transfer_stats_window.py    # Transfer Performance Statistics window
+│   ├── examination_lookup.py       # Examination Lookup dialog
 │   ├── log_window.py               # Floating log viewer
 │   └── styles.py                   # Shared button stylesheet constants
 │
-└── tests/                          # 418 tests
+└── tests/                          # 689 tests
     ├── conftest.py                 # Shared fixtures
     ├── test_config.py
     ├── test_dicom_ops.py
     ├── test_transfer_engine.py
+    ├── test_transfer_log.py
+    ├── test_i18n.py
     ├── test_dashboard.py
     ├── test_settings_dialog.py
     ├── test_main_window.py
     ├── test_filter_groups_dialog.py
-    └── test_filter_groups_export_import.py
+    ├── test_filter_groups_export_import.py
+    ├── test_live_completions.py
+    ├── test_transfer_stats_window.py
+    └── test_examination_lookup.py
 ```
 
 ---
