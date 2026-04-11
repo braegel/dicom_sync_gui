@@ -617,3 +617,124 @@ class TestExportFriendliness:
         conn.close()
         assert row[1] == 3   # num_series
         assert row[2] == 300  # total_images
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Series failure tracking — "stop retrying after N attempts"
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSeriesFailureTracking:
+    """Persist per-series failure counts so the engine can blacklist
+    series that repeatedly fail to download (e.g. tiny series with 1-5
+    images that the source PACS refuses to send). After 2 failed
+    attempts the series must be treated as permanently dead."""
+
+    def test_unknown_series_has_zero_attempts(self, log):
+        assert log.get_series_failure_count(
+            source_pacs="ct_scanner",
+            series_uid="1.2.3.4.5") == 0
+
+    def test_record_failure_sets_count_to_one(self, log):
+        log.record_series_failure(
+            source_pacs="ct_scanner",
+            series_uid="1.2.3.4.5")
+        assert log.get_series_failure_count(
+            source_pacs="ct_scanner",
+            series_uid="1.2.3.4.5") == 1
+
+    def test_record_failure_increments(self, log):
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3.4.5")
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3.4.5")
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3.4.5")
+        assert log.get_series_failure_count(
+            source_pacs="ct_scanner",
+            series_uid="1.2.3.4.5") == 3
+
+    def test_failures_scoped_per_source_pacs(self, log):
+        """Same series_uid at two PACS is counted independently."""
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        log.record_series_failure(
+            source_pacs="mr_scanner", series_uid="1.2.3")
+        log.record_series_failure(
+            source_pacs="mr_scanner", series_uid="1.2.3")
+        assert log.get_series_failure_count(
+            source_pacs="ct_scanner", series_uid="1.2.3") == 1
+        assert log.get_series_failure_count(
+            source_pacs="mr_scanner", series_uid="1.2.3") == 2
+
+    def test_is_series_blacklisted_default_threshold_is_two(self, log):
+        """Blacklist after the 2nd failed attempt."""
+        assert log.is_series_blacklisted(
+            source_pacs="ct_scanner", series_uid="1.2.3") is False
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        assert log.is_series_blacklisted(
+            source_pacs="ct_scanner", series_uid="1.2.3") is False
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        assert log.is_series_blacklisted(
+            source_pacs="ct_scanner", series_uid="1.2.3") is True
+
+    def test_is_series_blacklisted_custom_threshold(self, log):
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        assert log.is_series_blacklisted(
+            source_pacs="ct_scanner", series_uid="1.2.3",
+            max_attempts=5) is False
+        assert log.is_series_blacklisted(
+            source_pacs="ct_scanner", series_uid="1.2.3",
+            max_attempts=3) is True
+
+    def test_clear_series_failures_resets_count(self, log):
+        """Called after a successful transfer so a later failure
+        doesn't inherit stale attempts."""
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        log.clear_series_failures(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        assert log.get_series_failure_count(
+            source_pacs="ct_scanner", series_uid="1.2.3") == 0
+        assert log.is_series_blacklisted(
+            source_pacs="ct_scanner", series_uid="1.2.3") is False
+
+    def test_failures_persist_across_reopen(self, db_path):
+        """A restart of the app must not reset the blacklist."""
+        tl1 = TransferLog(db_path)
+        tl1.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        tl1.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
+        tl1.close()
+
+        tl2 = TransferLog(db_path)
+        try:
+            assert tl2.get_series_failure_count(
+                source_pacs="ct_scanner", series_uid="1.2.3") == 2
+            assert tl2.is_series_blacklisted(
+                source_pacs="ct_scanner", series_uid="1.2.3") is True
+        finally:
+            tl2.close()
+
+    def test_series_uid_stored_hashed(self, log, db_path):
+        """Series UID must be stored as SHA-256 — not plaintext —
+        to match the rest of the schema's PII handling."""
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3.4.5")
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT * FROM series_failures").fetchall()
+        conn.close()
+        assert len(rows) == 1
+        row_text = " ".join(str(v) for v in rows[0])
+        assert "1.2.3.4.5" not in row_text, (
+            "raw series_uid leaked into the failures table")

@@ -980,3 +980,214 @@ class TestPriorsInstitutionFilter:
             mock_ops, current, seen_series=set(), max_images=0)
 
         assert len(jobs) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — retry blacklist after 2 failed attempts
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRetryBlacklist:
+    """Small series (1-5 images) sometimes can't be retrieved from the
+    source PACS. The engine currently re-queues them every sync cycle
+    forever. After 2 failed C-MOVE attempts a series must be
+    blacklisted and never re-queried for download."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp, tmp_path):
+        from core.transfer_log import TransferLog
+        self.config = populated_config
+        self.config.filter_groups_enabled = False
+        self.engine = TransferEngine(self.config, "ct")
+        # Swap the engine's transfer log for one pointing at a tmp DB
+        # so tests never touch the user's real log.
+        self.engine._transfer_log.close()
+        self.engine._transfer_log = TransferLog(
+            str(tmp_path / "transfer_log.sqlite"))
+
+    def _make_study_ds(self, study_uid="1.2.3"):
+        from datetime import datetime
+        now = datetime.now()
+        ds = MagicMock()
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = now.strftime("%Y%m%d")
+        ds.StudyTime = now.strftime("%H%M%S")
+        ds.PatientName = "Doe^John"
+        ds.PatientID = "P1"
+        ds.StudyDescription = "CT Head"
+        ds.InstitutionName = "Hospital Alpha"
+        ds.AccessionNumber = "ACC1"
+        return ds
+
+    def _make_series_ds(self, series_uid="1.2.3.1", num_instances=3):
+        ds = MagicMock()
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesDescription = "Tiny localizer"
+        ds.Modality = "CT"
+        ds.SeriesNumber = "1"
+        ds.NumberOfSeriesRelatedInstances = num_instances
+        ds.InstitutionName = "Hospital Alpha"
+        return ds
+
+    def _mock_ops(self, study_ds, series_ds, c_move_success=False):
+        ops = MagicMock()
+        ops.c_find_studies.return_value = [study_ds]
+        ops.c_find_series.return_value = [series_ds]
+        ops.c_find_local_series.return_value = []
+        ops.c_move_series.return_value = (
+            c_move_success,
+            0 if not c_move_success
+            else series_ds.NumberOfSeriesRelatedInstances)
+        return ops
+
+    def test_failing_transfer_records_failure_in_log(self):
+        """A failed C-MOVE must call record_series_failure so the
+        attempt count is persisted for the next cycle."""
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=False)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert self.engine._transfer_log.get_series_failure_count(
+            source_pacs="ct", series_uid="1.2.3.1") == 1
+
+    def test_two_cycles_of_failure_increment_to_two(self):
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=False)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert self.engine._transfer_log.get_series_failure_count(
+            source_pacs="ct", series_uid="1.2.3.1") == 2
+
+    def test_blacklisted_series_is_not_queued_on_third_cycle(self):
+        """After 2 failures, a 3rd cycle must NOT build a SeriesJob
+        for the same series — it should be filtered out during
+        _build_study_jobs / _query_source."""
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=False)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            ops.c_move_series.reset_mock()
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert ops.c_move_series.call_count == 0, (
+            "blacklisted series must not be retried")
+        assert all(j.series_uid != "1.2.3.1"
+                   for j in self.engine._queue)
+
+    def test_blacklist_does_not_affect_other_series(self):
+        """A blacklisted series must not prevent healthy siblings in
+        the same study from being queued."""
+        study = self._make_study_ds("1.2.3")
+        bad = self._make_series_ds("1.2.3.bad", num_instances=3)
+        good = self._make_series_ds("1.2.3.good", num_instances=300)
+
+        ops = MagicMock()
+        ops.c_find_studies.return_value = [study]
+        ops.c_find_series.return_value = [bad, good]
+        ops.c_find_local_series.return_value = []
+
+        def c_move_side_effect(study_uid, series_uid):
+            if series_uid == "1.2.3.bad":
+                return (False, 0)
+            return (True, 300)
+        ops.c_move_series.side_effect = c_move_side_effect
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            ops.c_move_series.reset_mock()
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        attempted = [call.args[1]
+                     for call in ops.c_move_series.call_args_list]
+        assert "1.2.3.bad" not in attempted
+        assert all(j.series_uid != "1.2.3.bad"
+                   for j in self.engine._queue)
+
+    def test_successful_transfer_clears_prior_failures(self):
+        """If a series previously failed once and then succeeds, the
+        failure counter resets so a later failure isn't inherited."""
+        self.engine._transfer_log.record_series_failure(
+            source_pacs="ct", series_uid="1.2.3.1")
+        assert self.engine._transfer_log.get_series_failure_count(
+            source_pacs="ct", series_uid="1.2.3.1") == 1
+
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=True)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert self.engine._transfer_log.get_series_failure_count(
+            source_pacs="ct", series_uid="1.2.3.1") == 0
+
+    def test_preseeded_blacklist_skips_first_cycle(self):
+        """If the DB already says this series has 2 failures from a
+        previous app session, the very first cycle after restart must
+        not re-query it for transfer."""
+        self.engine._transfer_log.record_series_failure(
+            source_pacs="ct", series_uid="1.2.3.1")
+        self.engine._transfer_log.record_series_failure(
+            source_pacs="ct", series_uid="1.2.3.1")
+
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=False)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert ops.c_move_series.call_count == 0
+        assert all(j.series_uid != "1.2.3.1"
+                   for j in self.engine._queue)
+
+    def test_study_with_blacklisted_series_still_reaches_fully_complete(self):
+        """A study with one blacklisted and one healthy series must
+        still emit study_completed(fully_complete=True). The
+        blacklisted series is excluded from 'total remote series' —
+        otherwise the live completions window would silently drop
+        every study that ever contained a tiny-and-stuck series."""
+        study = self._make_study_ds("1.2.3")
+        bad = self._make_series_ds("1.2.3.bad", num_instances=3)
+        good = self._make_series_ds("1.2.3.good", num_instances=300)
+
+        # Pre-blacklist "bad" so we can test the positive path in a
+        # single cycle rather than orchestrating 3 cycles.
+        self.engine._transfer_log.record_series_failure(
+            source_pacs="ct", series_uid="1.2.3.bad")
+        self.engine._transfer_log.record_series_failure(
+            source_pacs="ct", series_uid="1.2.3.bad")
+
+        ops = MagicMock()
+        ops.c_find_studies.return_value = [study]
+        ops.c_find_series.return_value = [bad, good]
+        ops.c_find_local_series.return_value = []
+        ops.c_move_series.return_value = (True, 300)
+
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda uid, inst, full: received.append((uid, full)))
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert ("1.2.3", True) in received, (
+            "study with a blacklisted series must still fire "
+            "study_completed with fully_complete=True")

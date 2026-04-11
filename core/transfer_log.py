@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS series_transfer (
 )
 """
 
+_FAILURES_TABLE = """
+CREATE TABLE IF NOT EXISTS series_failures (
+    source_pacs TEXT NOT NULL,
+    series_uid_hash TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT NOT NULL,
+    PRIMARY KEY (source_pacs, series_uid_hash)
+)
+"""
+
+
 _STUDY_TABLE = """
 CREATE TABLE IF NOT EXISTS study_transfer (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +113,7 @@ class TransferLog:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SERIES_TABLE)
         self._conn.execute(_STUDY_TABLE)
+        self._conn.execute(_FAILURES_TABLE)
         self._conn.commit()
 
     def close(self):
@@ -166,6 +178,48 @@ class TransferLog:
                  total_series, total_images,
                  total_duration_seconds, wall_clock_seconds,
                  est_bytes, est_mbps))
+            self._conn.commit()
+
+    def record_series_failure(self, *, source_pacs: str,
+                              series_uid: str):
+        h = _sha256(series_uid)
+        ts = datetime.now().isoformat()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO series_failures "
+                "(source_pacs, series_uid_hash, attempt_count, "
+                "last_attempt_at) VALUES (?, ?, 1, ?) "
+                "ON CONFLICT(source_pacs, series_uid_hash) DO UPDATE SET "
+                "attempt_count = attempt_count + 1, "
+                "last_attempt_at = excluded.last_attempt_at",
+                (source_pacs, h, ts))
+            self._conn.commit()
+
+    def get_series_failure_count(self, *, source_pacs: str,
+                                 series_uid: str) -> int:
+        h = _sha256(series_uid)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT attempt_count FROM series_failures "
+                "WHERE source_pacs = ? AND series_uid_hash = ?",
+                (source_pacs, h)).fetchone()
+        return int(row[0]) if row else 0
+
+    def is_series_blacklisted(self, *, source_pacs: str,
+                              series_uid: str,
+                              max_attempts: int = 2) -> bool:
+        return self.get_series_failure_count(
+            source_pacs=source_pacs,
+            series_uid=series_uid) >= max_attempts
+
+    def clear_series_failures(self, *, source_pacs: str,
+                              series_uid: str):
+        h = _sha256(series_uid)
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM series_failures "
+                "WHERE source_pacs = ? AND series_uid_hash = ?",
+                (source_pacs, h))
             self._conn.commit()
 
     def query_series(self, *, date_from: Optional[str] = None,

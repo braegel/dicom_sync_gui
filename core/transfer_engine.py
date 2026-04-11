@@ -447,6 +447,17 @@ class TransferEngine:
 
         series_list = dicom_ops.c_find_series(study_uid)
 
+        # Exclude blacklisted series: they will never be fetched, so
+        # they must not count toward the study's "total remote series"
+        # or fully_complete detection would block forever on any study
+        # that contains a blacklisted series.
+        series_list = [
+            ser for ser in series_list
+            if not self._transfer_log.is_series_blacklisted(
+                source_pacs=self.remote_key,
+                series_uid=getattr(ser, 'SeriesInstanceUID', ''))
+        ]
+
         # Track total series count on remote for fully_complete detection
         self._study_total_series[study_uid] = len(series_list)
 
@@ -554,6 +565,13 @@ class TransferEngine:
                     )
                 except Exception as e:
                     logger.warning(f"TransferLog.record_series failed: {e}")
+                try:
+                    self._transfer_log.clear_series_failures(
+                        source_pacs=self.remote_key,
+                        series_uid=job.series_uid)
+                except Exception as e:
+                    logger.warning(
+                        f"TransferLog.clear_series_failures failed: {e}")
                 self.signals.series_completed.emit(job.series_uid, images)
                 self.signals.stats_updated.emit(self.stats)
                 self._check_study_complete(job.study_uid)
@@ -563,6 +581,13 @@ class TransferEngine:
             self._log(f"  [{self.remote_key}] C-MOVE failed: {e}")
 
         job.status = "error"
+        try:
+            self._transfer_log.record_series_failure(
+                source_pacs=self.remote_key,
+                series_uid=job.series_uid)
+        except Exception as e:
+            logger.warning(
+                f"TransferLog.record_series_failure failed: {e}")
         self.signals.series_error.emit(
             job.series_uid, "Transfer failed")
         return 0
