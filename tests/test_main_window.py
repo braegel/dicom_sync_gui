@@ -59,6 +59,39 @@ class TestMainWindowInit:
         win = MainWindow(populated_config)
         assert win.completions_window._language == "de"
 
+    def test_study_completed_live_passes_image_count(self):
+        """_on_study_completed_live must sum transferred_images across
+        all done series of the study and pass it to add_completion
+        so the Images and img/min columns can be populated."""
+        engine = MagicMock()
+        engine._queue = [
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=200, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=250, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+            MagicMock(study_uid="S2", status="done",
+                      transferred_images=999, patient_name="B",
+                      study_description="MR", study_time="090000",
+                      institution_name="H"),
+        ]
+        engine._study_wall_clock = {"S1": 30.0}
+
+        with patch.object(
+                self.win.completions_window, "add_completion") as mock_add:
+            self.win._on_study_completed_live(
+                engine, "S1", fully_complete=True)
+
+        mock_add.assert_called_once()
+        kwargs = mock_add.call_args.kwargs
+        assert kwargs["image_count"] == 450, (
+            "image_count must be the sum of transferred_images "
+            "for done series of this study only")
+        assert kwargs["download_duration_seconds"] == 30.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MainWindow — no sources placeholder

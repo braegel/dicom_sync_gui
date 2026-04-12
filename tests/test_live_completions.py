@@ -886,3 +886,126 @@ class TestCopyButtonLocalization:
                 "Image transfer completed: 08:15:30"
         finally:
             win.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Images and img/min columns — per-study throughput at a glance
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestImagesAndImagesPerMinuteColumns:
+    """Each completed study shows the total number of transferred
+    images and the images/minute throughput, computed from the
+    wall-clock download duration."""
+
+    def test_images_column_header_exists(self, window):
+        headers = _get_headers(window)
+        assert any(h == "images" for h in headers), (
+            f"expected an 'Images' column, got {headers}")
+
+    def test_images_per_minute_column_header_exists(self, window):
+        headers = _get_headers(window)
+        assert any("img/min" in h or "images/min" in h or "ipm" in h
+                    for h in headers), (
+            f"expected an img/min column, got {headers}")
+
+    def test_image_count_displayed(self, window):
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:00",
+            institution_name="X",
+            download_duration_seconds=60.0,
+            image_count=300,
+        )
+        col = _find_images_column(window)
+        item = window.completions_table.item(0, col)
+        assert item is not None
+        assert item.text() == "300"
+
+    def test_images_per_minute_computed(self, window):
+        """300 images in 60 s = 300 img/min."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:00",
+            institution_name="X",
+            download_duration_seconds=60.0,
+            image_count=300,
+        )
+        col = _find_ipm_column(window)
+        item = window.completions_table.item(0, col)
+        assert item is not None
+        assert item.text() == "300"
+
+    def test_images_per_minute_rounded_to_integer(self, window):
+        """200 images in 90 s -> 133.33 img/min -> displayed as '133'."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:30",
+            institution_name="X",
+            download_duration_seconds=90.0,
+            image_count=200,
+        )
+        col = _find_ipm_column(window)
+        item = window.completions_table.item(0, col)
+        assert item.text() == "133"
+
+    def test_missing_image_count_shows_dash(self, window):
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:00",
+            institution_name="X",
+            download_duration_seconds=60.0,
+            # no image_count
+        )
+        img_col = _find_images_column(window)
+        ipm_col = _find_ipm_column(window)
+        assert window.completions_table.item(0, img_col).text() == "—"
+        assert window.completions_table.item(0, ipm_col).text() == "—"
+
+    def test_missing_duration_keeps_image_count_but_dashes_ipm(self, window):
+        """Without a duration, img/min cannot be computed — but the
+        image count itself should still be visible."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:00",
+            institution_name="X",
+            image_count=300,
+            # no download_duration_seconds
+        )
+        img_col = _find_images_column(window)
+        ipm_col = _find_ipm_column(window)
+        assert window.completions_table.item(0, img_col).text() == "300"
+        assert window.completions_table.item(0, ipm_col).text() == "—"
+
+    def test_zero_duration_does_not_divide_by_zero(self, window):
+        """A zero duration must not crash; img/min degrades to '—'."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:00",
+            institution_name="X",
+            download_duration_seconds=0.0,
+            image_count=300,
+        )
+        img_col = _find_images_column(window)
+        ipm_col = _find_ipm_column(window)
+        assert window.completions_table.item(0, img_col).text() == "300"
+        assert window.completions_table.item(0, ipm_col).text() == "—"
+
+
+def _find_images_column(window):
+    t = window.completions_table
+    for c in range(t.columnCount()):
+        h = t.horizontalHeaderItem(c)
+        if h and h.text().strip().lower() == "images":
+            return c
+    raise ValueError("Images column not found")
+
+
+def _find_ipm_column(window):
+    t = window.completions_table
+    for c in range(t.columnCount()):
+        h = t.horizontalHeaderItem(c)
+        if h:
+            txt = h.text().lower()
+            if "img/min" in txt or "images/min" in txt or "ipm" in txt:
+                return c
+    raise ValueError("img/min column not found")

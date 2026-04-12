@@ -69,11 +69,18 @@ class LiveCompletionsWindow(QWidget):
         self.completions_table.setAlternatingRowColors(True)
         headers = ["Patient", "Study Description", "Institution",
                     "Time Acquired", "Download Completed",
-                    "Download Duration", "Delay", ""]
+                    "Download Duration", "Images", "img/min",
+                    "Delay", ""]
         self.completions_table.setColumnCount(len(headers))
         self.completions_table.setHorizontalHeaderLabels(headers)
         self.completions_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents)
+        # Row height must auto-fit the per-row Copy button — the global
+        # dark theme forces all QPushButtons to min-height: 22 + 12px of
+        # vertical padding, which is taller than the default fixed row.
+        self.completions_table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents)
+        self.completions_table.verticalHeader().setVisible(False)
         layout.addWidget(self.completions_table, 1)
 
         bottom = QHBoxLayout()
@@ -89,7 +96,8 @@ class LiveCompletionsWindow(QWidget):
     def add_completion(self, *, patient_name: str, study_description: str,
                        study_time: str, completed_time: str,
                        institution_name: str = "",
-                       download_duration_seconds: Optional[float] = None):
+                       download_duration_seconds: Optional[float] = None,
+                       image_count: Optional[int] = None):
         # Format study_time HHMMSS → HH:MM:SS
         acq = _parse_time(study_time)
         comp = _parse_time(completed_time)
@@ -121,6 +129,15 @@ class LiveCompletionsWindow(QWidget):
         else:
             dl_text = "—"
 
+        images_text = str(image_count) if image_count is not None else "—"
+        if (image_count is not None
+                and download_duration_seconds is not None
+                and download_duration_seconds > 0):
+            ipm = image_count * 60.0 / download_duration_seconds
+            ipm_text = f"{int(round(ipm))}"
+        else:
+            ipm_text = "—"
+
         self.completions_table.insertRow(0)
         self.completions_table.setItem(0, 0, QTableWidgetItem(patient_name))
         self.completions_table.setItem(0, 1, QTableWidgetItem(study_description))
@@ -128,14 +145,20 @@ class LiveCompletionsWindow(QWidget):
         self.completions_table.setItem(0, 3, QTableWidgetItem(formatted_acq))
         self.completions_table.setItem(0, 4, QTableWidgetItem(formatted_comp))
         self.completions_table.setItem(0, 5, QTableWidgetItem(dl_text))
-        self.completions_table.setItem(0, 6, QTableWidgetItem(delay_text))
+        self.completions_table.setItem(0, 6, QTableWidgetItem(images_text))
+        self.completions_table.setItem(0, 7, QTableWidgetItem(ipm_text))
+        self.completions_table.setItem(0, 8, QTableWidgetItem(delay_text))
 
         copy_btn = QPushButton("Copy")
+        # Override the global dark-theme QPushButton padding/min-height
+        # so the button fits comfortably inside a table row.
+        copy_btn.setStyleSheet(
+            "QPushButton { padding: 2px 8px; min-height: 0; }")
         prefix = tr("image_transfer_completed", self._language)
         copy_btn.clicked.connect(
             lambda checked=False, t=formatted_comp, p=prefix:
                 QApplication.clipboard().setText(f"{p}: {t}"))
-        self.completions_table.setCellWidget(0, 7, copy_btn)
+        self.completions_table.setCellWidget(0, 9, copy_btn)
 
         self._update_stats()
 
@@ -162,7 +185,7 @@ class LiveCompletionsWindow(QWidget):
         if stddev < 0.001:
             return
 
-        delay_col = 6
+        delay_col = 8
         for row in range(self.completions_table.rowCount()):
             idx = row  # _delays[0] = newest = row 0
             if idx >= len(self._delays):

@@ -262,6 +262,7 @@ class MainWindow(QMainWindow):
             return
         first = study_jobs[0]
         wall_clock = engine._study_wall_clock.pop(study_uid, None)
+        total_images = sum(j.transferred_images for j in study_jobs)
         self.completions_window.add_completion(
             patient_name=first.patient_name,
             study_description=first.study_description,
@@ -269,6 +270,7 @@ class MainWindow(QMainWindow):
             completed_time=datetime.now().strftime("%H:%M:%S"),
             institution_name=first.institution_name,
             download_duration_seconds=wall_clock,
+            image_count=total_images,
         )
 
     def _log(self, msg: str):
