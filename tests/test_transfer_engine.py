@@ -1238,3 +1238,74 @@ class TestFetchLocalSeriesCounts:
         result = TransferEngine._fetch_local_series_counts(
             ops, study_uid="1.2.3")
         assert result == {"1.2.3.1": 50, "1.2.3.2": 100}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — one DicomOperations (AE) per cycle, not per series
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSingleAEPerCycle:
+    """Each _run_one_cycle must create exactly one DicomOperations
+    instance and reuse it for both querying and transferring.
+    Creating a fresh pynetdicom AE per series caused a segfault:
+    the AE's reactor threads outlived the GC'd object → SIGSEGV."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp, tmp_path):
+        from core.transfer_log import TransferLog
+        self.config = populated_config
+        self.config.filter_groups_enabled = False
+        self.engine = TransferEngine(self.config, "ct")
+        self.engine._transfer_log.close()
+        self.engine._transfer_log = TransferLog(
+            str(tmp_path / "transfer_log.sqlite"))
+
+    def _make_study_ds(self):
+        from datetime import datetime
+        now = datetime.now()
+        ds = MagicMock()
+        ds.StudyInstanceUID = "1.2.3"
+        ds.StudyDate = now.strftime("%Y%m%d")
+        ds.StudyTime = now.strftime("%H%M%S")
+        ds.PatientName = "Doe^John"
+        ds.PatientID = "P1"
+        ds.StudyDescription = "CT Head"
+        ds.InstitutionName = "Hospital"
+        ds.AccessionNumber = "ACC1"
+        return ds
+
+    def _make_series_ds(self, series_uid, num=100):
+        ds = MagicMock()
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesDescription = "Axial"
+        ds.Modality = "CT"
+        ds.SeriesNumber = "1"
+        ds.NumberOfSeriesRelatedInstances = num
+        ds.InstitutionName = "Hospital"
+        return ds
+
+    def test_make_dicom_ops_called_once_per_cycle(self):
+        """Even with multiple series in the queue, _make_dicom_ops
+        must be called exactly once — the returned AE is reused for
+        both the query phase and every series transfer."""
+        study = self._make_study_ds()
+        s1 = self._make_series_ds("1.2.3.1")
+        s2 = self._make_series_ds("1.2.3.2")
+        s3 = self._make_series_ds("1.2.3.3")
+
+        ops = MagicMock()
+        ops.c_find_studies.return_value = [study]
+        ops.c_find_series.return_value = [s1, s2, s3]
+        ops.c_find_local_series.return_value = []
+        ops.c_move_series.return_value = (True, 100)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops) as mock_make:
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert mock_make.call_count == 1, (
+            f"_make_dicom_ops called {mock_make.call_count} times "
+            f"but must be called exactly once per cycle — "
+            f"creating a fresh AE per series causes a segfault")
+        # All 3 series should still have been transferred
+        assert ops.c_move_series.call_count == 3

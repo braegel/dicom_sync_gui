@@ -328,9 +328,17 @@ class TransferEngine:
 
         seen_series: Set[str] = set()
 
+        # One DicomOperations (= one pynetdicom AE) per cycle.
+        # Creating a fresh AE per series caused a segfault: each AE
+        # spawns AcceptorThread + RequestorThread + run_reactor
+        # threads, and when the AE was GC'd at function-scope exit
+        # those threads would dereference the dead object → SIGSEGV.
+        dicom_ops = self._make_dicom_ops()
+
         try:
             jobs = self._query_source(
-                date_range, cutoff, max_images, seen_series)
+                date_range, cutoff, max_images, seen_series,
+                dicom_ops)
         except Exception as e:
             self._log(f"  [{self.remote_key}] Error querying: {e}")
             jobs = []
@@ -365,16 +373,19 @@ class TransferEngine:
         for job in jobs:
             if self._cancel.is_set():
                 break
-            total_images += self._transfer_series(job)
+            total_images += self._transfer_series(job, dicom_ops)
             self.signals.queue_updated.emit([j.to_dict() for j in jobs])
 
         return total_images
 
     def _query_source(self, date_range: str, cutoff: datetime,
                       max_images: int,
-                      seen_series: Set[str]) -> List[SeriesJob]:
+                      seen_series: Set[str],
+                      dicom_ops: DicomOperations = None,
+                      ) -> List[SeriesJob]:
         """Query the source PACS and return new SeriesJob items."""
-        dicom_ops = self._make_dicom_ops()
+        if dicom_ops is None:
+            dicom_ops = self._make_dicom_ops()
         self._log(f"Querying {self.remote_key}...")
         studies_raw = dicom_ops.c_find_studies(study_date=date_range)
 
@@ -516,7 +527,8 @@ class TransferEngine:
             ))
         return jobs
 
-    def _transfer_series(self, job: SeriesJob) -> int:
+    def _transfer_series(self, job: SeriesJob,
+                         dicom_ops: DicomOperations = None) -> int:
         """Transfer one series. Returns number of images transferred."""
         job.status = "transferring"
         self.signals.series_started.emit(job.to_dict())
@@ -530,7 +542,7 @@ class TransferEngine:
             job.status = "error"
             return 0
         try:
-            ops = self._make_dicom_ops()
+            ops = dicom_ops or self._make_dicom_ops()
             t_start = time.time()
             success, images = ops.c_move_series(job.study_uid, job.series_uid)
             t_elapsed = time.time() - t_start
