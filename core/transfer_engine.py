@@ -129,6 +129,20 @@ class TransferStats:
         return [r for r in self._completed_series
                 if r.image_count >= self.MIN_IMAGES_FOR_STATS]
 
+    def raw_images_per_minute(self) -> float:
+        """Overall images/minute since session start.
+
+        Reads ``start_time`` and ``total_images`` in a single snapshot
+        so callers on another thread get a consistent rate."""
+        total = self.total_images
+        start = self.start_time
+        if not start or total <= 0:
+            return 0.0
+        elapsed = time.time() - start
+        if elapsed <= 0:
+            return 0.0
+        return total / elapsed * 60.0
+
     def last_series_ipm(self) -> float:
         """Images/minute for the most recently completed qualifying series."""
         qualifying = self._stats_series

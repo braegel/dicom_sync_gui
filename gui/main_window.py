@@ -7,7 +7,6 @@ with an independent download service, queue, and statistics.
 import logging
 import os
 import threading
-import time
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
@@ -260,20 +259,13 @@ class MainWindow(QMainWindow):
         for engine in self.engines.values():
             if not engine.is_running:
                 continue
-            for job in engine._queue:
+            # Snapshot the queue reference so we iterate a stable list
+            # even if the service-loop thread reassigns engine._queue.
+            queue = engine._queue
+            for job in queue:
                 if job.status not in ("done", "error", "skipped"):
                     total_pending += job.to_transfer
-            # Use the raw elapsed rate (total images / wall-clock time)
-            # instead of the filtered median.  The median requires ≥10
-            # images per series to qualify, so small series and early
-            # cycles would show no countdown at all.  The raw rate is
-            # available from the very first transferred image and
-            # includes query/sleep overhead which makes the ETE
-            # conservative but realistic.
-            stats = engine.stats
-            elapsed = time.time() - stats.start_time if stats.start_time else 0
-            if elapsed > 0 and stats.total_images > 0:
-                total_ipm += stats.total_images / elapsed * 60.0
+            total_ipm += engine.stats.raw_images_per_minute()
         self.completions_window.update_transfer_progress(
             total_pending, total_ipm)
 
@@ -282,7 +274,8 @@ class MainWindow(QMainWindow):
         """Add a completion entry to the live completions window."""
         if not fully_complete:
             return
-        study_jobs = [j for j in engine._queue
+        queue = engine._queue
+        study_jobs = [j for j in queue
                        if j.study_uid == study_uid and j.status == "done"]
         if not study_jobs:
             return
