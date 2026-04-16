@@ -236,6 +236,7 @@ class TransferEngine:
         self._series_start_times: Dict[str, float] = {}  # study_uid → first series start
         self._study_wall_clock: Dict[str, float] = {}  # study_uid → wall-clock seconds, populated at completion
         self._study_total_series: Dict[str, int] = {}  # study_uid → total series on remote
+        self._dicom_ops: Optional[DicomOperations] = None
 
     @property
     def is_running(self) -> bool:
@@ -313,6 +314,7 @@ class TransferEngine:
             self._log(f"[{self.remote_key}] Service error: {e}")
             logger.exception("Service loop error")
         finally:
+            self._dicom_ops = None
             self._running = False
             self._log(f"[{self.remote_key}] Service stopped.")
             self.signals.service_stopped.emit()
@@ -328,12 +330,13 @@ class TransferEngine:
 
         seen_series: Set[str] = set()
 
-        # One DicomOperations (= one pynetdicom AE) per cycle.
-        # Creating a fresh AE per series caused a segfault: each AE
-        # spawns AcceptorThread + RequestorThread + run_reactor
-        # threads, and when the AE was GC'd at function-scope exit
-        # those threads would dereference the dead object → SIGSEGV.
-        dicom_ops = self._make_dicom_ops()
+        # Reuse a single DicomOperations (= one pynetdicom AE) for the
+        # lifetime of the engine.  Each AE spawns reactor threads that
+        # outlive the Python object; letting the AE be GC'd while those
+        # threads are still running causes a SIGSEGV in mark_stacks.
+        if self._dicom_ops is None:
+            self._dicom_ops = self._make_dicom_ops()
+        dicom_ops = self._dicom_ops
 
         try:
             jobs = self._query_source(
@@ -385,7 +388,9 @@ class TransferEngine:
                       ) -> List[SeriesJob]:
         """Query the source PACS and return new SeriesJob items."""
         if dicom_ops is None:
-            dicom_ops = self._make_dicom_ops()
+            if self._dicom_ops is None:
+                self._dicom_ops = self._make_dicom_ops()
+            dicom_ops = self._dicom_ops
         self._log(f"Querying {self.remote_key}...")
         studies_raw = dicom_ops.c_find_studies(study_date=date_range)
 
@@ -542,7 +547,11 @@ class TransferEngine:
             job.status = "error"
             return 0
         try:
-            ops = dicom_ops or self._make_dicom_ops()
+            if dicom_ops is None:
+                if self._dicom_ops is None:
+                    self._dicom_ops = self._make_dicom_ops()
+                dicom_ops = self._dicom_ops
+            ops = dicom_ops
             t_start = time.time()
             success, images = ops.c_move_series(job.study_uid, job.series_uid)
             t_elapsed = time.time() - t_start

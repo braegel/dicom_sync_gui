@@ -7,6 +7,7 @@ with an independent download service, queue, and statistics.
 import logging
 import os
 import threading
+import time
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
@@ -251,6 +252,31 @@ class MainWindow(QMainWindow):
         self.log_window.raise_()
         self.log_window.activateWindow()
 
+    def _update_completions_progress(self):
+        """Aggregate pending images and transfer rate across all
+        running engines and push the ETE to the completions window."""
+        total_pending = 0
+        total_ipm = 0.0
+        for engine in self.engines.values():
+            if not engine.is_running:
+                continue
+            for job in engine._queue:
+                if job.status not in ("done", "error", "skipped"):
+                    total_pending += job.to_transfer
+            # Use the raw elapsed rate (total images / wall-clock time)
+            # instead of the filtered median.  The median requires ≥10
+            # images per series to qualify, so small series and early
+            # cycles would show no countdown at all.  The raw rate is
+            # available from the very first transferred image and
+            # includes query/sleep overhead which makes the ETE
+            # conservative but realistic.
+            stats = engine.stats
+            elapsed = time.time() - stats.start_time if stats.start_time else 0
+            if elapsed > 0 and stats.total_images > 0:
+                total_ipm += stats.total_images / elapsed * 60.0
+        self.completions_window.update_transfer_progress(
+            total_pending, total_ipm)
+
     def _on_study_completed_live(self, engine, study_uid: str,
                                    fully_complete: bool):
         """Add a completion entry to the live completions window."""
@@ -330,6 +356,7 @@ class MainWindow(QMainWindow):
         if dashboard:
             dashboard.set_service_running(False)
         self.statusBar().showMessage(f"Service stopped: {remote_key}")
+        self._update_completions_progress()
 
     # ── Per-source Storage SCP ────────────────────────────────────────────
 
@@ -411,6 +438,11 @@ class MainWindow(QMainWindow):
                 self._on_study_completed_live(eng, uid, full))
         e.signals.series_started.connect(dashboard.on_series_started)
         e.signals.stats_updated.connect(dashboard.on_stats_updated)
+        # Forward queue/stats to the completions-window ETE countdown
+        e.signals.queue_updated.connect(
+            lambda _q: self._update_completions_progress())
+        e.signals.stats_updated.connect(
+            lambda _s: self._update_completions_progress())
         e.signals.cycle_started.connect(dashboard.on_cycle_started)
         e.signals.cycle_finished.connect(dashboard.on_cycle_finished)
         # Service lifecycle — use a lambda to pass the remote_key

@@ -92,6 +92,54 @@ class TestMainWindowInit:
             "for done series of this study only")
         assert kwargs["download_duration_seconds"] == 30.0
 
+    def test_update_completions_progress_aggregates_engines(self):
+        """_update_completions_progress must sum pending images and
+        transfer rates across all running engines and forward them
+        to the completions window's ETE countdown."""
+        import time as _time
+        from core.transfer_engine import SeriesJob, TransferStats
+
+        now = _time.time()
+
+        eng1 = MagicMock()
+        eng1.is_running = True
+        eng1._queue = [
+            SeriesJob(series_uid="1", remote_count=200,
+                      local_count=0, status="queued"),
+            SeriesJob(series_uid="2", remote_count=100,
+                      local_count=100, status="done"),
+        ]
+        eng1.stats = TransferStats()
+        eng1.stats.start_time = now - 60  # 60 s ago
+        eng1.stats.total_images = 100     # → 100 img/min raw
+
+        eng2 = MagicMock()
+        eng2.is_running = True
+        eng2._queue = [
+            SeriesJob(series_uid="3", remote_count=300,
+                      local_count=0, status="queued"),
+        ]
+        eng2.stats = TransferStats()
+        eng2.stats.start_time = now - 60
+        eng2.stats.total_images = 200     # → 200 img/min raw
+
+        self.win.engines = {"ct": eng1, "mri": eng2}
+
+        with patch.object(
+                self.win.completions_window,
+                "update_transfer_progress") as mock_up:
+            self.win._update_completions_progress()
+
+        mock_up.assert_called_once()
+        args = mock_up.call_args
+        pending = args[0][0] if args[0] else args[1]["pending_images"]
+        ipm = args[0][1] if len(args[0]) > 1 else args[1]["images_per_minute"]
+        assert pending == 500, (
+            "200 (eng1 queued) + 300 (eng2 queued) = 500 pending")
+        # Raw rate: eng1 100/min + eng2 200/min ≈ 300/min
+        assert 290 < ipm < 310, (
+            f"aggregate raw rate should be ~300 img/min, got {ipm}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MainWindow — no sources placeholder
@@ -238,7 +286,10 @@ class TestMainWindowService:
         self.win._on_start_service(
             "ct", {"hours": 3, "max_images": 0, "sync_interval": 60})
 
-        mock_signals.queue_updated.connect.assert_called_once()
+        # queue_updated: dashboard + ETE countdown = 2 connections
+        assert mock_signals.queue_updated.connect.call_count == 2
+        # stats_updated: dashboard + ETE countdown = 2 connections
+        assert mock_signals.stats_updated.connect.call_count == 2
         mock_signals.series_started.connect.assert_called_once()
         mock_signals.service_stopped.connect.assert_called_once()
         mock_signals.unknown_institution.connect.assert_called_once()

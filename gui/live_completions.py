@@ -12,7 +12,7 @@ from typing import Optional
 
 from core.i18n import tr
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
@@ -83,6 +83,23 @@ class LiveCompletionsWindow(QWidget):
         self.completions_table.verticalHeader().setVisible(False)
         layout.addWidget(self.completions_table, 1)
 
+        # ── ETE countdown row ──
+        ete_row = QHBoxLayout()
+        ete_row.addWidget(QLabel("Remaining:"))
+        self.lbl_remaining_time = QLabel("—")
+        ete_row.addWidget(self.lbl_remaining_time)
+        ete_row.addWidget(QLabel("  Expected completion:"))
+        self.lbl_expected_completion = QLabel("—")
+        ete_row.addWidget(self.lbl_expected_completion)
+        ete_row.addStretch()
+        layout.addLayout(ete_row)
+
+        self._remaining_seconds: float = 0.0
+        self._ete_timer = QTimer(self)
+        self._ete_timer.setInterval(1000)
+        self._ete_timer.timeout.connect(self._tick_countdown)
+
+        # ── Bottom bar ──
         bottom = QHBoxLayout()
         self.lbl_median_delay = QLabel("—")
         bottom.addWidget(QLabel("Median delay:"))
@@ -236,8 +253,49 @@ class LiveCompletionsWindow(QWidget):
             else:
                 item.setForeground(QBrush(QColor("white")))
 
+    def update_transfer_progress(self, pending_images: int,
+                                 images_per_minute: float):
+        """Update the ETE countdown from the current queue state."""
+        if pending_images <= 0 or images_per_minute <= 0:
+            self._remaining_seconds = 0.0
+            self._ete_timer.stop()
+            self.lbl_remaining_time.setText("—")
+            self.lbl_expected_completion.setText("—")
+            return
+        self._remaining_seconds = pending_images / images_per_minute * 60.0
+        self._refresh_countdown_labels()
+        if not self._ete_timer.isActive():
+            self._ete_timer.start()
+
+    def _tick_countdown(self):
+        self._remaining_seconds = max(self._remaining_seconds - 1.0, 0.0)
+        if self._remaining_seconds <= 0:
+            self._ete_timer.stop()
+            self.lbl_remaining_time.setText("—")
+            self.lbl_expected_completion.setText("—")
+            return
+        self._refresh_countdown_labels()
+
+    def _refresh_countdown_labels(self):
+        secs = int(self._remaining_seconds)
+        if secs >= 3600:
+            h = secs // 3600
+            m = (secs % 3600) // 60
+            s = secs % 60
+            self.lbl_remaining_time.setText(f"{h}:{m:02d}:{s:02d}")
+        else:
+            m = secs // 60
+            s = secs % 60
+            self.lbl_remaining_time.setText(f"{m}:{s:02d}")
+        expected = datetime.now() + timedelta(seconds=secs)
+        self.lbl_expected_completion.setText(expected.strftime("%H:%M:%S"))
+
     def _clear(self):
         self.completions_table.setRowCount(0)
         self._delays.clear()
         self._durations.clear()
         self.lbl_median_delay.setText("—")
+        self._remaining_seconds = 0.0
+        self._ete_timer.stop()
+        self.lbl_remaining_time.setText("—")
+        self.lbl_expected_completion.setText("—")

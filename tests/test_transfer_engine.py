@@ -1245,10 +1245,9 @@ class TestFetchLocalSeriesCounts:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestSingleAEPerCycle:
-    """Each _run_one_cycle must create exactly one DicomOperations
-    instance and reuse it for both querying and transferring.
-    Creating a fresh pynetdicom AE per series caused a segfault:
-    the AE's reactor threads outlived the GC'd object → SIGSEGV."""
+    """The engine must reuse a single DicomOperations (= one pynetdicom AE)
+    across all cycles.  Creating fresh AEs causes a segfault: the AE's
+    reactor threads outlive the GC'd object and crash in mark_stacks."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, populated_config, qapp, tmp_path):
@@ -1284,10 +1283,9 @@ class TestSingleAEPerCycle:
         ds.InstitutionName = "Hospital"
         return ds
 
-    def test_make_dicom_ops_called_once_per_cycle(self):
-        """Even with multiple series in the queue, _make_dicom_ops
-        must be called exactly once — the returned AE is reused for
-        both the query phase and every series transfer."""
+    def test_make_dicom_ops_called_once_across_cycles(self):
+        """_make_dicom_ops must be called exactly once even across
+        multiple cycles — the AE is reused for the engine's lifetime."""
         study = self._make_study_ds()
         s1 = self._make_series_ds("1.2.3.1")
         s2 = self._make_series_ds("1.2.3.2")
@@ -1302,10 +1300,11 @@ class TestSingleAEPerCycle:
         with patch.object(self.engine, '_make_dicom_ops',
                           return_value=ops) as mock_make:
             self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
 
         assert mock_make.call_count == 1, (
             f"_make_dicom_ops called {mock_make.call_count} times "
-            f"but must be called exactly once per cycle — "
-            f"creating a fresh AE per series causes a segfault")
-        # All 3 series should still have been transferred
-        assert ops.c_move_series.call_count == 3
+            f"but must be called exactly once — reactor threads from "
+            f"GC'd AEs cause a segfault in mark_stacks")
+        # All 3 series should have been transferred in each cycle
+        assert ops.c_move_series.call_count == 6

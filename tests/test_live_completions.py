@@ -1009,3 +1009,108 @@ def _find_ipm_column(window):
             if "img/min" in txt or "images/min" in txt or "ipm" in txt:
                 return c
     raise ValueError("img/min column not found")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Live ETE countdown — remaining time + expected completion clock
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTransferProgressCountdown:
+    """The Download Completions window shows a live countdown:
+    estimated remaining time for the current download queue and the
+    expected wall-clock time when the download will finish.
+
+    Data is pushed in via ``update_transfer_progress(pending_images,
+    images_per_minute)``; a 1-second QTimer ticks the remaining time
+    down between updates."""
+
+    # ── UI element existence ──────────────────────────────────────────
+
+    def test_has_remaining_time_label(self, window):
+        assert hasattr(window, "lbl_remaining_time"), (
+            "LiveCompletionsWindow needs a lbl_remaining_time QLabel")
+
+    def test_has_expected_completion_label(self, window):
+        assert hasattr(window, "lbl_expected_completion"), (
+            "LiveCompletionsWindow needs a lbl_expected_completion QLabel")
+
+    def test_initial_state_shows_dash(self, window):
+        assert "—" in window.lbl_remaining_time.text()
+        assert "—" in window.lbl_expected_completion.text()
+
+    # ── Remaining time computation ────────────────────────────────────
+
+    def test_remaining_time_five_minutes(self, window):
+        """600 pending images at 120 img/min → 5:00 remaining."""
+        window.update_transfer_progress(
+            pending_images=600, images_per_minute=120.0)
+        text = window.lbl_remaining_time.text()
+        assert "5:00" in text
+
+    def test_remaining_time_two_and_half_minutes(self, window):
+        """300 pending images at 120 img/min → 2:30 remaining."""
+        window.update_transfer_progress(
+            pending_images=300, images_per_minute=120.0)
+        assert "2:30" in window.lbl_remaining_time.text()
+
+    def test_remaining_time_over_one_hour(self, window):
+        """3600 images at 60 img/min → 60 min → 1:00:00."""
+        window.update_transfer_progress(
+            pending_images=3600, images_per_minute=60.0)
+        assert "1:00:00" in window.lbl_remaining_time.text()
+
+    # ── Expected completion time ──────────────────────────────────────
+
+    def test_expected_completion_shows_clock_time(self, window):
+        """Must show a HH:MM:SS wall-clock time, not just a duration."""
+        from datetime import datetime, timedelta
+        before = datetime.now()
+        window.update_transfer_progress(
+            pending_images=600, images_per_minute=120.0)
+        # Expected ≈ now + 5 min
+        expected = before + timedelta(minutes=5)
+        text = window.lbl_expected_completion.text()
+        assert f"{expected.hour:02d}:{expected.minute:02d}" in text
+
+    # ── Edge cases ────────────────────────────────────────────────────
+
+    def test_zero_rate_shows_dash(self, window):
+        """Can't estimate without a transfer rate."""
+        window.update_transfer_progress(
+            pending_images=600, images_per_minute=0.0)
+        assert "—" in window.lbl_remaining_time.text()
+        assert "—" in window.lbl_expected_completion.text()
+
+    def test_zero_pending_shows_dash(self, window):
+        """No pending work → nothing to count down."""
+        window.update_transfer_progress(
+            pending_images=0, images_per_minute=120.0)
+        assert "—" in window.lbl_remaining_time.text() or \
+            "0:00" in window.lbl_remaining_time.text()
+
+    def test_negative_pending_treated_as_zero(self, window):
+        window.update_transfer_progress(
+            pending_images=-10, images_per_minute=120.0)
+        text = window.lbl_remaining_time.text()
+        assert "—" in text or "0:00" in text
+
+    # ── Update replaces previous estimate ─────────────────────────────
+
+    def test_update_replaces_previous_estimate(self, window):
+        window.update_transfer_progress(
+            pending_images=600, images_per_minute=120.0)
+        window.update_transfer_progress(
+            pending_images=300, images_per_minute=120.0)
+        text = window.lbl_remaining_time.text()
+        assert "2:30" in text
+        assert "5:00" not in text
+
+    # ── Reset on clear ────────────────────────────────────────────────
+
+    def test_clear_resets_countdown(self, window):
+        """Pressing Clear must also reset the ETE display."""
+        window.update_transfer_progress(
+            pending_images=600, images_per_minute=120.0)
+        window._clear()
+        assert "—" in window.lbl_remaining_time.text()
+        assert "—" in window.lbl_expected_completion.text()
