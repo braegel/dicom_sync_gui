@@ -10,6 +10,7 @@ Dependencies:
     pip install PySide6 pydicom pynetdicom
 """
 
+import gc
 import logging
 import os
 import platform
@@ -106,6 +107,16 @@ def main():
     # Create and show main window
     window = MainWindow(config)
     window.show()
+
+    # Move every object allocated so far into a permanent GC generation
+    # that cyclic GC will never scan.  Python 3.14's incremental GC walks
+    # all thread stacks during mark_stacks; when the service-loop thread
+    # hits a safepoint while the Qt thread is mid-dealloc of a PySide
+    # wrapper, the walk races the dealloc and SIGSEGVs in mark_stacks.
+    # Freezing drastically shrinks the scan set to only newly-allocated
+    # containers, making the race effectively unreachable.  Refcount-
+    # based cleanup still runs normally.
+    gc.freeze()
 
     sys.exit(app.exec())
 
