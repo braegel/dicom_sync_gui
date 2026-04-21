@@ -73,7 +73,7 @@ def main():
     check_dependencies()
 
     from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QFont
 
     from core.config import AppConfig
@@ -108,15 +108,22 @@ def main():
     window = MainWindow(config)
     window.show()
 
-    # Move every object allocated so far into a permanent GC generation
-    # that cyclic GC will never scan.  Python 3.14's incremental GC walks
-    # all thread stacks during mark_stacks; when the service-loop thread
-    # hits a safepoint while the Qt thread is mid-dealloc of a PySide
-    # wrapper, the walk races the dealloc and SIGSEGVs in mark_stacks.
-    # Freezing drastically shrinks the scan set to only newly-allocated
-    # containers, making the race effectively unreachable.  Refcount-
-    # based cleanup still runs normally.
+    # Python 3.14's incremental GC runs mark_stacks at any bytecode
+    # safepoint on any thread.  When the service-loop thread triggers a
+    # collection while the Qt thread is mid-dealloc of a PySide wrapper,
+    # the stack walk races the dealloc and SIGSEGVs in mark_stacks.
+    # Mitigation: freeze all startup objects so they're never scanned,
+    # disable automatic GC entirely, and drive collection ourselves from
+    # a QTimer that only ever fires on the main thread.  With automatic
+    # GC off, mark_stacks can never run on the service-loop thread, so
+    # the cross-thread race becomes unreachable.  Refcount cleanup is
+    # unaffected.
     gc.freeze()
+    gc.disable()
+    gc_timer = QTimer()
+    gc_timer.setInterval(60 * 1000)
+    gc_timer.timeout.connect(lambda: gc.collect())
+    gc_timer.start()
 
     sys.exit(app.exec())
 
