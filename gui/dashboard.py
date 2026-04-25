@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.transfer_engine import TransferStats
-from gui.styles import BTN_START, BTN_STOP, BTN_DOWNLOAD_SELECTED
+from gui.styles import BTN_START, BTN_STOP, BTN_DOWNLOAD_SELECTED, BTN_BLUE
 
 _default_sound_path: str | None = None
 _sad_sound_path: str | None = None
@@ -231,8 +231,22 @@ class SourceDashboard(QWidget):
         self.btn_download_selected.clicked.connect(
             self._on_download_selected_clicked)
 
+        self.btn_select_all = QPushButton("  Select All  ")
+        self.btn_select_all.setStyleSheet(BTN_BLUE)
+        self.btn_select_all.setVisible(False)
+        self.btn_select_all.clicked.connect(
+            lambda: self._set_all_series_checked(True))
+
+        self.btn_deselect_all = QPushButton("  Deselect All  ")
+        self.btn_deselect_all.setStyleSheet(BTN_BLUE)
+        self.btn_deselect_all.setVisible(False)
+        self.btn_deselect_all.clicked.connect(
+            lambda: self._set_all_series_checked(False))
+
         btn_layout.addWidget(self.btn_start)
         btn_layout.addWidget(self.btn_stop)
+        btn_layout.addWidget(self.btn_select_all)
+        btn_layout.addWidget(self.btn_deselect_all)
         btn_layout.addWidget(self.btn_download_selected)
         ctrl_layout.addLayout(btn_layout)
 
@@ -553,6 +567,8 @@ class SourceDashboard(QWidget):
             self.restart_banner.setVisible(False)
             self.lbl_status.setText("Stopped")
             self.btn_download_selected.setVisible(False)
+            self.btn_select_all.setVisible(False)
+            self.btn_deselect_all.setVisible(False)
             self.series_table.setColumnHidden(0, True)
 
     # ── ETE calculation ───────────────────────────────────────────────────
@@ -600,6 +616,8 @@ class SourceDashboard(QWidget):
         self._last_queue = queue
         # Hide selection UI — engine is now downloading or idle
         self.btn_download_selected.setVisible(False)
+        self.btn_select_all.setVisible(False)
+        self.btn_deselect_all.setVisible(False)
         self.series_table.setColumnHidden(0, True)
 
         rate = self._get_rate()
@@ -720,8 +738,18 @@ class SourceDashboard(QWidget):
         self.lbl_status.setText(
             f"Awaiting selection — {len(queue)} series found")
         self.btn_download_selected.setVisible(True)
+        self.btn_select_all.setVisible(True)
+        self.btn_deselect_all.setVisible(True)
         # Allow checking/unchecking in the table
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+    def _set_all_series_checked(self, checked: bool):
+        """Check or uncheck every row of the selection table."""
+        state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(self.series_table.rowCount()):
+            cb_item = self.series_table.item(row, 0)
+            if cb_item is not None:
+                cb_item.setCheckState(state)
 
     def _on_download_selected_clicked(self):
         """Collect checked series UIDs and confirm selection to the engine."""

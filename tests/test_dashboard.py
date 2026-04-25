@@ -1397,3 +1397,74 @@ class TestSoundPerStudyNotPerSeries:
         mock_play.assert_not_called()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Selection-mode Select All / Deselect All buttons
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSelectionModeToggleAll:
+    """In manual-selection mode the user gets a checkbox per series.
+    The Select All and Deselect All buttons toggle every checkbox at once."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def _make_job_dict(self, series_uid: str):
+        return {
+            "patient_name": "Doe^John", "patient_id": "1",
+            "study_description": "CT Head", "series_description": "Axial",
+            "modality": "CT", "series_number": "1",
+            "study_uid": "1.2.3", "series_uid": series_uid,
+            "remote_count": 100, "local_count": 0, "status": "queued",
+            "institution_name": "Hospital", "images_per_minute": 0.0,
+            "study_date": "", "study_time": "",
+        }
+
+    def _queue(self, n: int):
+        return [self._make_job_dict(f"1.{i}") for i in range(n)]
+
+    def test_buttons_hidden_by_default(self):
+        assert not self.dashboard.btn_select_all.isVisible()
+        assert not self.dashboard.btn_deselect_all.isVisible()
+
+    def test_buttons_visible_in_selection_mode(self):
+        self.dashboard.show()
+        self.dashboard.on_queue_ready_for_selection(self._queue(3))
+        assert self.dashboard.btn_select_all.isVisible()
+        assert self.dashboard.btn_deselect_all.isVisible()
+
+    def test_buttons_hidden_when_queue_updated_after_selection(self):
+        self.dashboard.show()
+        self.dashboard.on_queue_ready_for_selection(self._queue(3))
+        self.dashboard.on_queue_updated(self._queue(3))
+        assert not self.dashboard.btn_select_all.isVisible()
+        assert not self.dashboard.btn_deselect_all.isVisible()
+
+    def test_deselect_all_unchecks_every_row(self):
+        self.dashboard.on_queue_ready_for_selection(self._queue(3))
+        # All rows start checked per on_queue_ready_for_selection
+        self.dashboard._set_all_series_checked(False)
+        for row in range(self.dashboard.series_table.rowCount()):
+            cb = self.dashboard.series_table.item(row, 0)
+            assert cb.checkState() == Qt.Unchecked
+
+    def test_select_all_checks_every_row(self):
+        self.dashboard.on_queue_ready_for_selection(self._queue(3))
+        # Start by clearing them
+        self.dashboard._set_all_series_checked(False)
+        self.dashboard._set_all_series_checked(True)
+        for row in range(self.dashboard.series_table.rowCount()):
+            cb = self.dashboard.series_table.item(row, 0)
+            assert cb.checkState() == Qt.Checked
+
+    def test_select_all_after_partial_user_selection(self):
+        self.dashboard.on_queue_ready_for_selection(self._queue(3))
+        # User manually unchecked the middle one
+        self.dashboard.series_table.item(1, 0).setCheckState(Qt.Unchecked)
+        self.dashboard._set_all_series_checked(True)
+        for row in range(3):
+            cb = self.dashboard.series_table.item(row, 0)
+            assert cb.checkState() == Qt.Checked
+
+
