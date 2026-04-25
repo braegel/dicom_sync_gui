@@ -78,7 +78,7 @@ class TestMainWindowInit:
                       study_description="MR", study_time="090000",
                       institution_name="H"),
         ]
-        engine._study_wall_clock = {"S1": 30.0}
+        engine.pop_study_wall_clock.return_value = 30.0
 
         with patch.object(
                 self.win.completions_window, "add_completion") as mock_add:

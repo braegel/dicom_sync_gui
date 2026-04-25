@@ -6,24 +6,32 @@ Used as fallback when no external DICOM server is available.
 import logging
 import os
 import threading
-import time
-from typing import Callable, Optional
+from typing import Optional
 
+from PySide6.QtCore import QObject, Signal
+
+from pydicom import Dataset
 from pynetdicom import AE, evt, StoragePresentationContexts
 from pynetdicom.sop_class import Verification
 
 logger = logging.getLogger("dicom_sync")
 
 
-class StorageSCP:
-    """Built-in DICOM Storage SCP."""
+class StorageSCP(QObject):
+    """Built-in DICOM Storage SCP.
 
-    def __init__(self, ae_title: str, port: int, storage_path: str,
-                 on_image_received: Optional[Callable] = None):
+    `image_received` is emitted from the pynetdicom reactor thread
+    after each successful C-STORE.  Qt marshals the signal to the
+    main thread when the connection uses the default
+    Qt.AutoConnection, so slots can safely touch widgets."""
+
+    image_received = Signal(Dataset)
+
+    def __init__(self, ae_title: str, port: int, storage_path: str):
+        super().__init__()
         self.ae_title = ae_title
         self.port = port
         self.storage_path = storage_path
-        self.on_image_received = on_image_received
         self.ae = None
         self.running = False
         self._lock = threading.Lock()
@@ -45,8 +53,7 @@ class StorageSCP:
             ds.save_as(filepath, write_like_original=False)
             with self._lock:
                 self._images_received += 1
-            if self.on_image_received:
-                self.on_image_received(ds)
+            self.image_received.emit(ds)
             return 0x0000
         except Exception as e:
             logger.error(f"Store failed: {e}")

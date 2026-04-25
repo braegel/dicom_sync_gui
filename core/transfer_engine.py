@@ -249,6 +249,7 @@ class TransferEngine:
         self._transfer_log = TransferLog(default_db_path())
         self._series_start_times: Dict[str, float] = {}  # study_uid → first series start
         self._study_wall_clock: Dict[str, float] = {}  # study_uid → wall-clock seconds, populated at completion
+        self._study_wall_clock_lock = threading.Lock()
         self._study_total_series: Dict[str, int] = {}  # study_uid → total series on remote
         self._dicom_ops: Optional[DicomOperations] = None
 
@@ -259,6 +260,15 @@ class TransferEngine:
     @property
     def _remote_node(self):
         return self.config.remote_nodes[self.remote_key]
+
+    def pop_study_wall_clock(self, study_uid: str) -> Optional[float]:
+        """Thread-safe pop of the wall-clock duration for a completed study.
+
+        The service-loop thread writes this dict when a study completes;
+        the GUI thread reads it in the completion handler.  Holding the
+        lock for the pop makes the read/remove atomic."""
+        with self._study_wall_clock_lock:
+            return self._study_wall_clock.pop(study_uid, None)
 
     # -- public API ----------------------------------------------------------
 
@@ -337,12 +347,6 @@ class TransferEngine:
         """Query the source PACS, build queue, transfer everything."""
         self._completed_patients.clear()
         self._completed_studies.clear()
-        now = datetime.now()
-        cutoff = now - timedelta(hours=hours)
-        yesterday = now - timedelta(days=1)
-        date_range = f"{yesterday.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
-
-        seen_series: Set[str] = set()
 
         # Reuse a single DicomOperations (= one pynetdicom AE) for the
         # lifetime of the engine.  Each AE spawns reactor threads that
@@ -352,10 +356,33 @@ class TransferEngine:
             self._dicom_ops = self._make_dicom_ops()
         dicom_ops = self._dicom_ops
 
+        jobs = self._query_and_build_queue(hours, max_images, dicom_ops)
+        if not jobs:
+            return 0
+
+        if self._selection_mode:
+            jobs = self._await_user_selection(jobs)
+            if not jobs:
+                return 0
+
+        self._queue = jobs
+        self.signals.queue_updated.emit([j.to_dict() for j in jobs])
+        self._log(f"[{self.remote_key}] Queue: {len(jobs)} series to download")
+
+        return self._transfer_queue(jobs, dicom_ops)
+
+    def _query_and_build_queue(self, hours: int, max_images: int,
+                               dicom_ops: DicomOperations) -> List[SeriesJob]:
+        """Run the C-FIND pass and produce the list of series to transfer."""
+        now = datetime.now()
+        cutoff = now - timedelta(hours=hours)
+        yesterday = now - timedelta(days=1)
+        date_range = f"{yesterday.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
+        seen_series: Set[str] = set()
+
         try:
             jobs = self._query_source(
-                date_range, cutoff, max_images, seen_series,
-                dicom_ops)
+                date_range, cutoff, max_images, seen_series, dicom_ops)
         except Exception as e:
             self._log(f"  [{self.remote_key}] Error querying: {e}")
             jobs = []
@@ -363,36 +390,34 @@ class TransferEngine:
         if not jobs:
             self._queue = []
             self.signals.queue_updated.emit([])
-            return 0
+        return jobs
 
-        if self._selection_mode:
-            self._selection_event.clear()
-            self.signals.queue_ready_for_selection.emit(
-                [j.to_dict() for j in jobs])
-            # Block until user confirms selection or service is cancelled
-            while not self._cancel.is_set():
-                if self._selection_event.wait(timeout=1.0):
-                    break
-            if self._cancel.is_set():
-                return 0
-            jobs = [j for j in jobs if j.series_uid in self._selected_uids]
-            if not jobs:
-                self._queue = []
-                self.signals.queue_updated.emit([])
-                return 0
+    def _await_user_selection(
+            self, jobs: List[SeriesJob]) -> List[SeriesJob]:
+        """Pause for manual selection; return the jobs the user kept."""
+        self._selection_event.clear()
+        self.signals.queue_ready_for_selection.emit(
+            [j.to_dict() for j in jobs])
+        while not self._cancel.is_set():
+            if self._selection_event.wait(timeout=1.0):
+                break
+        if self._cancel.is_set():
+            return []
+        jobs = [j for j in jobs if j.series_uid in self._selected_uids]
+        if not jobs:
+            self._queue = []
+            self.signals.queue_updated.emit([])
+        return jobs
 
-        self._queue = jobs
-        self.signals.queue_updated.emit([j.to_dict() for j in jobs])
-        self._log(f"[{self.remote_key}] Queue: {len(jobs)} series to download")
-
-        # Transfer all queued series
+    def _transfer_queue(self, jobs: List[SeriesJob],
+                        dicom_ops: DicomOperations) -> int:
+        """Transfer every job in the queue; return total images moved."""
         total_images = 0
         for job in jobs:
             if self._cancel.is_set():
                 break
             total_images += self._transfer_series(job, dicom_ops)
             self.signals.queue_updated.emit([j.to_dict() for j in jobs])
-
         return total_images
 
     def _query_source(self, date_range: str, cutoff: datetime,
@@ -560,61 +585,76 @@ class TransferEngine:
         if self._cancel.is_set():
             job.status = "error"
             return 0
+
+        if dicom_ops is None:
+            if self._dicom_ops is None:
+                self._dicom_ops = self._make_dicom_ops()
+            dicom_ops = self._dicom_ops
+
+        success, images, t_elapsed, t_start = self._do_move(dicom_ops, job)
+        if success:
+            return self._record_success(job, images, t_elapsed, t_start,
+                                        to_transfer)
+        return self._record_failure(job)
+
+    def _do_move(self, dicom_ops: DicomOperations,
+                 job: SeriesJob) -> Tuple[bool, int, float, float]:
+        """Run the C-MOVE.  Returns (success, images, elapsed, t_start)."""
+        t_start = time.time()
         try:
-            if dicom_ops is None:
-                if self._dicom_ops is None:
-                    self._dicom_ops = self._make_dicom_ops()
-                dicom_ops = self._dicom_ops
-            ops = dicom_ops
-            t_start = time.time()
-            success, images = ops.c_move_series(job.study_uid, job.series_uid)
-            t_elapsed = time.time() - t_start
-            if success:
-                images = max(images, to_transfer)
-                self.stats.record_series(
-                    job.series_uid, images, t_elapsed)
-                ipm = (images / t_elapsed) * 60 if t_elapsed > 0 else 0.0
-                job.images_per_minute = ipm
-                job.transferred_images = images
-                job.duration_seconds = t_elapsed
-                job.status = "done"
-                # Track wall-clock start for this study
-                if job.study_uid not in self._series_start_times:
-                    self._series_start_times[job.study_uid] = t_start
-                # Log to SQLite
-                try:
-                    self._transfer_log.record_series(
-                        source_pacs=self.remote_key,
-                        study_uid=job.study_uid,
-                        series_uid=job.series_uid,
-                        patient_id=job.patient_id,
-                        accession_number=job.accession_number,
-                        study_date=job.study_date,
-                        study_time=job.study_time,
-                        modality=job.modality,
-                        study_description=job.study_description,
-                        series_description=job.series_description,
-                        series_number=job.series_number,
-                        image_count=images,
-                        duration_seconds=t_elapsed,
-                    )
-                except Exception as e:
-                    logger.warning(f"TransferLog.record_series failed: {e}")
-                try:
-                    self._transfer_log.clear_series_failures(
-                        source_pacs=self.remote_key,
-                        series_uid=job.series_uid)
-                except Exception as e:
-                    logger.warning(
-                        f"TransferLog.clear_series_failures failed: {e}")
-                self.signals.series_completed.emit(job.series_uid, images)
-                self.signals.stats_updated.emit(self.stats)
-                self._check_study_complete(job.study_uid)
-                self._check_patient_complete(job.patient_id)
-                return images
+            success, images = dicom_ops.c_move_series(
+                job.study_uid, job.series_uid)
         except Exception as e:
             self._log(f"  [{self.remote_key}] C-MOVE failed: {e}")
+            return False, 0, time.time() - t_start, t_start
+        return success, images, time.time() - t_start, t_start
 
+    def _record_success(self, job: SeriesJob, images: int,
+                        t_elapsed: float, t_start: float,
+                        to_transfer: int) -> int:
+        """Update stats, persist, and emit completion signals."""
+        images = max(images, to_transfer)
+        self.stats.record_series(job.series_uid, images, t_elapsed)
+        ipm = (images / t_elapsed) * 60 if t_elapsed > 0 else 0.0
+        job.images_per_minute = ipm
+        job.transferred_images = images
+        job.duration_seconds = t_elapsed
+        job.status = "done"
+        if job.study_uid not in self._series_start_times:
+            self._series_start_times[job.study_uid] = t_start
+        try:
+            self._transfer_log.record_series(
+                source_pacs=self.remote_key,
+                study_uid=job.study_uid,
+                series_uid=job.series_uid,
+                patient_id=job.patient_id,
+                accession_number=job.accession_number,
+                study_date=job.study_date,
+                study_time=job.study_time,
+                modality=job.modality,
+                study_description=job.study_description,
+                series_description=job.series_description,
+                series_number=job.series_number,
+                image_count=images,
+                duration_seconds=t_elapsed,
+            )
+        except Exception as e:
+            logger.warning(f"TransferLog.record_series failed: {e}")
+        try:
+            self._transfer_log.clear_series_failures(
+                source_pacs=self.remote_key,
+                series_uid=job.series_uid)
+        except Exception as e:
+            logger.warning(
+                f"TransferLog.clear_series_failures failed: {e}")
+        self.signals.series_completed.emit(job.series_uid, images)
+        self.signals.stats_updated.emit(self.stats)
+        self._check_study_complete(job.study_uid)
+        self._check_patient_complete(job.patient_id)
+        return images
+
+    def _record_failure(self, job: SeriesJob) -> int:
+        """Mark the job as errored, persist the failure, and emit."""
         job.status = "error"
         try:
             self._transfer_log.record_series_failure(
@@ -666,7 +706,8 @@ class TransferEngine:
                 except Exception as e:
                     logger.warning(f"TransferLog.record_study failed: {e}")
                 self._series_start_times.pop(study_uid, None)
-                self._study_wall_clock[study_uid] = wall_clock
+                with self._study_wall_clock_lock:
+                    self._study_wall_clock[study_uid] = wall_clock
             # fully_complete = all remote series were queued and done
             total_remote = self._study_total_series.pop(study_uid, 0)
             done_count = len([j for j in study_series

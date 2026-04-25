@@ -280,7 +280,7 @@ class MainWindow(QMainWindow):
         if not study_jobs:
             return
         first = study_jobs[0]
-        wall_clock = engine._study_wall_clock.pop(study_uid, None)
+        wall_clock = engine.pop_study_wall_clock(study_uid)
         total_images = sum(j.transferred_images for j in study_jobs)
         self.completions_window.add_completion(
             patient_name=first.patient_name,
