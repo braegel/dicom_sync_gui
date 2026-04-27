@@ -14,8 +14,8 @@ no Python installation required.
 
 | File | Architecture | Size |
 |---|---|---|
-| [`DICOM_Sync_1.0.6_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.6/DICOM_Sync_1.0.6_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~56 MB |
-| [`DICOM_Sync_1.0.6_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.6/DICOM_Sync_1.0.6_macOS_x86_64.dmg) | Intel | ~59 MB |
+| [`DICOM_Sync_1.0.7_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.7/DICOM_Sync_1.0.7_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~56 MB |
+| [`DICOM_Sync_1.0.7_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.7/DICOM_Sync_1.0.7_macOS_x86_64.dmg) | Intel | ~59 MB |
 
 **Installation:**
 
@@ -297,7 +297,7 @@ cp -R "dist/DICOM Sync.app" "/tmp/dmg_stage/DICOM Sync.app"
 ln -s /Applications "/tmp/dmg_stage/Applications"
 hdiutil create -volname "DICOM Sync" \
   -srcfolder /tmp/dmg_stage -ov -format UDZO \
-  releases/DICOM_Sync_1.0.6_macOS_arm64.dmg
+  releases/DICOM_Sync_1.0.7_macOS_arm64.dmg
 rm -rf /tmp/dmg_stage
 ```
 
@@ -311,7 +311,7 @@ rm -rf /tmp/dmg_stage
 ```
 dicom_sync_gui/
 ├── main.py                         # Entry point, dark theme, dependency check
-├── __init__.py                     # Package version (1.0.6)
+├── __init__.py                     # Package version (1.0.7)
 ├── __main__.py                     # python -m support
 ├── requirements.txt                # pip dependencies
 ├── dicom_sync.spec                 # PyInstaller build spec
@@ -325,7 +325,7 @@ dicom_sync_gui/
 │   └── AppIcon.icns                # macOS application icon
 │
 ├── releases/
-│   └── DICOM_Sync_1.0.6_macOS_*.dmg   # Standalone macOS app
+│   └── DICOM_Sync_1.0.7_macOS_*.dmg   # Standalone macOS app
 │
 ├── core/
 │   ├── config.py                   # AppConfig, PacsNode, load/save
