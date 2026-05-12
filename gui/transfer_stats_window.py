@@ -40,11 +40,22 @@ class TransferStatsWindow(QWidget):
     def __init__(self, db_path: str, parent=None):
         super().__init__(parent)
         self._db_path = db_path
+        # Open one TransferLog for the window's lifetime instead of
+        # re-creating (with the three CREATE TABLE IF NOT EXISTS round
+        # trips) on every filter change.
+        self._log = TransferLog(db_path)
         self.setWindowTitle("Transfer Performance Statistics")
         self.setWindowFlags(Qt.Window)
         self.setMinimumSize(800, 500)
         self._setup_ui()
         self._refresh()
+
+    def closeEvent(self, event):
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -159,9 +170,7 @@ class TransferStatsWindow(QWidget):
         self._refresh()
 
     def _rebuild_filters(self):
-        log = TransferLog(self._db_path)
-        all_series = log.query_series()
-        log.close()
+        all_series = self._log.query_series()
 
         sources = sorted({r["source_pacs"] for r in all_series})
         modalities = sorted({r["modality"] for r in all_series})
@@ -192,11 +201,9 @@ class TransferStatsWindow(QWidget):
         self.filter_modality.blockSignals(False)
 
     def _refresh(self):
-        log = TransferLog(self._db_path)
-
         # Build filter lists on first load or refresh
         if self.filter_source.count() == 0:
-            all_series = log.query_series()
+            all_series = self._log.query_series()
             sources = sorted({r["source_pacs"] for r in all_series})
             modalities = sorted({r["modality"] for r in all_series})
             self.filter_source.blockSignals(True)
@@ -215,9 +222,8 @@ class TransferStatsWindow(QWidget):
         if modality:
             kw["modality"] = modality
 
-        series = log.query_series(**kw)
-        studies = log.query_studies(**kw)
-        log.close()
+        series = self._log.query_series(**kw)
+        studies = self._log.query_studies(**kw)
 
         self._update_summary(series, studies)
         self._update_boxplot(series)

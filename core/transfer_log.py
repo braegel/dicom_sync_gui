@@ -107,7 +107,9 @@ CREATE TABLE IF NOT EXISTS study_transfer (
 class TransferLog:
 
     def __init__(self, db_path: str):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        parent_dir = os.path.dirname(db_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -243,6 +245,40 @@ class TransferLog:
                            date_to=date_to, source_pacs=source_pacs,
                            modality=modality, patient_id=patient_id,
                            accession_number=accession_number)
+
+    def mbps_stats(self) -> Optional[Dict[str, float]]:
+        """Return ``{count, mean, stddev, median}`` over all series rows
+        with ``estimated_mbps > 0``, or ``None`` if there are < 2 rows.
+
+        Computes mean/stddev in SQL so the dialog doesn't drag the full
+        series table into Python on every search.  Median uses an
+        ordered cursor over the same filter so it's still one connection.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, "
+                "AVG(estimated_mbps) AS avg, "
+                "AVG(estimated_mbps * estimated_mbps) AS avg_sq "
+                "FROM series_transfer "
+                "WHERE estimated_mbps > 0").fetchone()
+            if not row or row["n"] is None or row["n"] < 2:
+                return None
+            n = int(row["n"])
+            mean = float(row["avg"])
+            var = max(float(row["avg_sq"]) - mean * mean, 0.0)
+            stddev = var ** 0.5
+            # Median: stream the ordered values, pick the middle.
+            cur = self._conn.execute(
+                "SELECT estimated_mbps FROM series_transfer "
+                "WHERE estimated_mbps > 0 ORDER BY estimated_mbps")
+            mid = n // 2
+            median = 0.0
+            for i, r in enumerate(cur):
+                if i == mid:
+                    median = float(r[0])
+                    break
+        return {"count": n, "mean": mean, "stddev": stddev,
+                "median": median}
 
     def _query(self, table: str, *, date_from, date_to, source_pacs,
                modality, patient_id, accession_number) -> List[dict]:

@@ -153,6 +153,10 @@ class AppConfig:
         self._legacy_local_node: Optional[Dict[str, Any]] = None
         self._legacy_fallback_enabled: bool = False
         self._legacy_fallback_path: str = ""
+        # Raw on-disk dict, captured at load() time.  Unknown keys are
+        # round-tripped on save() so a newer-version field written by a
+        # future build is not silently lost when this version saves.
+        self._raw_data: Dict[str, Any] = {}
 
     @staticmethod
     def _default_config_path() -> str:
@@ -175,6 +179,7 @@ class AppConfig:
         try:
             with open(self.config_path, "r") as f:
                 data = json.load(f)
+            self._raw_data = dict(data)
 
             self.remote_nodes = {}
             for key, val in data.get("remotes", {}).items():
@@ -242,9 +247,18 @@ class AppConfig:
             return False
 
     def save(self):
-        """Save configuration to file."""
+        """Save configuration to file atomically.
+
+        Writes to a sibling ``.tmp`` file and ``os.replace``s it onto the
+        real path so a crash mid-write cannot leave the user with a
+        truncated config (which would otherwise re-trigger the
+        initial-setup wizard on next launch)."""
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-        data = {
+        # Start from the raw on-disk dict so unknown keys (e.g. settings
+        # added by a future build) round-trip instead of being silently
+        # dropped on save.
+        data = dict(self._raw_data)
+        data.update({
             "remotes": {k: v.to_dict() for k, v in self.remote_nodes.items()},
             "prior_studies_count": self.prior_studies_count,
             "prior_studies_same_modality": self.prior_studies_same_modality,
@@ -260,9 +274,13 @@ class AppConfig:
             "default_hours": self.default_hours,
             "max_images": self.max_images,
             "sync_interval": self.sync_interval,
-        }
-        with open(self.config_path, "w") as f:
+        })
+        tmp_path = self.config_path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.config_path)
 
     def get_remote_names(self) -> List[str]:
         return list(self.remote_nodes.keys())

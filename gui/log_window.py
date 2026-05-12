@@ -63,7 +63,7 @@ class LogWindow(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Log", "dicom_sync.log", "Text Files (*.log *.txt)")
         if path:
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(self.log_text.toPlainText())
 
     def _update_line_count(self):

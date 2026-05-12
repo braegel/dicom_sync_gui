@@ -14,13 +14,14 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox,
     QTabWidget, QLabel, QApplication,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QFont
 
 from core.config import AppConfig
 from core.dicom_ops import DicomOperations
 from core.storage_scp import StorageSCP
 from core.transfer_engine import TransferEngine
+from core.transfer_log import TransferLog, default_db_path
 from gui.settings_dialog import SettingsDialog
 from gui.dashboard import SourceDashboard
 from gui.log_window import LogWindow
@@ -38,6 +39,7 @@ class MainWindow(QMainWindow):
 
     _echo_results_ready = Signal(list)
     _scp_check_done = Signal(str, bool, dict)
+    _log_message = Signal(str)
 
     def __init__(self, config: AppConfig):
         super().__init__()
@@ -49,6 +51,11 @@ class MainWindow(QMainWindow):
         self.dashboards: Dict[str, SourceDashboard] = {}
         # Pending start params keyed by remote_key (supports concurrent starts)
         self._pending_start_params: Dict[str, dict] = {}
+        # Single shared TransferLog so per-instance write locks actually
+        # serialize writers across sources (separate instances would each
+        # carry their own lock and could interleave commits).
+        self._transfer_log = TransferLog(default_db_path())
+        self._stats_window: Optional[TransferStatsWindow] = None
 
         self.setWindowTitle("DICOM Sync")
         self.setMinimumSize(1000, 750)
@@ -59,6 +66,23 @@ class MainWindow(QMainWindow):
         self._setup_statusbar()
         self._echo_results_ready.connect(self._on_echo_results)
         self._scp_check_done.connect(self._on_scp_check_done)
+        # Queue log lines through this signal so direct callers from
+        # any thread are marshalled onto the GUI thread.
+        self._log_message.connect(self._append_log)
+
+        # Pre-generate notification WAVs after the event loop is up so
+        # the first study completion doesn't pay the ~30k-sample DSP
+        # cost synchronously on the GUI thread.
+        QTimer.singleShot(0, self._prewarm_sounds)
+
+    @staticmethod
+    def _prewarm_sounds():
+        try:
+            from gui.dashboard import _generate_default_sound
+            _generate_default_sound(sad=False)
+            _generate_default_sound(sad=True)
+        except Exception as e:
+            logger.debug(f"Notification prewarm failed: {e}")
 
     # ── Menu ──────────────────────────────────────────────────────────────
 
@@ -190,12 +214,15 @@ class MainWindow(QMainWindow):
         self._echo_action.setEnabled(False)
         self.statusBar().showMessage("C-ECHO test running...")
 
+        def echo_one(key: str, node, target: str) -> bool:
+            local_config = self.config.get_local_dict_for(key)
+            ops = DicomOperations(local_config, node.to_dict(), key)
+            return ops.c_echo(target=target)
+
         def run_echo():
             results = []
             for key, node in self.config.remote_nodes.items():
-                local_config = self.config.get_local_dict_for(key)
-                ops = DicomOperations(local_config, node.to_dict(), key)
-                ok = ops.c_echo(target='remote')
+                ok = echo_one(key, node, target='remote')
                 results.append(
                     f"  {key} ({node.name}): "
                     f"{'Reachable' if ok else 'Not reachable'}")
@@ -206,9 +233,7 @@ class MainWindow(QMainWindow):
                 if local_key in tested_locals:
                     continue
                 tested_locals.add(local_key)
-                local_config = self.config.get_local_dict_for(key)
-                ops = DicomOperations(local_config, node.to_dict(), key)
-                local_ok = ops.c_echo(target='local')
+                local_ok = echo_one(key, node, target='local')
                 results.append(
                     f"\n  Local [{node.local_ae_title}:{node.local_port}]: "
                     f"{'Reachable' if local_ok else 'Not reachable'}")
@@ -229,15 +254,13 @@ class MainWindow(QMainWindow):
     # ── Log ───────────────────────────────────────────────────────────────
 
     def _open_transfer_stats(self):
-        from core.transfer_log import default_db_path
-        if not hasattr(self, '_stats_window') or self._stats_window is None:
+        if self._stats_window is None:
             self._stats_window = TransferStatsWindow(default_db_path(), self)
         self._stats_window.show()
         self._stats_window.raise_()
         self._stats_window.activateWindow()
 
     def _open_examination_lookup(self):
-        from core.transfer_log import default_db_path
         dlg = ExaminationLookupDialog(default_db_path(), self)
         dlg.exec()
 
@@ -259,10 +282,7 @@ class MainWindow(QMainWindow):
         for engine in self.engines.values():
             if not engine.is_running:
                 continue
-            # Snapshot the queue reference so we iterate a stable list
-            # even if the service-loop thread reassigns engine._queue.
-            queue = engine._queue
-            for job in queue:
+            for job in engine.queue_snapshot():
                 if job.status not in ("done", "error", "skipped"):
                     total_pending += job.to_transfer
             total_ipm += engine.stats.raw_images_per_minute()
@@ -274,8 +294,7 @@ class MainWindow(QMainWindow):
         """Add a completion entry to the live completions window."""
         if not fully_complete:
             return
-        queue = engine._queue
-        study_jobs = [j for j in queue
+        study_jobs = [j for j in engine.queue_snapshot()
                        if j.study_uid == study_uid and j.status == "done"]
         if not study_jobs:
             return
@@ -293,10 +312,15 @@ class MainWindow(QMainWindow):
         )
 
     def _log(self, msg: str):
+        """Log a message.  Safe to call from any thread — routed via
+        the ``_log_message`` signal so the GUI work happens on the GUI
+        thread.  Does NOT touch the status bar; lifecycle handlers
+        update it explicitly."""
+        self._log_message.emit(msg)
+
+    def _append_log(self, msg: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {msg}"
-        self.log_window.append_log(line)
-        self.statusBar().showMessage(msg)
+        self.log_window.append_log(f"[{timestamp}] {msg}")
 
     # ── Service Start / Stop (per source) ─────────────────────────────────
 
@@ -320,7 +344,8 @@ class MainWindow(QMainWindow):
         if not dashboard:
             return
 
-        engine = TransferEngine(self.config, remote_key)
+        engine = TransferEngine(
+            self.config, remote_key, transfer_log=self._transfer_log)
         self.engines[remote_key] = engine
         self._connect_engine_signals(remote_key, engine, dashboard)
 
@@ -496,15 +521,34 @@ class MainWindow(QMainWindow):
             # Daemon threads would otherwise be killed mid-stream.
             self.statusBar().showMessage(
                 "Waiting for current downloads to finish...")
-            QApplication.processEvents()
-            for engine in self.engines.values():
-                thread = getattr(engine, "_thread", None)
-                if thread is not None and thread.is_alive():
-                    thread.join(timeout=30)
+            self._join_engines_responsive(total_timeout=30)
 
         for scp in self.storage_scps.values():
             if scp.running:
                 scp.stop()
 
+        # Flush any debounced config writes the dashboards have queued
+        # so closing the app never drops in-flight settings changes.
+        for dashboard in self.dashboards.values():
+            dashboard.flush_pending_save()
+
         self.log_window.close()
         event.accept()
+
+    def _join_engines_responsive(self, total_timeout: float):
+        """Wait up to *total_timeout* seconds per engine while keeping the
+        Qt event loop pumping so the status bar/window stays responsive.
+
+        Calls ``thread.join(timeout=…)`` in short slices and processes
+        pending Qt events between slices instead of a single 30-second
+        blocking join per engine."""
+        import time
+        for engine in self.engines.values():
+            thread = getattr(engine, "_thread", None)
+            if thread is None or not thread.is_alive():
+                continue
+            end = time.monotonic() + total_timeout
+            while thread.is_alive() and time.monotonic() < end:
+                remaining = max(0.0, end - time.monotonic())
+                thread.join(timeout=min(0.1, remaining))
+                QApplication.processEvents()

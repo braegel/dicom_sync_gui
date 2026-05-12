@@ -27,18 +27,37 @@ class StorageSCP(QObject):
 
     image_received = Signal(Dataset)
 
-    def __init__(self, ae_title: str, port: int, storage_path: str):
+    def __init__(self, ae_title: str, port: int, storage_path: str,
+                 bind_address: str = "0.0.0.0"):
         super().__init__()
         self.ae_title = ae_title
         self.port = port
+        self.bind_address = bind_address
         self.storage_path = storage_path
         self.ae = None
-        self.running = False
-        self._lock = threading.Lock()
+        # ``_running_flag`` is read/written from both the reactor thread
+        # and the caller (GUI) thread; access goes through ``_run_lock``
+        # so ``stop()`` cannot observe a stale True after the reactor
+        # has already set it False and torn the AE down.
+        self._running_flag = False
+        self._run_lock = threading.Lock()
+        self._lock = threading.Lock()  # protects _images_received
         self._images_received = 0
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         os.makedirs(storage_path, exist_ok=True)
+
+    @property
+    def running(self) -> bool:
+        with self._run_lock:
+            return self._running_flag
+
+    @running.setter
+    def running(self, value: bool):
+        # Setter kept so existing test mocks that assign ``.running``
+        # continue to work; thread-safety only matters on real instances.
+        with self._run_lock:
+            self._running_flag = bool(value)
 
     @property
     def images_received(self) -> int:
@@ -60,8 +79,11 @@ class StorageSCP(QObject):
             return 0xC000
 
     def start(self):
-        if self.running:
-            return
+        # Compare-and-set under the lock so two callers can't both start.
+        with self._run_lock:
+            if self._running_flag:
+                return
+            self._running_flag = True
         self.ae = AE(ae_title=self.ae_title)
         self.ae.supported_contexts = StoragePresentationContexts
         self.ae.add_supported_context(Verification)
@@ -69,15 +91,15 @@ class StorageSCP(QObject):
 
         def run():
             try:
-                self.running = True
                 self._ready.set()
                 self.ae.start_server(
-                    ('0.0.0.0', self.port), block=True,
+                    (self.bind_address, self.port), block=True,
                     evt_handlers=[(evt.EVT_C_STORE, self.handle_store)])
             except Exception as e:
                 logger.error(f"SCP error: {e}")
             finally:
-                self.running = False
+                with self._run_lock:
+                    self._running_flag = False
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
@@ -85,9 +107,17 @@ class StorageSCP(QObject):
         logger.info(f"Storage SCP started on port {self.port}")
 
     def stop(self):
-        if self.ae and self.running:
+        # Atomically claim the shutdown so a concurrent stop() or the
+        # reactor's own finally clause cannot race us into calling
+        # ae.shutdown() twice on the same (already-torn-down) AE.
+        with self._run_lock:
+            if not self._running_flag or self.ae is None:
+                return
+            self._running_flag = False
+        try:
             self.ae.shutdown()
-            if self._thread:
-                self._thread.join(timeout=5.0)
-            self.running = False
-            logger.info("Storage SCP stopped")
+        except Exception as e:
+            logger.warning(f"SCP shutdown failed: {e}")
+        if self._thread:
+            self._thread.join(timeout=5.0)
+        logger.info("Storage SCP stopped")

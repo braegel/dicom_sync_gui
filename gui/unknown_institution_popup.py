@@ -14,21 +14,14 @@ from typing import List, Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QDialogButtonBox,
+    QComboBox,
 )
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
 from gui.styles import BTN_OK_BLUE
 
 logger = logging.getLogger("dicom_sync")
-
-# Try to import QSoundEffect for the alert sound
-try:
-    from PySide6.QtMultimedia import QSoundEffect
-    HAS_MULTIMEDIA = True
-except ImportError:
-    HAS_MULTIMEDIA = False
 
 
 def _play_alert():

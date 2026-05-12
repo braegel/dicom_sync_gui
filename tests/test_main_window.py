@@ -64,7 +64,7 @@ class TestMainWindowInit:
         all done series of the study and pass it to add_completion
         so the Images and img/min columns can be populated."""
         engine = MagicMock()
-        engine._queue = [
+        engine.queue_snapshot.return_value = [
             MagicMock(study_uid="S1", status="done",
                       transferred_images=200, patient_name="A",
                       study_description="CT", study_time="080000",
@@ -103,7 +103,7 @@ class TestMainWindowInit:
 
         eng1 = MagicMock()
         eng1.is_running = True
-        eng1._queue = [
+        eng1.queue_snapshot.return_value = [
             SeriesJob(series_uid="1", remote_count=200,
                       local_count=0, status="queued"),
             SeriesJob(series_uid="2", remote_count=100,
@@ -115,7 +115,7 @@ class TestMainWindowInit:
 
         eng2 = MagicMock()
         eng2.is_running = True
-        eng2._queue = [
+        eng2.queue_snapshot.return_value = [
             SeriesJob(series_uid="3", remote_count=300,
                       local_count=0, status="queued"),
         ]
@@ -257,7 +257,8 @@ class TestMainWindowService:
         self.win._on_start_service(
             "ct", {"hours": 6, "max_images": 500, "sync_interval": 120})
 
-        MockEngine.assert_called_once_with(self.config, "ct")
+        MockEngine.assert_called_once_with(
+            self.config, "ct", transfer_log=self.win._transfer_log)
         mock_engine.start.assert_called_once_with(
             hours=6, max_images=500, sync_interval=120,
             selection_mode=False)
@@ -526,16 +527,23 @@ class TestMainWindowClose:
     def test_close_waits_for_engine_thread(self, mock_question):
         """After Quit-Anyway, the engine thread must be join()ed so
         the in-flight C-MOVE can finish — otherwise the daemon thread
-        is killed mid-transfer and the SQLite log is inconsistent."""
+        is killed mid-transfer and the SQLite log is inconsistent.
+
+        The poll-join loop checks ``is_alive`` three times per engine
+        before terminating: outer guard, while-condition entry, and
+        while-condition recheck after the first join slice.  Report
+        alive twice then dead so the loop terminates after a single
+        join slice."""
         mock_engine = MagicMock()
         mock_engine.is_running = True
-        mock_engine._thread.is_alive.return_value = True
+        mock_engine._thread.is_alive.side_effect = [True, True, False]
         self.win.engines["ct"] = mock_engine
         event = MagicMock()
         self.win.closeEvent(event)
         mock_engine.stop.assert_called_once()
-        mock_engine._thread.join.assert_called_once()
-        # Sanity: a finite timeout was supplied (don't hang forever).
+        assert mock_engine._thread.join.called
+        # Sanity: a finite, positive timeout was supplied (don't hang
+        # forever).
         _, kwargs = mock_engine._thread.join.call_args
         assert "timeout" in kwargs and kwargs["timeout"] > 0
 

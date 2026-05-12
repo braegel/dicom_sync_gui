@@ -5,9 +5,7 @@ Abstracted from the original CLI script for GUI use.
 
 import logging
 import warnings
-from typing import Dict, List, Optional, Set, Tuple, Any
-
-warnings.filterwarnings('ignore', message='.*value length.*exceeds the maximum length.*VR UI.*')
+from typing import Dict, List, Tuple
 
 from pydicom import Dataset
 from pydicom.uid import (
@@ -83,7 +81,9 @@ class DicomOperations:
             if assoc.is_established:
                 try:
                     status = assoc.send_c_echo()
-                    return status and status.Status == 0x0000
+                    if status is None:
+                        return False
+                    return getattr(status, "Status", 0xFFFF) == 0x0000
                 finally:
                     assoc.release()
         except Exception as e:
@@ -186,10 +186,19 @@ class DicomOperations:
             assoc = self.ae.associate(config['ip_address'], config['port'],
                                      ae_title=config['ae_title'])
             if assoc.is_established:
-                for status, dataset in assoc.send_c_find(
-                        query_ds, StudyRootQueryRetrieveInformationModelFind):
-                    if status and status.Status in (0xFF00, 0xFF01) and dataset:
-                        results.append(dataset)
+                # Suppress pydicom's "VR UI value length exceeds maximum"
+                # warning that some PACS implementations trigger; scoped
+                # to the actual call site instead of process-wide.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        'ignore',
+                        message='.*value length.*exceeds the maximum length.*VR UI.*')
+                    for status, dataset in assoc.send_c_find(
+                            query_ds, StudyRootQueryRetrieveInformationModelFind):
+                        if status is None or dataset is None:
+                            continue
+                        if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
+                            results.append(dataset)
                 assoc.release()
         except Exception as e:
             logger.error(f"C-FIND error: {e}")
@@ -220,11 +229,14 @@ class DicomOperations:
             if assoc.is_established:
                 for status, _ in assoc.send_c_move(
                         query_ds, move_dest, StudyRootQueryRetrieveInformationModelMove):
-                    if status:
-                        if status.Status == 0x0000:
-                            success = True
-                        if hasattr(status, 'NumberOfCompletedSuboperations'):
-                            images = status.NumberOfCompletedSuboperations
+                    if status is None:
+                        continue
+                    if getattr(status, "Status", None) == 0x0000:
+                        success = True
+                    completed = getattr(
+                        status, 'NumberOfCompletedSuboperations', None)
+                    if completed is not None:
+                        images = completed
                 assoc.release()
         except Exception as e:
             logger.error(f"C-MOVE error: {e}")

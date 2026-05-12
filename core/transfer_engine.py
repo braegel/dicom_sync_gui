@@ -6,11 +6,12 @@ Emits Qt signals so the GUI can display queue and progress in real time.
 """
 
 import logging
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, Signal
 
@@ -89,7 +90,7 @@ class TransferStats:
     towards ``total_images`` but their transfer speed is too noisy to
     be meaningful.
     """
-    MIN_IMAGES_FOR_STATS: int = 10
+    MIN_IMAGES_FOR_STATS: ClassVar[int] = 10
 
     total_images: int = 0
     start_time: float = 0.0
@@ -231,7 +232,8 @@ class TransferEngine:
     Create one instance per configured source PACS node.
     """
 
-    def __init__(self, config: Any, remote_key: str):
+    def __init__(self, config: Any, remote_key: str,
+                 transfer_log: Optional[TransferLog] = None):
         self.config = config
         self.remote_key = remote_key
         self.signals = TransferSignals()
@@ -240,13 +242,19 @@ class TransferEngine:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._queue: List[SeriesJob] = []
+        # Guards whole-list reassignment vs. snapshot reads from the GUI
+        # thread.  Per-job attribute mutations (e.g. ``job.status``) remain
+        # unlocked; snapshot consumers must treat returned jobs as
+        # point-in-time views that may already be stale.
+        self._queue_lock = threading.Lock()
         self._notified_institutions: Set[str] = set()
         self._selection_mode = False
         self._selection_event = threading.Event()
         self._selected_uids: Set[str] = set()
         self._completed_patients: Set[str] = set()
         self._completed_studies: Set[str] = set()
-        self._transfer_log = TransferLog(default_db_path())
+        self._transfer_log = (transfer_log if transfer_log is not None
+                              else TransferLog(default_db_path()))
         self._series_start_times: Dict[str, float] = {}  # study_uid → first series start
         self._study_wall_clock: Dict[str, float] = {}  # study_uid → wall-clock seconds, populated at completion
         self._study_wall_clock_lock = threading.Lock()
@@ -260,6 +268,24 @@ class TransferEngine:
     @property
     def _remote_node(self):
         return self.config.remote_nodes[self.remote_key]
+
+    def queue_snapshot(self) -> List[SeriesJob]:
+        """Return a shallow copy of the current job queue.
+
+        Safe to call from any thread: the snapshot is taken under
+        ``_queue_lock`` so the returned list is not the same object the
+        service-loop thread reassigns.  SeriesJob instances inside are
+        shared, so caller must treat their fields as point-in-time."""
+        with self._queue_lock:
+            return list(self._queue)
+
+    def join(self, timeout: Optional[float] = None) -> bool:
+        """Join the service-loop thread.  Returns True if it finished."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def pop_study_wall_clock(self, study_uid: str) -> Optional[float]:
         """Thread-safe pop of the wall-clock duration for a completed study.
@@ -338,6 +364,17 @@ class TransferEngine:
             self._log(f"[{self.remote_key}] Service error: {e}")
             logger.exception("Service loop error")
         finally:
+            # Tear down pynetdicom's AE so its reactor threads exit
+            # before we drop the reference.  Letting the AE be GC'd
+            # while its reactor threads are still alive is what the
+            # ``gc.freeze()`` workaround in main.py exists to mask.
+            ops = self._dicom_ops
+            if ops is not None and ops.ae is not None:
+                try:
+                    ops.ae.shutdown()
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.remote_key}] AE shutdown failed: {e}")
             self._dicom_ops = None
             self._running = False
             self._log(f"[{self.remote_key}] Service stopped.")
@@ -365,7 +402,8 @@ class TransferEngine:
             if not jobs:
                 return 0
 
-        self._queue = jobs
+        with self._queue_lock:
+            self._queue = jobs
         self.signals.queue_updated.emit([j.to_dict() for j in jobs])
         self._log(f"[{self.remote_key}] Queue: {len(jobs)} series to download")
 
@@ -388,7 +426,8 @@ class TransferEngine:
             jobs = []
 
         if not jobs:
-            self._queue = []
+            with self._queue_lock:
+                self._queue = []
             self.signals.queue_updated.emit([])
         return jobs
 
@@ -405,7 +444,8 @@ class TransferEngine:
             return []
         jobs = [j for j in jobs if j.series_uid in self._selected_uids]
         if not jobs:
-            self._queue = []
+            with self._queue_lock:
+                self._queue = []
             self.signals.queue_updated.emit([])
         return jobs
 
@@ -420,16 +460,25 @@ class TransferEngine:
             self.signals.queue_updated.emit([j.to_dict() for j in jobs])
         return total_images
 
+    def _ensure_dicom_ops(self,
+                          dicom_ops: Optional[DicomOperations]
+                          ) -> DicomOperations:
+        """Return the supplied DicomOperations, or the engine's cached
+        instance (lazily constructed).  Centralizes the dual-path so
+        callers don't repeat the ``if None: …`` block."""
+        if dicom_ops is not None:
+            return dicom_ops
+        if self._dicom_ops is None:
+            self._dicom_ops = self._make_dicom_ops()
+        return self._dicom_ops
+
     def _query_source(self, date_range: str, cutoff: datetime,
                       max_images: int,
                       seen_series: Set[str],
-                      dicom_ops: DicomOperations = None,
+                      dicom_ops: Optional[DicomOperations] = None,
                       ) -> List[SeriesJob]:
         """Query the source PACS and return new SeriesJob items."""
-        if dicom_ops is None:
-            if self._dicom_ops is None:
-                self._dicom_ops = self._make_dicom_ops()
-            dicom_ops = self._dicom_ops
+        dicom_ops = self._ensure_dicom_ops(dicom_ops)
         self._log(f"Querying {self.remote_key}...")
         studies_raw = dicom_ops.c_find_studies(study_date=date_range)
 
@@ -480,7 +529,10 @@ class TransferEngine:
         # Emit study metadata for study rate display.  Covers ALL studies
         # from the query (including filtered-out and time-filtered ones)
         # with InstitutionName patched from series-level where available.
-        self.signals.studies_queried.emit(list(study_metadata.values()))
+        # Deep-copy so the GUI thread owns the payload independent of the
+        # engine's study_metadata dict (which is replaced on each cycle).
+        self.signals.studies_queried.emit(
+            [dict(v) for v in study_metadata.values()])
 
         return jobs
 
@@ -572,7 +624,8 @@ class TransferEngine:
         return jobs
 
     def _transfer_series(self, job: SeriesJob,
-                         dicom_ops: DicomOperations = None) -> int:
+                         dicom_ops: Optional[DicomOperations] = None
+                         ) -> int:
         """Transfer one series. Returns number of images transferred."""
         job.status = "transferring"
         self.signals.series_started.emit(job.to_dict())
@@ -586,10 +639,7 @@ class TransferEngine:
             job.status = "error"
             return 0
 
-        if dicom_ops is None:
-            if self._dicom_ops is None:
-                self._dicom_ops = self._make_dicom_ops()
-            dicom_ops = self._dicom_ops
+        dicom_ops = self._ensure_dicom_ops(dicom_ops)
 
         success, images, t_elapsed, t_start = self._do_move(dicom_ops, job)
         if success:
@@ -638,13 +688,13 @@ class TransferEngine:
                 image_count=images,
                 duration_seconds=t_elapsed,
             )
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.warning(f"TransferLog.record_series failed: {e}")
         try:
             self._transfer_log.clear_series_failures(
                 source_pacs=self.remote_key,
                 series_uid=job.series_uid)
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.warning(
                 f"TransferLog.clear_series_failures failed: {e}")
         self.signals.series_completed.emit(job.series_uid, images)
@@ -660,7 +710,7 @@ class TransferEngine:
             self._transfer_log.record_series_failure(
                 source_pacs=self.remote_key,
                 series_uid=job.series_uid)
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.warning(
                 f"TransferLog.record_series_failure failed: {e}")
         self.signals.series_error.emit(
@@ -703,7 +753,7 @@ class TransferEngine:
                         total_duration_seconds=total_duration,
                         wall_clock_seconds=wall_clock,
                     )
-                except Exception as e:
+                except sqlite3.Error as e:
                     logger.warning(f"TransferLog.record_study failed: {e}")
                 self._series_start_times.pop(study_uid, None)
                 with self._study_wall_clock_lock:
@@ -745,101 +795,119 @@ class TransferEngine:
             if not pid or pid in patients_done:
                 continue
             patients_done.add(pid)
-
-            current_uids = {getattr(s, 'StudyInstanceUID', '') for s in current_studies
-                            if getattr(s, 'PatientID', '') == pid}
-
-            all_raw = dicom_ops.c_find_studies(patient_id=pid)
-            self._log(f"  [Prior] patient {pid}: {len(all_raw)} total studies on PACS, "
-                      f"{len(current_uids)} in current window")
-            prior_studies = []
-            for s in all_raw:
-                uid = getattr(s, 'StudyInstanceUID', '')
-                if uid in current_uids:
-                    continue
-                prior_studies.append(s)
-
-            self._log(f"  [Prior] {len(prior_studies)} candidate prior studies")
-
-            prior_studies.sort(
-                key=lambda x: (getattr(x, 'StudyDate', ''),
-                               getattr(x, 'StudyTime', '')),
-                reverse=True)
-
-            # Filter by same modality if configured
-            if self.config.prior_studies_same_modality:
-                target_mods = set()
-                for cs in current_studies:
-                    if getattr(cs, 'PatientID', '') == pid:
-                        mods = str(getattr(cs, 'ModalitiesInStudy', ''))
-                        for m in mods.replace("\\", ",").split(","):
-                            m = m.strip()
-                            if m:
-                                target_mods.add(m)
-                self._log(f"  [Prior] modality filter active, target: {target_mods}")
-                if target_mods:
-                    prior_studies = [
-                        s for s in prior_studies
-                        if {m.strip()
-                            for m in str(getattr(s, 'ModalitiesInStudy', ''))
-                            .replace("\\", ",").split(",")
-                            if m.strip()} & target_mods
-                    ]
-                    self._log(f"  [Prior] {len(prior_studies)} after modality filter")
-
-            count = min(self.config.prior_studies_count, len(prior_studies))
-            self._log(f"  [Prior] downloading {count} of {len(prior_studies)} "
-                      f"(configured max: {self.config.prior_studies_count})")
-            for ps in prior_studies[:count]:
-                ps_uid = getattr(ps, 'StudyInstanceUID', '')
-                ps_name = str(getattr(ps, 'PatientName', 'Unknown'))
-                ps_desc = getattr(ps, 'StudyDescription', 'N/A')
-                ps_date = getattr(ps, 'StudyDate', '')
-                ps_time_raw = getattr(ps, 'StudyTime', '')
-                ps_time = ps_time_raw[:6] if ps_time_raw else ''
-
-                institution = str(
-                    getattr(ps, 'InstitutionName', '')).strip()
-                series_list = dicom_ops.c_find_series(ps_uid)
-                if not institution and series_list:
-                    institution = str(
-                        getattr(series_list[0], 'InstitutionName', '')
-                    ).strip()
-                if not self._passes_institution_filter(institution):
-                    continue
-                local_series = self._fetch_local_series_counts(
-                    dicom_ops, ps_uid)
-
-                for ser in series_list:
-                    series_uid = getattr(ser, 'SeriesInstanceUID', '')
-                    if series_uid in seen_series:
-                        continue
-                    remote_count = int(
-                        getattr(ser, 'NumberOfSeriesRelatedInstances', 0) or 0)
-                    local_count = local_series.get(series_uid, 0)
-                    if self._should_skip_series(
-                            remote_count, local_count, max_images):
-                        continue
-                    seen_series.add(series_uid)
-                    prior_jobs.append(SeriesJob(
-                        patient_name=ps_name,
-                        patient_id=pid,
-                        study_description=f"[Prior] {ps_desc}",
-                        series_description=getattr(ser, 'SeriesDescription', 'N/A'),
-                        modality=getattr(ser, 'Modality', 'UN'),
-                        series_number=str(getattr(ser, 'SeriesNumber', '')),
-                        study_uid=ps_uid,
-                        series_uid=series_uid,
-                        remote_count=remote_count,
-                        local_count=local_count,
-                        study_date=ps_date,
-                        study_time=ps_time,
-                    ))
-
-            if prior_jobs:
-                self._log(f"  {len(prior_jobs)} prior series for patient {pid}")
+            prior_jobs.extend(self._resolve_priors_for_patient(
+                dicom_ops, pid, current_studies, seen_series, max_images))
 
         return prior_jobs
+
+    def _resolve_priors_for_patient(
+            self, dicom_ops: DicomOperations, pid: str,
+            current_studies, seen_series: Set[str],
+            max_images: int) -> List[SeriesJob]:
+        """Resolve the prior-study series jobs for a single patient."""
+        current_uids = {getattr(s, 'StudyInstanceUID', '')
+                        for s in current_studies
+                        if getattr(s, 'PatientID', '') == pid}
+
+        all_raw = dicom_ops.c_find_studies(patient_id=pid)
+        self._log(f"  [Prior] patient {pid}: {len(all_raw)} total studies on PACS, "
+                  f"{len(current_uids)} in current window")
+        prior_studies = [s for s in all_raw
+                         if getattr(s, 'StudyInstanceUID', '') not in current_uids]
+        self._log(f"  [Prior] {len(prior_studies)} candidate prior studies")
+
+        prior_studies.sort(
+            key=lambda x: (getattr(x, 'StudyDate', ''),
+                           getattr(x, 'StudyTime', '')),
+            reverse=True)
+
+        if self.config.prior_studies_same_modality:
+            prior_studies = self._filter_priors_by_modality(
+                prior_studies, current_studies, pid)
+
+        count = min(self.config.prior_studies_count, len(prior_studies))
+        self._log(f"  [Prior] downloading {count} of {len(prior_studies)} "
+                  f"(configured max: {self.config.prior_studies_count})")
+
+        jobs: List[SeriesJob] = []
+        for ps in prior_studies[:count]:
+            jobs.extend(self._build_prior_jobs_for_study(
+                dicom_ops, ps, pid, seen_series, max_images))
+
+        if jobs:
+            self._log(f"  {len(jobs)} prior series for patient {pid}")
+        return jobs
+
+    def _filter_priors_by_modality(
+            self, prior_studies, current_studies, pid: str):
+        """Keep only prior studies whose modality set intersects the
+        modalities of the current studies for this patient."""
+        def split_modalities(ds) -> Set[str]:
+            return {m.strip()
+                    for m in str(getattr(ds, 'ModalitiesInStudy', ''))
+                    .replace("\\", ",").split(",")
+                    if m.strip()}
+
+        target_mods: Set[str] = set()
+        for cs in current_studies:
+            if getattr(cs, 'PatientID', '') == pid:
+                target_mods |= split_modalities(cs)
+        self._log(f"  [Prior] modality filter active, target: {target_mods}")
+        if not target_mods:
+            return prior_studies
+        kept = [s for s in prior_studies
+                if split_modalities(s) & target_mods]
+        self._log(f"  [Prior] {len(kept)} after modality filter")
+        return kept
+
+    def _build_prior_jobs_for_study(
+            self, dicom_ops: DicomOperations, ps, pid: str,
+            seen_series: Set[str], max_images: int) -> List[SeriesJob]:
+        """Build SeriesJob items for one prior study, applying the
+        institution filter and seen/local checks."""
+        ps_uid = getattr(ps, 'StudyInstanceUID', '')
+        ps_name = str(getattr(ps, 'PatientName', 'Unknown'))
+        ps_desc = getattr(ps, 'StudyDescription', 'N/A')
+        ps_date = getattr(ps, 'StudyDate', '')
+        ps_time_raw = getattr(ps, 'StudyTime', '')
+        ps_time = ps_time_raw[:6] if ps_time_raw else ''
+
+        institution = str(getattr(ps, 'InstitutionName', '')).strip()
+        series_list = dicom_ops.c_find_series(ps_uid)
+        if not institution and series_list:
+            institution = str(
+                getattr(series_list[0], 'InstitutionName', '')).strip()
+        if not self._passes_institution_filter(institution):
+            return []
+        local_series = self._fetch_local_series_counts(dicom_ops, ps_uid)
+
+        jobs: List[SeriesJob] = []
+        for ser in series_list:
+            series_uid = getattr(ser, 'SeriesInstanceUID', '')
+            if series_uid in seen_series:
+                continue
+            remote_count = int(
+                getattr(ser, 'NumberOfSeriesRelatedInstances', 0) or 0)
+            local_count = local_series.get(series_uid, 0)
+            if self._should_skip_series(
+                    remote_count, local_count, max_images):
+                continue
+            seen_series.add(series_uid)
+            jobs.append(SeriesJob(
+                patient_name=ps_name,
+                patient_id=pid,
+                study_description=f"[Prior] {ps_desc}",
+                series_description=getattr(ser, 'SeriesDescription', 'N/A'),
+                modality=getattr(ser, 'Modality', 'UN'),
+                series_number=str(getattr(ser, 'SeriesNumber', '')),
+                study_uid=ps_uid,
+                series_uid=series_uid,
+                remote_count=remote_count,
+                local_count=local_count,
+                study_date=ps_date,
+                study_time=ps_time,
+            ))
+        return jobs
 
     # ── Institution filter logic ──────────────────────────────────────────
 

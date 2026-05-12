@@ -5,7 +5,6 @@ The user enters cleartext identifiers which are hashed to query the
 SQLite transfer log. Warns if series were likely resent (Mbit/s outlier).
 """
 
-import math
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import Qt
@@ -79,11 +78,13 @@ class ExaminationLookupDialog(QDialog):
 
         log = TransferLog(self._db_path)
         results = log.query_series(**kw)
-        all_series = log.query_series() if results else []
+        # Compute baseline mbps stats in SQL (one round trip) instead
+        # of dragging the full series table into Python.
+        baseline = log.mbps_stats() if results else None
         log.close()
 
         self._populate_table(results)
-        self._check_resend(results, all_series)
+        self._check_resend(results, baseline)
 
     def _populate_table(self, results):
         headers = ["Acquisition Time", "Download Start", "Download End",
@@ -118,18 +119,10 @@ class ExaminationLookupDialog(QDialog):
             self.results_table.setItem(row, 8, QTableWidgetItem(f"{r['duration_seconds']:.1f}"))
             self.results_table.setItem(row, 9, QTableWidgetItem(f"{r['estimated_mbps']:.2f}"))
 
-    def _check_resend(self, results, all_series):
-        if not results or not all_series:
+    def _check_resend(self, results, baseline):
+        if not results or not baseline:
             return
-        all_mbps = [r["estimated_mbps"] for r in all_series
-                    if r["estimated_mbps"] > 0]
-        if len(all_mbps) < 2:
-            return
-        mean = sum(all_mbps) / len(all_mbps)
-        variance = sum((v - mean) ** 2 for v in all_mbps) / len(all_mbps)
-        stddev = math.sqrt(variance)
-        median = sorted(all_mbps)[len(all_mbps) // 2]
-        threshold = median - 2 * stddev
+        threshold = baseline["median"] - 2 * baseline["stddev"]
         for r in results:
             if r["estimated_mbps"] > 0 and r["estimated_mbps"] < threshold:
                 self.lbl_resend_warning.setText(

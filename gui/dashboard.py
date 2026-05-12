@@ -6,12 +6,14 @@ and real-time throughput statistics with color-coded indicators.
 """
 
 import io
+import itertools
 import math
 import os
 import struct
 import tempfile
 import wave
 from datetime import datetime, timedelta
+from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QFont, QAction
@@ -26,6 +28,30 @@ from PySide6.QtWidgets import (
 
 from core.transfer_engine import TransferStats
 from gui.styles import BTN_START, BTN_STOP, BTN_DOWNLOAD_SELECTED, BTN_BLUE
+
+# ── UI thresholds and colors ─────────────────────────────────────────────
+# A series rate is shaded green/red when it deviates by more than this
+# ratio from the median-of-all baseline.
+SPEED_BAND_RATIO = 0.2
+
+# Studies-per-hour thresholds that switch the study rate label colour
+# and trigger the high-load popup.
+STUDY_RATE_GOOD_MAX = 5      # green at ≤
+STUDY_RATE_WARN_MAX = 11     # yellow at ≤
+STUDY_RATE_HIGH_LOAD = 12    # red + popup at ≥
+
+# Stats refresh tick (ms)
+STATS_REFRESH_MS = 2000
+# Debounce window for coalescing config writes from UI events (ms)
+CONFIG_SAVE_DEBOUNCE_MS = 500
+
+# Palette
+COLOR_GREEN = "#2ecc71"
+COLOR_YELLOW = "#f1c40f"
+COLOR_RED = "#e74c3c"
+COLOR_ORANGE = "#f39c12"
+COLOR_BLUE_ACCENT = "#3498db"
+COLOR_MUTED = "#969696"
 
 _default_sound_path: str | None = None
 _sad_sound_path: str | None = None
@@ -104,26 +130,26 @@ class StatsLabel(QLabel):
         """Update text and colour.
 
         *median_all* is the overall-median baseline.  A value more than
-        20 % above baseline is green; more than 20 % below is red;
-        everything else stays white.  If baseline is < 1 we don't
+        ``SPEED_BAND_RATIO`` above baseline is green; the same below is
+        red; everything else stays white.  If baseline is < 1 we don't
         colour-code (not enough data).
         """
         self.setText(f"{value:.0f}")
         if median_all < 1 or value < 1:
             self.setStyleSheet(self._style("white"))
             return
-        if value > median_all * 1.2:
-            self.setStyleSheet(self._style("#2ecc71"))  # green
-        elif value < median_all * 0.8:
-            self.setStyleSheet(self._style("#e74c3c"))  # red
+        if value > median_all * (1 + SPEED_BAND_RATIO):
+            self.setStyleSheet(self._style(COLOR_GREEN))
+        elif value < median_all * (1 - SPEED_BAND_RATIO):
+            self.setStyleSheet(self._style(COLOR_RED))
         else:
             self.setStyleSheet(self._style("white"))
 
     @staticmethod
     def _style(color: str) -> str:
         bg = "#2c2c2c" if color == "white" else (
-            "#1a3a1a" if "#2ecc71" in color else
-            "#3a1a1a" if "#e74c3c" in color else "#2c2c2c"
+            "#1a3a1a" if color == COLOR_GREEN else
+            "#3a1a1a" if color == COLOR_RED else "#2c2c2c"
         )
         return (
             f"QLabel {{ color: {color}; background: {bg}; "
@@ -143,18 +169,48 @@ class SourceDashboard(QWidget):
         super().__init__(parent)
         self.config = config
         self.remote_key = remote_key
-        self._current_stats: TransferStats = None
+        self._current_stats: Optional[TransferStats] = None
         self._last_queue: list = []
         self._service_running = False
         self._settings_dirty = False
-        self._filter_popup_visible = False
         self._last_high_load_groups: set = set()
+        # Set True while _setup_ui runs so any toggled signal fired by
+        # setChecked() during construction is ignored — those would
+        # otherwise call config.save() before the rest of the UI exists.
+        self._initializing = True
+        # Lazy single long-lived QSoundEffect.  Creating one per
+        # play_sound call has historically raced PySide6 dealloc when
+        # notifications arrive in quick succession (study_completed
+        # comes from the pynetdicom reactor thread); creating it in
+        # __init__ instead allocates an audio backend during widget
+        # construction which is undesirable in headless test runs.
+        # Deferred init solves both: one instance, but only when the
+        # first sound actually plays.
+        self._sound_effect: Optional[QSoundEffect] = None
         self._setup_ui()
 
         # Refresh stats display every 2 seconds
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_stats_display)
-        self._timer.start(2000)
+        self._timer.start(STATS_REFRESH_MS)
+
+        # Debounce config writes: a hammered spinbox / rapid toggles
+        # otherwise call config.save() once per UI event, hitting disk
+        # synchronously on the main thread.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(CONFIG_SAVE_DEBOUNCE_MS)
+        self._save_timer.timeout.connect(self.config.save)
+
+    def _save_config_debounced(self):
+        """Schedule a config save 500ms in the future; coalesces bursts."""
+        self._save_timer.start()
+
+    def flush_pending_save(self):
+        """Synchronously persist any pending debounced save."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+        self.config.save()
 
     @property
     def _remote_node(self):
@@ -419,6 +475,9 @@ class SourceDashboard(QWidget):
         summary.addWidget(self.lbl_status)
         layout.addLayout(summary)
 
+        # Construction complete — accept user-driven toggle events now.
+        self._initializing = False
+
     # ── Filter group handling ─────────────────────────────────────────
 
     def _populate_filter_menu(self):
@@ -441,6 +500,8 @@ class SourceDashboard(QWidget):
 
     def _on_filter_group_toggled(self, checked: bool):
         """Update active groups when a menu item is toggled."""
+        if self._initializing:
+            return
         active = []
         for action in self.filter_menu.actions():
             if action.isCheckable() and action.isChecked():
@@ -448,27 +509,33 @@ class SourceDashboard(QWidget):
         self.config.active_filter_groups = active
         self.config.filter_groups_enabled = (
             self.filter_enable_check.isChecked())
-        self.config.save()
+        self._save_config_debounced()
         self._update_filter_button_text()
 
     def _on_filter_toggled(self, enabled: bool):
         """Master switch for filtering."""
+        if self._initializing:
+            return
         self.config.filter_groups_enabled = enabled
-        self.config.save()
+        self._save_config_debounced()
         self._update_filter_enabled_state()
         self._update_filter_button_text()
         self._rebuild_study_rate_labels()
         self._on_settings_changed()
 
     def _on_small_series_toggled(self, checked: bool):
+        if self._initializing:
+            return
         self.config.filter_allow_small_series = checked
-        self.config.save()
+        self._save_config_debounced()
         self._update_filter_enabled_state()
         self._on_settings_changed()
 
     def _on_small_series_max_changed(self, value: int):
+        if self._initializing:
+            return
         self.config.filter_small_series_max = value
-        self.config.save()
+        self._save_config_debounced()
         self._on_settings_changed()
 
     def _update_filter_enabled_state(self):
@@ -513,7 +580,7 @@ class SourceDashboard(QWidget):
         self.config.active_filter_groups = [
             g for g in self.config.active_filter_groups
             if g in valid_names]
-        self.config.save()
+        self._save_config_debounced()
         self._populate_filter_menu()
         self._update_filter_button_text()
         self._update_filter_enabled_state()
@@ -523,7 +590,7 @@ class SourceDashboard(QWidget):
         node = self._remote_node
         if node:
             node.notification_sound_enabled = checked
-            self.config.save()
+            self._save_config_debounced()
 
     # ── Service control handlers ──────────────────────────────────────────
 
@@ -535,13 +602,14 @@ class SourceDashboard(QWidget):
     def _on_start_clicked(self):
         self._settings_dirty = False
         self.restart_banner.setVisible(False)
-        # Save per-source params to config
+        # Save per-source params to config (immediate — user-intent
+        # action; we want this on disk before the engine starts).
         node = self._remote_node
         if node:
             node.hours = self.hours_spin.value()
             node.max_images = self.max_images_spin.value()
             node.sync_interval = self.interval_spin.value()
-            self.config.save()
+            self.flush_pending_save()
         params = {
             "hours": self.hours_spin.value(),
             "max_images": self.max_images_spin.value(),
@@ -583,16 +651,11 @@ class SourceDashboard(QWidget):
     @staticmethod
     def _compute_cumulative_pending(queue: list) -> list:
         """Return a list of cumulative pending-image counts per queue row."""
-        running_sum = 0
-        cumulative = []
-        for job in queue:
+        def pending_for(job: dict) -> int:
             if job["status"] in ("done", "error", "skipped"):
-                running_sum += 0
-            else:
-                pending = job["remote_count"] - job["local_count"]
-                running_sum += max(pending, 0)
-            cumulative.append(running_sum)
-        return cumulative
+                return 0
+            return max(job["remote_count"] - job["local_count"], 0)
+        return list(itertools.accumulate(pending_for(j) for j in queue))
 
     @staticmethod
     def _format_ete(seconds: float) -> str:
@@ -886,11 +949,11 @@ class SourceDashboard(QWidget):
         """Return CSS color string for a study rate value."""
         if n <= 0:
             return None
-        if n <= 5:
-            return "#2ecc71"
-        if n <= 11:
-            return "#f1c40f"
-        return "#e74c3c"
+        if n <= STUDY_RATE_GOOD_MAX:
+            return COLOR_GREEN
+        if n <= STUDY_RATE_WARN_MAX:
+            return COLOR_YELLOW
+        return COLOR_RED
 
     def on_study_completed(self, study_uid: str,
                            institution_name: str,
@@ -925,14 +988,13 @@ class SourceDashboard(QWidget):
         median_all = stats.median_all_ipm()
         if median_all < 1:
             return False
-        return stats.median_n_ipm(5) < median_all * 0.8
+        return stats.median_n_ipm(5) < median_all * (1 - SPEED_BAND_RATIO)
 
     def _play_sound(self, path: str):
-        """Play a WAV file via QSoundEffect."""
-        if hasattr(self, "_sound_effect") and self._sound_effect is not None:
-            self._sound_effect.stop()
-            self._sound_effect.deleteLater()
-        self._sound_effect = QSoundEffect(self)
+        """Play a WAV file via the long-lived QSoundEffect (lazy)."""
+        if self._sound_effect is None:
+            self._sound_effect = QSoundEffect(self)
+        self._sound_effect.stop()
         self._sound_effect.setSource(QUrl.fromLocalFile(path))
         self._sound_effect.play()
 
@@ -967,7 +1029,8 @@ class SourceDashboard(QWidget):
                 lbl.setStyleSheet("")
 
         # High-load popup (non-modal so it doesn't block signal processing)
-        high_groups = {g for g, c in rates.items() if c >= 12}
+        high_groups = {g for g, c in rates.items()
+                       if c >= STUDY_RATE_HIGH_LOAD}
         new_high = high_groups - self._last_high_load_groups
         if new_high and self.config.high_load_alert_enabled:
             QApplication.beep()

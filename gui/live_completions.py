@@ -10,8 +10,6 @@ import math
 from datetime import datetime, timedelta
 from typing import Optional
 
-from core.i18n import tr
-
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
@@ -19,12 +17,17 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QPushButton, QHeaderView, QApplication,
 )
 
+from core.i18n import tr
+
 _RED = QColor("#e74c3c")
 _GREEN = QColor("#2ecc71")
 
 
-def _parse_time(s: str):
-    """Parse HH:MM:SS or HHMMSS into (hours, minutes, seconds)."""
+def _parse_time(s: str) -> Optional[tuple[int, int, int]]:
+    """Parse HH:MM:SS or HHMMSS into (hours, minutes, seconds).
+
+    Returns ``None`` when *s* cannot be parsed; never raises.
+    """
     s = s.strip()
     if ":" in s:
         parts = s.split(":")
@@ -35,7 +38,10 @@ def _parse_time(s: str):
     else:
         return None
     try:
-        return int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
+        h = int(parts[0])
+        m = int(parts[1])
+        sec = int(parts[2]) if len(parts) > 2 else 0
+        return h, m, sec
     except (ValueError, IndexError):
         return None
 
@@ -119,15 +125,14 @@ class LiveCompletionsWindow(QWidget):
         acq = _parse_time(study_time)
         comp = _parse_time(completed_time)
 
-        if acq and len(study_time) >= 4:
-            formatted_acq = f"{acq[0]:02d}:{acq[1]:02d}:{acq[2]:02d}"
-        else:
-            formatted_acq = study_time
-
-        if comp:
-            formatted_comp = f"{comp[0]:02d}:{comp[1]:02d}:{comp[2]:02d}"
-        else:
-            formatted_comp = completed_time
+        formatted_acq = (
+            f"{acq[0]:02d}:{acq[1]:02d}:{acq[2]:02d}"
+            if acq is not None else study_time
+        )
+        formatted_comp = (
+            f"{comp[0]:02d}:{comp[1]:02d}:{comp[2]:02d}"
+            if comp is not None else completed_time
+        )
 
         # Compute delay in seconds
         delay_seconds = None

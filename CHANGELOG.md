@@ -2,6 +2,79 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.8] — 2026-05-12
+
+### Fixed (critical)
+- `TransferEngine.queue_snapshot()` boundary: GUI thread no longer
+  reads the engine's internal `_queue` directly; snapshot is taken
+  under a lock so list reassignment in the service-loop thread
+  can't race the GUI iterating it
+- Single shared `TransferLog` across all source PACS engines so the
+  per-instance write lock actually serializes writers (previously
+  each engine had its own lock and writes could interleave)
+- `QSoundEffect` is now a single lazily-created long-lived instance
+  per dashboard; the previous create/`deleteLater` per notification
+  could race PySide6 dealloc when study completions arrived in
+  quick succession
+- `closeEvent` joins engine threads in 100 ms slices with
+  `processEvents()` between them so the "waiting for downloads"
+  status bar stays responsive instead of freezing for 30 s × N
+  sources
+- `DicomOperations` C-ECHO / C-FIND / C-MOVE explicitly handle
+  `None`/missing `Status` (dropped associations) instead of relying
+  on the truthiness of `status and status.Status == 0x0000`
+- `studies_queried` signal now emits an owned deep copy of the
+  per-cycle dict, eliminating an implicit ownership contract
+  between engine and GUI
+- Atomic config save: `AppConfig.save()` writes to a `.tmp` sibling
+  and `os.replace`s onto the real path so a crash mid-write cannot
+  truncate the config and re-trigger the first-run setup wizard
+- `TransferEngine` now calls `AE.shutdown()` in its `finally` block
+  so pynetdicom reactor threads exit deterministically on stop
+  instead of accumulating
+- `StorageSCP.running` is now a thread-safe property guarded by a
+  dedicated lock; `start()` compare-and-sets and `stop()` atomically
+  claims the shutdown so the reactor's own `finally` cannot race
+  an external `stop()` into a double `ae.shutdown()`
+
+### Changed
+- Notification WAVs are pre-generated at app startup via
+  `QTimer.singleShot(0, …)` so the first study-completion sound is
+  instant instead of paying ~30 k samples of Python DSP synchronously
+  on the GUI thread
+- `config.save()` calls from dashboard checkboxes/spinboxes are
+  debounced through a 500 ms `QTimer` to coalesce bursts; immediate
+  flush on Start-clicked and on window close so no changes are lost
+- `_resolve_priors` (was 100+ lines, 4 levels of nesting) split into
+  `_resolve_priors_for_patient`, `_filter_priors_by_modality`,
+  `_build_prior_jobs_for_study`
+- Round-trip unknown JSON keys in `AppConfig.load()`/`save()` so a
+  future build's new setting is not silently dropped when an older
+  version saves
+- `TransferLog.mbps_stats()` computes the resend-detection baseline
+  in SQL instead of pulling the whole `series_transfer` table into
+  Python on every Examination Lookup search
+- `TransferStatsWindow` keeps a single `TransferLog` open for the
+  window's lifetime instead of creating/closing one on every filter
+  change
+- `StorageSCP` accepts a `bind_address` constructor arg (default
+  still `0.0.0.0`)
+- Dashboard threshold/colour magic numbers consolidated as module
+  constants (`SPEED_BAND_RATIO`, `STUDY_RATE_*`, palette)
+- `_log` is split from status-bar updates and routed through a
+  `_log_message` signal so it's safe from any thread
+
+### Internal
+- `gui/styles.py` now owns `DARK_THEME` and a `_button_style(...)`
+  factory used by all coloured buttons (replaced 8 near-duplicate
+  inline strings)
+- `pydicom` VR-UI warning is now scoped to the actual `send_c_find`
+  call site via `warnings.catch_warnings()` instead of process-wide
+- Narrowed `except Exception` to `except sqlite3.Error` around all
+  `TransferLog.*` writes in `TransferEngine`
+- Test suite: 722 passing (no count change; existing tests
+  retargeted at new `queue_snapshot` and `transfer_log=` injection)
+
 ## [1.0.6] — 2026-04-11
 
 ### Added
