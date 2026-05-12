@@ -14,8 +14,8 @@ no Python installation required.
 
 | File | Architecture | Size |
 |---|---|---|
-| [`DICOM_Sync_1.0.7_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.7/DICOM_Sync_1.0.7_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~56 MB |
-| [`DICOM_Sync_1.0.7_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.7/DICOM_Sync_1.0.7_macOS_x86_64.dmg) | Intel | ~59 MB |
+| [`DICOM_Sync_1.0.8_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.8/DICOM_Sync_1.0.8_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~59 MB |
+| [`DICOM_Sync_1.0.8_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.8/DICOM_Sync_1.0.8_macOS_x86_64.dmg) | Intel | ~63 MB |
 
 **Installation:**
 
@@ -262,7 +262,7 @@ to an active filter group.
 
 ## Running tests
 
-The project includes a comprehensive test suite (689 tests).
+The project includes a comprehensive test suite (722 tests).
 
 ```bash
 # Linux / macOS (headless — no display required)
@@ -283,26 +283,51 @@ set QT_QPA_PLATFORM=offscreen && python -m pytest tests/ -v
 ## Building the standalone app
 
 The macOS `.app` bundle is built with [PyInstaller](https://pyinstaller.org/).
+The release ships both architectures, each built from its own dedicated
+virtual environment so the Mach-O target matches the host Python.
+
+### Apple Silicon (arm64)
 
 ```bash
-pip install pyinstaller
-pyinstaller dicom_sync.spec
+python3 -m venv venv               # arm64 Python (e.g. 3.14)
+source venv/bin/activate
+pip install -r requirements.txt pyinstaller
+
+pyinstaller dicom_sync.spec --clean --noconfirm
+# → dist/DICOM Sync.app  (arm64)
 ```
 
-The result is in `dist/DICOM Sync.app`. To create a distributable DMG:
+### Intel (x86_64)
+
+Use an x86_64 Python (e.g. installed via `python.org` Universal2
+installer, or downloaded specifically as `x86_64`). On Apple Silicon
+hosts the x86_64 Python binary will automatically be invoked under
+Rosetta.
 
 ```bash
-mkdir -p /tmp/dmg_stage
-cp -R "dist/DICOM Sync.app" "/tmp/dmg_stage/DICOM Sync.app"
-ln -s /Applications "/tmp/dmg_stage/Applications"
-hdiutil create -volname "DICOM Sync" \
-  -srcfolder /tmp/dmg_stage -ov -format UDZO \
-  releases/DICOM_Sync_1.0.7_macOS_arm64.dmg
-rm -rf /tmp/dmg_stage
+python3 -m venv venv_x86           # x86_64 Python (e.g. 3.12)
+source venv_x86/bin/activate
+pip install -r requirements.txt pyinstaller
+
+pyinstaller dicom_sync.spec --clean --noconfirm
+# → dist/DICOM Sync.app  (x86_64)
 ```
 
-> **Note:** The current DMG is built for Apple Silicon (arm64). For Intel Macs,
-> build on an Intel machine or use `--target-arch x86_64`.
+### Package the DMG
+
+```bash
+ARCH=arm64   # or x86_64
+mkdir -p _dmg
+cp -R "dist/DICOM Sync.app" _dmg/
+ln -s /Applications _dmg/Applications
+hdiutil create -volname "DICOM Sync 1.0.8" \
+  -srcfolder _dmg -ov -format UDZO \
+  releases/DICOM_Sync_1.0.8_macOS_${ARCH}.dmg
+rm -rf _dmg
+```
+
+> The DMG is not code-signed; first launch on another Mac needs
+> right-click → **Open** to bypass Gatekeeper.
 
 ---
 
@@ -311,7 +336,7 @@ rm -rf /tmp/dmg_stage
 ```
 dicom_sync_gui/
 ├── main.py                         # Entry point, dark theme, dependency check
-├── __init__.py                     # Package version (1.0.7)
+├── __init__.py                     # Package version (1.0.8)
 ├── __main__.py                     # python -m support
 ├── requirements.txt                # pip dependencies
 ├── dicom_sync.spec                 # PyInstaller build spec
@@ -325,7 +350,7 @@ dicom_sync_gui/
 │   └── AppIcon.icns                # macOS application icon
 │
 ├── releases/
-│   └── DICOM_Sync_1.0.7_macOS_*.dmg   # Standalone macOS app
+│   └── DICOM_Sync_1.0.8_macOS_*.dmg   # Standalone macOS app (arm64 + x86_64)
 │
 ├── core/
 │   ├── config.py                   # AppConfig, PacsNode, load/save
@@ -347,7 +372,7 @@ dicom_sync_gui/
 │   ├── log_window.py               # Floating log viewer
 │   └── styles.py                   # Shared button stylesheet constants
 │
-└── tests/                          # 689 tests
+└── tests/                          # 722 tests
     ├── conftest.py                 # Shared fixtures
     ├── test_config.py
     ├── test_dicom_ops.py
