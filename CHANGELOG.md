@@ -2,6 +2,29 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.9] — 2026-05-14
+
+### Fixed
+- **Download Completions barely getting filled**: `fully_complete`
+  was checking `done_count` against the full count of series the
+  PACS returned, including filtered-out ones (institution filter,
+  `max_images` filter, small-series exception). A study with even
+  one filtered-out series could never reach the completion entry.
+
+  New rule: a study is fully complete when every *queued* series of
+  the study has `status == "done"`. Filter-rejected series are not
+  in the queue and so are naturally ignored. Series with fewer than
+  6 remote images may additionally be `error` / `skipped` without
+  blocking the completion — this covers stuck tiny localizers that
+  the PACS refuses to send.
+
+### Internal
+- `_study_total_series` dict removed from `TransferEngine` — it was
+  the backing store for the old `total_remote` comparison and is no
+  longer needed
+- Tests: 724 passing (+2 covering the new small-series-failure-OK
+  path and the filtered-queue completion path)
+
 ## [1.0.8] — 2026-05-12
 
 ### Fixed (critical)

@@ -1315,7 +1315,6 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.3",
                       status="done", institution_name="Hospital Alpha"),
         ]
-        self.engine._study_total_series["S1"] = 3
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
         mock_play.assert_called_once()
@@ -1326,7 +1325,6 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha"),
         ]
-        self.engine._study_total_series["S1"] = 1
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
             self.engine._check_study_complete("S1")
@@ -1353,8 +1351,6 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
                       status="done", institution_name="Hospital Alpha"),
         ]
-        self.engine._study_total_series["S1"] = 1
-        self.engine._study_total_series["S2"] = 1
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
             self.engine._check_study_complete("S2")
@@ -1369,23 +1365,56 @@ class TestSoundPerStudyNotPerSeries:
             SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
                       status="done", institution_name="Clinic Beta"),
         ]
-        self.engine._study_total_series["S1"] = 1
-        self.engine._study_total_series["S2"] = 1
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
             self.engine._check_study_complete("S2")
         mock_play.assert_called_once()
 
-    def test_no_sound_for_partial_study(self):
-        """Study has 5 series on remote but only 2 small ones in queue
-        (filter_allow_small_series) → no sound."""
+    def test_partial_queue_fires_completion(self):
+        """Filtered-out series are not in the queue; completion must
+        fire as soon as every *queued* series of the study is done,
+        regardless of how many series the PACS originally had."""
+        # The PACS may have had 5 series for S1; the filter let only
+        # 2 through.  Both are done → sound must play.
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      remote_count=300),
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      remote_count=200),
         ]
-        self.engine._study_total_series["S1"] = 5  # 5 on remote, only 2 queued
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_called_once()
+
+    def test_small_failed_series_does_not_block_completion(self):
+        """A queued series with < 6 remote images that errors out must
+        not suppress the completion sound — it's typically a stuck
+        localizer."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha",
+                      remote_count=300),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="error", institution_name="Hospital Alpha",
+                      remote_count=3),  # tiny series, failed
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_called_once()
+
+    def test_large_failed_series_blocks_completion(self):
+        """A queued series with ≥ 6 remote images that errors out must
+        suppress the completion sound — only small series are tolerated."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha",
+                      remote_count=300),
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
+                      status="error", institution_name="Hospital Alpha",
+                      remote_count=50),  # not small; failure blocks
+        ]
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
         mock_play.assert_not_called()

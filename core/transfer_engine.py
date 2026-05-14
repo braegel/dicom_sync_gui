@@ -81,6 +81,14 @@ class SeriesCompletionRecord:
     images_per_minute: float = 0.0
 
 
+# Series with fewer than this many remote images may fail (error/
+# skipped) without blocking the study's fully_complete signal — small
+# series are typically localizers or stuck tiny series that should not
+# silently suppress the Download Completions entry for everything else
+# that did arrive.
+SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION = 6
+
+
 @dataclass
 class TransferStats:
     """Per-series throughput statistics with median aggregation.
@@ -258,7 +266,6 @@ class TransferEngine:
         self._series_start_times: Dict[str, float] = {}  # study_uid → first series start
         self._study_wall_clock: Dict[str, float] = {}  # study_uid → wall-clock seconds, populated at completion
         self._study_wall_clock_lock = threading.Lock()
-        self._study_total_series: Dict[str, int] = {}  # study_uid → total series on remote
         self._dicom_ops: Optional[DicomOperations] = None
 
     @property
@@ -555,18 +562,13 @@ class TransferEngine:
         series_list = dicom_ops.c_find_series(study_uid)
 
         # Exclude blacklisted series: they will never be fetched, so
-        # they must not count toward the study's "total remote series"
-        # or fully_complete detection would block forever on any study
-        # that contains a blacklisted series.
+        # they must not appear in the queue.
         series_list = [
             ser for ser in series_list
             if not self._transfer_log.is_series_blacklisted(
                 source_pacs=self.remote_key,
                 series_uid=getattr(ser, 'SeriesInstanceUID', ''))
         ]
-
-        # Track total series count on remote for fully_complete detection
-        self._study_total_series[study_uid] = len(series_list)
 
         # InstitutionName fallback: read from first series
         if not institution and series_list:
@@ -758,12 +760,19 @@ class TransferEngine:
                 self._series_start_times.pop(study_uid, None)
                 with self._study_wall_clock_lock:
                     self._study_wall_clock[study_uid] = wall_clock
-            # fully_complete = all remote series were queued and done
-            total_remote = self._study_total_series.pop(study_uid, 0)
-            done_count = len([j for j in study_series
-                              if j.status == "done"])
-            fully_complete = (total_remote > 0
-                              and done_count >= total_remote)
+            # fully_complete: every queued series of this study must be
+            # ``done``, except small series (< SMALL_SERIES_MAX_IMAGES…
+            # remote images) may also be error/skipped without blocking.
+            # Filter-rejected series are not in study_series at all, so
+            # they're naturally excluded.
+
+            def _ok_for_completion(j: SeriesJob) -> bool:
+                if j.status == "done":
+                    return True
+                return j.remote_count < SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION
+
+            fully_complete = all(_ok_for_completion(j)
+                                 for j in study_series)
             self.signals.study_completed.emit(
                 study_uid, institution, fully_complete)
 
