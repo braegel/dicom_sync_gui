@@ -227,7 +227,7 @@ class TransferSignals(QObject):
     # All series for a patient (incl. priors) finished downloading
     patient_studies_completed = Signal(str, str)  # patient_id, institution_name
     # All series of a single study finished downloading
-    study_completed = Signal(str, str, bool)  # study_uid, institution_name, fully_complete
+    study_completed = Signal(str, str, bool, int)  # study_uid, institution_name, fully_complete, total_images_done
 
 
 # ---------------------------------------------------------------------------
@@ -733,9 +733,9 @@ class TransferEngine:
             institution = study_series[0].institution_name
             # Log study-level aggregate to SQLite
             done_series = [j for j in study_series if j.status == "done"]
+            total_images = sum(j.transferred_images for j in done_series)
             if done_series:
                 first = done_series[0]
-                total_images = sum(j.transferred_images for j in done_series)
                 total_duration = sum(j.duration_seconds for j in done_series)
                 wall_start = self._series_start_times.get(
                     study_uid, time.time())
@@ -774,7 +774,7 @@ class TransferEngine:
             fully_complete = all(_ok_for_completion(j)
                                  for j in study_series)
             self.signals.study_completed.emit(
-                study_uid, institution, fully_complete)
+                study_uid, institution, fully_complete, total_images)
 
     def _check_patient_complete(self, patient_id: str):
         """Emit patient_studies_completed if all series for this patient

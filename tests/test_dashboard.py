@@ -1309,11 +1309,14 @@ class TestSoundPerStudyNotPerSeries:
         """All 3 series of study S1 are done → exactly one sound."""
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.3",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
         ]
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
@@ -1323,7 +1326,8 @@ class TestSoundPerStudyNotPerSeries:
         """Calling _check_study_complete again must not play a second sound."""
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
         ]
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
@@ -1347,9 +1351,11 @@ class TestSoundPerStudyNotPerSeries:
         triggers its own sound."""
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
             SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
         ]
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
@@ -1361,9 +1367,11 @@ class TestSoundPerStudyNotPerSeries:
         active group's study triggers a sound."""
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
-                      status="done", institution_name="Hospital Alpha"),
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
             SeriesJob(patient_id="P1", study_uid="S2", series_uid="2.1",
-                      status="done", institution_name="Clinic Beta"),
+                      status="done", institution_name="Clinic Beta",
+                      transferred_images=100),
         ]
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
@@ -1379,10 +1387,10 @@ class TestSoundPerStudyNotPerSeries:
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha",
-                      remote_count=300),
+                      remote_count=300, transferred_images=300),
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
                       status="done", institution_name="Hospital Alpha",
-                      remote_count=200),
+                      remote_count=200, transferred_images=200),
         ]
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
@@ -1395,7 +1403,7 @@ class TestSoundPerStudyNotPerSeries:
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha",
-                      remote_count=300),
+                      remote_count=300, transferred_images=300),
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
                       status="error", institution_name="Hospital Alpha",
                       remote_count=3),  # tiny series, failed
@@ -1410,7 +1418,7 @@ class TestSoundPerStudyNotPerSeries:
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha",
-                      remote_count=300),
+                      remote_count=300, transferred_images=300),
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.2",
                       status="error", institution_name="Hospital Alpha",
                       remote_count=50),  # not small; failure blocks
@@ -1418,6 +1426,30 @@ class TestSoundPerStudyNotPerSeries:
         with patch.object(self.dashboard, "_play_sound") as mock_play:
             self.engine._check_study_complete("S1")
         mock_play.assert_not_called()
+
+    def test_no_sound_when_fewer_than_21_images_downloaded(self):
+        """A fully-complete study whose total downloaded image count is
+        below MIN_IMAGES_FOR_NOTIFICATION_SOUND must NOT chime — it is
+        too small to be a meaningful exam."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha",
+                      remote_count=20, transferred_images=20),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_not_called()
+
+    def test_sound_when_exactly_21_images_downloaded(self):
+        """Boundary: 21 downloaded images must chime."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha",
+                      remote_count=21, transferred_images=21),
+        ]
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+        mock_play.assert_called_once()
 
     def test_series_completed_signal_does_not_trigger_sound(self):
         """The series_completed signal (per series) must NOT play sound."""

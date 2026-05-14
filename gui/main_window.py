@@ -452,7 +452,7 @@ class MainWindow(QMainWindow):
         e.signals.study_completed.connect(
             dashboard.on_study_completed)
         e.signals.study_completed.connect(
-            lambda uid, inst, full, eng=engine:
+            lambda uid, inst, full, images, eng=engine:
                 self._on_study_completed_live(eng, uid, full))
         e.signals.series_started.connect(dashboard.on_series_started)
         e.signals.stats_updated.connect(dashboard.on_stats_updated)

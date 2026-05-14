@@ -2,6 +2,21 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.10] — 2026-05-14
+
+### Changed
+- Notification sound is suppressed when a study's total downloaded
+  image count is below `MIN_IMAGES_FOR_NOTIFICATION_SOUND = 21`
+  (typically isolated small series, stray priors, or partial fetches
+  that would otherwise spam the user with chimes)
+- `study_completed` signal now carries the total downloaded image
+  count as a fourth argument so the dashboard can apply the new
+  size threshold without consulting the engine queue
+
+### Tests
+- 724 → 726 (+`test_no_sound_when_fewer_than_21_images_downloaded`,
+  +`test_sound_when_exactly_21_images_downloaded` for the boundary)
+
 ## [1.0.9] — 2026-05-14
 
 ### Fixed

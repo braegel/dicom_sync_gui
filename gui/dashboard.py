@@ -53,6 +53,13 @@ COLOR_ORANGE = "#f39c12"
 COLOR_BLUE_ACCENT = "#3498db"
 COLOR_MUTED = "#969696"
 
+# Notification sound suppression threshold: studies whose total
+# downloaded image count is below this are treated as "too small to
+# be a real exam" and play no completion sound — typically isolated
+# small series, stray priors, or partial fetches that would otherwise
+# spam the user.
+MIN_IMAGES_FOR_NOTIFICATION_SOUND = 21
+
 _default_sound_path: str | None = None
 _sad_sound_path: str | None = None
 
@@ -957,10 +964,23 @@ class SourceDashboard(QWidget):
 
     def on_study_completed(self, study_uid: str,
                            institution_name: str,
-                           fully_complete: bool = True):
+                           fully_complete: bool = True,
+                           image_count: Optional[int] = None):
         """Slot for study_completed — play notification sound
-        only when the study was fully downloaded."""
+        only when the study was fully downloaded *and* enough images
+        actually arrived.
+
+        ``image_count`` is the total number of images downloaded for
+        this study (sum of ``transferred_images`` over done series).
+        When the count is below ``MIN_IMAGES_FOR_NOTIFICATION_SOUND``
+        the study is treated as too small to chime — typically a
+        stray prior or a partial fetch.  ``None`` (the default used
+        by direct unit-test calls) skips the size check.
+        """
         if not fully_complete:
+            return
+        if (image_count is not None
+                and image_count < MIN_IMAGES_FOR_NOTIFICATION_SOUND):
             return
         self._play_notification_if_allowed(institution_name)
 
