@@ -92,6 +92,76 @@ class TestMainWindowInit:
             "for done series of this study only")
         assert kwargs["download_duration_seconds"] == 30.0
 
+    def test_study_completed_live_skips_entry_below_min_images(self):
+        """Studies whose total downloaded image count is below
+        MIN_IMAGES_FOR_COMPLETIONS_ENTRY (10) must NOT appear in the
+        Download Completions window — they're too small to be
+        meaningful exam records."""
+        engine = MagicMock()
+        engine.queue_snapshot.return_value = [
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=5, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=4, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+        ]
+        engine.pop_study_wall_clock.return_value = 12.0
+
+        with patch.object(
+                self.win.completions_window, "add_completion") as mock_add:
+            self.win._on_study_completed_live(
+                engine, "S1", fully_complete=True)
+
+        mock_add.assert_not_called()
+
+    def test_study_completed_live_skips_entry_just_below_threshold(self):
+        """Boundary: 9 downloaded images must be filtered out."""
+        engine = MagicMock()
+        engine.queue_snapshot.return_value = [
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=9, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+        ]
+        engine.pop_study_wall_clock.return_value = 5.0
+
+        with patch.object(
+                self.win.completions_window, "add_completion") as mock_add:
+            self.win._on_study_completed_live(
+                engine, "S1", fully_complete=True)
+
+        mock_add.assert_not_called()
+
+    def test_study_completed_live_includes_entry_at_threshold(self):
+        """Boundary: exactly 10 downloaded images must appear."""
+        engine = MagicMock()
+        engine.queue_snapshot.return_value = [
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=10, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+        ]
+        engine.pop_study_wall_clock.return_value = 5.0
+
+        with patch.object(
+                self.win.completions_window, "add_completion") as mock_add:
+            self.win._on_study_completed_live(
+                engine, "S1", fully_complete=True)
+
+        mock_add.assert_called_once()
+        kwargs = mock_add.call_args.kwargs
+        assert kwargs["image_count"] == 10
+
+    def test_min_images_for_completions_entry_is_ten(self):
+        """The threshold constant for Download Completions filtering
+        must be exposed and equal 10.  Pinning it here so the value
+        is not silently changed without updating the spec."""
+        from gui.main_window import MIN_IMAGES_FOR_COMPLETIONS_ENTRY
+        assert MIN_IMAGES_FOR_COMPLETIONS_ENTRY == 10
+
     def test_update_completions_progress_aggregates_engines(self):
         """_update_completions_progress must sum pending images and
         transfer rates across all running engines and forward them

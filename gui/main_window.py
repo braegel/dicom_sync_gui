@@ -33,6 +33,11 @@ from gui.live_completions import LiveCompletionsWindow
 
 logger = logging.getLogger("dicom_sync")
 
+# Studies whose total downloaded image count is below this threshold
+# are not added to the Download Completions window — they're too small
+# to be meaningful exam records.
+MIN_IMAGES_FOR_COMPLETIONS_ENTRY = 10
+
 
 class MainWindow(QMainWindow):
     """Main application window — per-source tabs, fully automatic."""
@@ -301,6 +306,8 @@ class MainWindow(QMainWindow):
         first = study_jobs[0]
         wall_clock = engine.pop_study_wall_clock(study_uid)
         total_images = sum(j.transferred_images for j in study_jobs)
+        if total_images < MIN_IMAGES_FOR_COMPLETIONS_ENTRY:
+            return
         self.completions_window.add_completion(
             patient_name=first.patient_name,
             study_description=first.study_description,
