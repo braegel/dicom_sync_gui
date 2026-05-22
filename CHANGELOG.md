@@ -2,6 +2,42 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.0.11] — 2026-05-22
+
+### Added
+- **Download Completions: Copy button moved to the first column** so
+  it remains reachable on narrow windows without horizontal scrolling
+- **Sortable column headers** in the Download Completions table —
+  click any column title to sort ascending; click again for
+  descending
+- **Aggregation by study_uid**: when late-arriving series for an
+  already-completed study come in during a later query cycle, the
+  existing row in the Download Completions window is *updated*
+  (image_count and download_duration_seconds summed, completed_time
+  advanced to the latest, Copy button rebound to the new
+  timestamp) instead of a duplicate row being appended.  Different
+  studies still get separate rows.
+
+### Changed
+- **Studies with fewer than 10 downloaded images are filtered out**
+  of the Download Completions window (stray priors, partial fetches
+  and isolated tiny series no longer clutter the list).  Threshold
+  lives in `MIN_IMAGES_FOR_COMPLETIONS_ENTRY` in `gui/main_window.py`
+
+### Internal
+- Per-row state in the completions table (study_uid, image_count,
+  download_duration, delay) now lives on the `QTableWidgetItem`s
+  themselves via `Qt.UserRole`; the parallel lists `_delays`,
+  `_durations`, `_study_uids` are gone.  Aggregation lookup and
+  stat-colour helpers are now sort-stable.
+- Magic column indices replaced with module constants
+  (`_COL_COPY`, `_COL_PATIENT`, …, `_COL_DELAY`).
+
+### Tests
+- 726 → 744 (+18 covering the cutoff, copy-in-first-column,
+  sortable headers, aggregation, position stability, and the
+  ~21-image notification-sound threshold boundary)
+
 ## [1.0.10] — 2026-05-14
 
 ### Changed

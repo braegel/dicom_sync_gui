@@ -14,8 +14,8 @@ no Python installation required.
 
 | File | Architecture | Size |
 |---|---|---|
-| [`DICOM_Sync_1.0.10_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.10/DICOM_Sync_1.0.10_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~59 MB |
-| [`DICOM_Sync_1.0.10_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.10/DICOM_Sync_1.0.10_macOS_x86_64.dmg) | Intel | ~63 MB |
+| [`DICOM_Sync_1.0.11_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.11/DICOM_Sync_1.0.11_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~59 MB |
+| [`DICOM_Sync_1.0.11_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.0.11/DICOM_Sync_1.0.11_macOS_x86_64.dmg) | Intel | ~63 MB |
 
 **Installation:**
 
@@ -262,7 +262,7 @@ to an active filter group.
 
 ## Running tests
 
-The project includes a comprehensive test suite (726 tests).
+The project includes a comprehensive test suite (744 tests).
 
 ```bash
 # Linux / macOS (headless — no display required)
@@ -320,9 +320,9 @@ ARCH=arm64   # or x86_64
 mkdir -p _dmg
 cp -R "dist/DICOM Sync.app" _dmg/
 ln -s /Applications _dmg/Applications
-hdiutil create -volname "DICOM Sync 1.0.10" \
+hdiutil create -volname "DICOM Sync 1.0.11" \
   -srcfolder _dmg -ov -format UDZO \
-  releases/DICOM_Sync_1.0.10_macOS_${ARCH}.dmg
+  releases/DICOM_Sync_1.0.11_macOS_${ARCH}.dmg
 rm -rf _dmg
 ```
 
@@ -336,7 +336,7 @@ rm -rf _dmg
 ```
 dicom_sync_gui/
 ├── main.py                         # Entry point, dark theme, dependency check
-├── __init__.py                     # Package version (1.0.10)
+├── __init__.py                     # Package version (1.0.11)
 ├── __main__.py                     # python -m support
 ├── requirements.txt                # pip dependencies
 ├── dicom_sync.spec                 # PyInstaller build spec
@@ -350,7 +350,7 @@ dicom_sync_gui/
 │   └── AppIcon.icns                # macOS application icon
 │
 ├── releases/
-│   └── DICOM_Sync_1.0.10_macOS_*.dmg   # Standalone macOS app (arm64 + x86_64)
+│   └── DICOM_Sync_1.0.11_macOS_*.dmg   # Standalone macOS app (arm64 + x86_64)
 │
 ├── core/
 │   ├── config.py                   # AppConfig, PacsNode, load/save
@@ -372,7 +372,7 @@ dicom_sync_gui/
 │   ├── log_window.py               # Floating log viewer
 │   └── styles.py                   # Shared button stylesheet constants
 │
-└── tests/                          # 726 tests
+└── tests/                          # 744 tests
     ├── conftest.py                 # Shared fixtures
     ├── test_config.py
     ├── test_dicom_ops.py
