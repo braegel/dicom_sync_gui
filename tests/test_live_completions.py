@@ -806,6 +806,273 @@ def _find_copy_button(window, row: int):
     return None
 
 
+def _column_index_for_header(window, needle: str) -> int:
+    """Return the column index whose header text contains *needle*
+    (case-insensitive).  -1 if no column matches."""
+    t = window.completions_table
+    needle = needle.lower()
+    for c in range(t.columnCount()):
+        item = t.horizontalHeaderItem(c)
+        if item and needle in item.text().lower():
+            return c
+    return -1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Copy button is in column 0  +  table is sortable by column header
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCopyButtonInFirstColumn:
+    """The per-row Copy button must live in the FIRST column so the
+    user can click it without horizontally scrolling on narrow windows."""
+
+    def test_copy_button_lives_in_column_zero(self, window):
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        t = window.completions_table
+        cell0 = t.cellWidget(0, 0)
+        # Either the cell widget itself is the button, or it wraps one.
+        if isinstance(cell0, QPushButton):
+            assert cell0.text().strip().lower().startswith("copy")
+            return
+        assert cell0 is not None, (
+            "column 0 must host the per-row Copy button widget")
+        buttons = cell0.findChildren(QPushButton)
+        assert buttons, (
+            "column 0 must contain a QPushButton (the Copy button)")
+        assert buttons[0].text().strip().lower().startswith("copy")
+
+    def test_copy_button_is_not_in_last_column(self, window):
+        """Regression guard: after the move, no Copy button should
+        remain in the previous last-column slot."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        t = window.completions_table
+        last = t.columnCount() - 1
+        w = t.cellWidget(0, last)
+        if w is None:
+            return  # nothing in last column = fine
+        if isinstance(w, QPushButton):
+            assert not w.text().strip().lower().startswith("copy"), (
+                "Copy button must have moved out of the last column")
+        else:
+            buttons = w.findChildren(QPushButton)
+            assert not any(b.text().strip().lower().startswith("copy")
+                           for b in buttons), (
+                "Copy button must have moved out of the last column")
+
+
+class TestAggregateByStudyUid:
+    """When the engine emits study_completed multiple times for the
+    same study_uid (because more series arrived for that study in a
+    later query cycle), the Download Completions window must UPDATE
+    the existing row instead of appending a duplicate.  Numeric
+    fields (image_count, download_duration_seconds) are summed; the
+    completed_time advances to the latest.
+    """
+
+    def test_repeated_study_uid_keeps_single_row(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=100,
+            download_duration_seconds=20.0,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0,
+        )
+        assert window.completions_table.rowCount() == 1, (
+            "two add_completion calls with the same study_uid must "
+            "leave exactly one row in the table")
+
+    def test_image_count_is_summed(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=100,
+            download_duration_seconds=20.0,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0,
+        )
+        images_col = _column_index_for_header(window, "images")
+        assert images_col >= 0
+        assert window.completions_table.item(0, images_col).text() == "150"
+
+    def test_completed_time_advances_to_latest(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=100,
+            download_duration_seconds=20.0,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0,
+        )
+        comp_col = _column_index_for_header(window, "completed")
+        assert comp_col >= 0
+        assert "08:20:00" in window.completions_table.item(0, comp_col).text()
+
+    def test_download_duration_is_summed(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=100,
+            download_duration_seconds=20.0,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:30",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0,
+        )
+        dur_col = _column_index_for_header(window, "duration")
+        assert dur_col >= 0
+        # 20 + 10 = 30 seconds total → "0:30"
+        assert window.completions_table.item(0, dur_col).text() == "0:30"
+
+    def test_different_study_uids_remain_separate_rows(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=100,
+        )
+        window.add_completion(
+            study_uid="S2", patient_name="B", study_description="MR",
+            study_time="090000", completed_time="09:15:30",
+            institution_name="Y", image_count=50,
+        )
+        assert window.completions_table.rowCount() == 2
+
+    def test_aggregated_row_stays_at_original_position(self, window):
+        """Aggregating must NOT move the row — the existing entry
+        stays where it is, only its contents update."""
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=100,
+        )
+        window.add_completion(
+            study_uid="S2", patient_name="B", study_description="MR",
+            study_time="090000", completed_time="09:15:30",
+            institution_name="Y", image_count=50,
+        )
+        # After two inserts at row 0: S2 at row 0, S1 at row 1.
+        # An aggregation hit on S1 must keep S1 at row 1.
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=25,
+        )
+
+        assert window.completions_table.rowCount() == 2
+        patient_col = _column_index_for_header(window, "patient")
+        assert window.completions_table.item(0, patient_col).text() == "B"
+        assert window.completions_table.item(1, patient_col).text() == "A"
+
+    def test_copy_button_on_aggregated_row_uses_latest_time(
+            self, window, qapp):
+        """After aggregation, the per-row Copy button must copy the
+        LATEST completed_time, not the original one."""
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=100,
+            download_duration_seconds=20.0,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0,
+        )
+        QApplication.clipboard().clear()
+        _find_copy_button(window, row=0).click()
+        text = QApplication.clipboard().text()
+        assert "08:20:00" in text
+        assert "08:15:30" not in text
+
+
+class TestSortableColumns:
+    """Clicking a column header sorts the table by that column,
+    toggling ascending → descending → ascending."""
+
+    def test_sorting_is_enabled(self, window):
+        assert window.completions_table.isSortingEnabled(), (
+            "completions table must enable QTableWidget sorting so "
+            "column headers are clickable")
+
+    def test_header_sort_indicator_shown(self, window):
+        header = window.completions_table.horizontalHeader()
+        assert header.isSortIndicatorShown(), (
+            "header must visibly show a sort-direction arrow")
+
+    def test_sort_by_patient_ascending_reorders_rows(self, window):
+        """Insert rows out of order, ask for ascending sort by Patient,
+        rows must reorder lexicographically."""
+        window.add_completion(
+            patient_name="Charlie", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+        window.add_completion(
+            patient_name="Alpha", study_description="CT",
+            study_time="080100", completed_time="08:16:30",
+            institution_name="X",
+        )
+        window.add_completion(
+            patient_name="Bravo", study_description="CT",
+            study_time="080200", completed_time="08:17:30",
+            institution_name="X",
+        )
+        patient_col = _column_index_for_header(window, "patient")
+        assert patient_col >= 0, "no Patient column found"
+
+        window.completions_table.sortByColumn(patient_col, Qt.AscendingOrder)
+
+        order = [window.completions_table.item(r, patient_col).text()
+                 for r in range(window.completions_table.rowCount())]
+        assert order == ["Alpha", "Bravo", "Charlie"], (
+            f"ascending sort expected [Alpha, Bravo, Charlie], "
+            f"got {order}")
+
+    def test_sort_toggles_descending_on_second_click(self, window):
+        """Re-sorting the same column in descending order reverses
+        the rows."""
+        for name in ("Charlie", "Alpha", "Bravo"):
+            window.add_completion(
+                patient_name=name, study_description="CT",
+                study_time="080000", completed_time="08:15:30",
+                institution_name="X",
+            )
+        patient_col = _column_index_for_header(window, "patient")
+        assert patient_col >= 0
+
+        window.completions_table.sortByColumn(patient_col, Qt.AscendingOrder)
+        window.completions_table.sortByColumn(patient_col, Qt.DescendingOrder)
+
+        order = [window.completions_table.item(r, patient_col).text()
+                 for r in range(window.completions_table.rowCount())]
+        assert order == ["Charlie", "Bravo", "Alpha"], (
+            f"descending sort expected [Charlie, Bravo, Alpha], "
+            f"got {order}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Copy button localization — clipboard text in the configured language
 # ═══════════════════════════════════════════════════════════════════════════

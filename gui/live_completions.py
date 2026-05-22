@@ -22,6 +22,19 @@ from core.i18n import tr
 _RED = QColor("#e74c3c")
 _GREEN = QColor("#2ecc71")
 
+# Column layout — kept here so add_completion, _update_existing_row,
+# and the stat-colour helpers all agree on which cell is which.
+_COL_COPY = 0
+_COL_PATIENT = 1
+_COL_STUDY_DESC = 2
+_COL_INSTITUTION = 3
+_COL_ACQ = 4
+_COL_COMPLETED = 5
+_COL_DURATION = 6
+_COL_IMAGES = 7
+_COL_IPM = 8
+_COL_DELAY = 9
+
 
 def _parse_time(s: str) -> Optional[tuple[int, int, int]]:
     """Parse HH:MM:SS or HHMMSS into (hours, minutes, seconds).
@@ -63,8 +76,12 @@ class LiveCompletionsWindow(QWidget):
         self.setWindowFlags(Qt.Window)
         self.setMinimumSize(600, 300)
         self._language = language
-        self._delays: list[float] = []
-        self._durations: list[Optional[float]] = []
+        # Per-row state (study_uid, image_count, duration, delay) lives
+        # on the table items themselves via ``Qt.UserRole`` so:
+        #   1. Aggregation for repeat study_uid emits stays sort-stable
+        #      (lookup scans rows; the data follows the item).
+        #   2. Stat-colour helpers read the raw values straight from the
+        #      cells they're colouring, which is also sort-stable.
         self._setup_ui()
 
     def _setup_ui(self):
@@ -73,12 +90,14 @@ class LiveCompletionsWindow(QWidget):
         self.completions_table = QTableWidget()
         self.completions_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.completions_table.setAlternatingRowColors(True)
-        headers = ["Patient", "Study Description", "Institution",
+        headers = ["", "Patient", "Study Description", "Institution",
                     "Time Acquired", "Download Completed",
                     "Download Duration", "Images", "img/min",
-                    "Delay", ""]
+                    "Delay"]
         self.completions_table.setColumnCount(len(headers))
         self.completions_table.setHorizontalHeaderLabels(headers)
+        self.completions_table.setSortingEnabled(True)
+        self.completions_table.horizontalHeader().setSortIndicatorShown(True)
         self.completions_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents)
         # Row height must auto-fit the per-row Copy button — the global
@@ -116,12 +135,24 @@ class LiveCompletionsWindow(QWidget):
         bottom.addWidget(self.btn_clear)
         layout.addLayout(bottom)
 
-    def add_completion(self, *, patient_name: str, study_description: str,
+    def add_completion(self, *,
+                       study_uid: Optional[str] = None,
+                       patient_name: str, study_description: str,
                        study_time: str, completed_time: str,
                        institution_name: str = "",
                        download_duration_seconds: Optional[float] = None,
                        image_count: Optional[int] = None):
-        # Format study_time HHMMSS → HH:MM:SS
+        """Add (or aggregate) a completed-study entry.
+
+        When *study_uid* is supplied and a row with the same UID
+        already exists in the table, the new values fold into that
+        row: ``image_count`` and ``download_duration_seconds`` are
+        summed, ``completed_time`` advances to the latest, and the
+        Copy button is rebound to the latest timestamp.
+
+        When *study_uid* is ``None`` (the legacy / unit-test case),
+        no aggregation is attempted and a fresh row is inserted.
+        """
         acq = _parse_time(study_time)
         comp = _parse_time(completed_time)
 
@@ -134,23 +165,26 @@ class LiveCompletionsWindow(QWidget):
             if comp is not None else completed_time
         )
 
-        # Compute delay in seconds
-        delay_seconds = None
+        delay_seconds: Optional[float] = None
         if acq and comp:
             delay_seconds = _time_to_seconds(*comp) - _time_to_seconds(*acq)
 
-        delay_text = _format_delay(delay_seconds) if delay_seconds is not None else "—"
+        if study_uid is not None:
+            existing_row = self._find_row_by_study_uid(study_uid)
+            if existing_row >= 0:
+                self._update_existing_row(
+                    existing_row,
+                    formatted_comp=formatted_comp,
+                    new_image_count=image_count,
+                    new_duration=download_duration_seconds,
+                    delay_seconds=delay_seconds,
+                )
+                return
 
-        if delay_seconds is not None:
-            self._delays.insert(0, delay_seconds)
-
-        self._durations.insert(0, download_duration_seconds)
-
-        if download_duration_seconds is not None:
-            dl_text = _format_delay(int(download_duration_seconds))
-        else:
-            dl_text = "—"
-
+        delay_text = (_format_delay(int(delay_seconds))
+                      if delay_seconds is not None else "—")
+        dl_text = (_format_delay(int(download_duration_seconds))
+                   if download_duration_seconds is not None else "—")
         images_text = str(image_count) if image_count is not None else "—"
         if (image_count is not None
                 and download_duration_seconds is not None
@@ -160,17 +194,65 @@ class LiveCompletionsWindow(QWidget):
         else:
             ipm_text = "—"
 
-        self.completions_table.insertRow(0)
-        self.completions_table.setItem(0, 0, QTableWidgetItem(patient_name))
-        self.completions_table.setItem(0, 1, QTableWidgetItem(study_description))
-        self.completions_table.setItem(0, 2, QTableWidgetItem(institution_name))
-        self.completions_table.setItem(0, 3, QTableWidgetItem(formatted_acq))
-        self.completions_table.setItem(0, 4, QTableWidgetItem(formatted_comp))
-        self.completions_table.setItem(0, 5, QTableWidgetItem(dl_text))
-        self.completions_table.setItem(0, 6, QTableWidgetItem(images_text))
-        self.completions_table.setItem(0, 7, QTableWidgetItem(ipm_text))
-        self.completions_table.setItem(0, 8, QTableWidgetItem(delay_text))
+        # Disable sorting during the insert so Qt doesn't re-sort while
+        # we're still populating the row.
+        was_sorting = self.completions_table.isSortingEnabled()
+        self.completions_table.setSortingEnabled(False)
 
+        row = 0
+        self.completions_table.insertRow(row)
+
+        pat_item = QTableWidgetItem(patient_name)
+        if study_uid is not None:
+            pat_item.setData(Qt.UserRole, study_uid)
+        self.completions_table.setItem(row, _COL_PATIENT, pat_item)
+        self.completions_table.setItem(
+            row, _COL_STUDY_DESC, QTableWidgetItem(study_description))
+        self.completions_table.setItem(
+            row, _COL_INSTITUTION, QTableWidgetItem(institution_name))
+        self.completions_table.setItem(
+            row, _COL_ACQ, QTableWidgetItem(formatted_acq))
+        self.completions_table.setItem(
+            row, _COL_COMPLETED, QTableWidgetItem(formatted_comp))
+
+        dur_item = QTableWidgetItem(dl_text)
+        dur_item.setData(Qt.UserRole, download_duration_seconds)
+        self.completions_table.setItem(row, _COL_DURATION, dur_item)
+
+        img_item = QTableWidgetItem(images_text)
+        img_item.setData(Qt.UserRole, image_count or 0)
+        self.completions_table.setItem(row, _COL_IMAGES, img_item)
+
+        self.completions_table.setItem(
+            row, _COL_IPM, QTableWidgetItem(ipm_text))
+
+        delay_item = QTableWidgetItem(delay_text)
+        delay_item.setData(Qt.UserRole, delay_seconds)
+        self.completions_table.setItem(row, _COL_DELAY, delay_item)
+
+        self._install_copy_button(row=row, formatted_comp=formatted_comp)
+
+        if was_sorting:
+            self.completions_table.setSortingEnabled(True)
+
+        self._update_stats()
+
+    def _find_row_by_study_uid(self, study_uid: str) -> int:
+        """Return the table row that carries *study_uid* in its
+        Patient-cell UserRole, or ``-1`` if no row matches.  Sort-
+        stable: scans the table directly, no parallel list."""
+        t = self.completions_table
+        for row in range(t.rowCount()):
+            item = t.item(row, _COL_PATIENT)
+            if item is not None and item.data(Qt.UserRole) == study_uid:
+                return row
+        return -1
+
+    def _install_copy_button(self, *, row: int, formatted_comp: str):
+        """Place a Copy button in column 0 of *row* that copies the
+        localized "Image transfer completed: HH:MM:SS" line to the
+        clipboard.  Replaces any existing button at that cell so the
+        captured timestamp is always the latest."""
         copy_btn = QPushButton("Copy")
         # Override the global dark-theme QPushButton padding/min-height
         # so the button fits comfortably inside a table row.
@@ -180,18 +262,91 @@ class LiveCompletionsWindow(QWidget):
         copy_btn.clicked.connect(
             lambda checked=False, t=formatted_comp, p=prefix:
                 QApplication.clipboard().setText(f"{p}: {t}"))
-        self.completions_table.setCellWidget(0, 9, copy_btn)
+        self.completions_table.setCellWidget(row, 0, copy_btn)
+
+    def _update_existing_row(self, row: int, *,
+                             formatted_comp: str,
+                             new_image_count: Optional[int],
+                             new_duration: Optional[float],
+                             delay_seconds: Optional[float]):
+        """Fold a repeat ``study_completed`` emit into the existing row.
+
+        Sums ``image_count`` and ``download_duration_seconds`` against
+        what's already on the cells (stored in ``Qt.UserRole``),
+        advances completed_time to the latest, re-derives delay and
+        img/min from the new totals, and re-installs the Copy button
+        so it grabs the latest timestamp.
+
+        Reads/writes go through the items directly (not parallel
+        lists), so this is sort-stable.
+        """
+        t = self.completions_table
+        was_sorting = t.isSortingEnabled()
+        t.setSortingEnabled(False)
+
+        dur_item = t.item(row, _COL_DURATION)
+        existing_dur = dur_item.data(Qt.UserRole) or 0.0
+        total_dur = existing_dur + (new_duration or 0.0)
+
+        img_item = t.item(row, _COL_IMAGES)
+        existing_images = img_item.data(Qt.UserRole) or 0
+        total_images = existing_images + (new_image_count or 0)
+
+        dl_text = (_format_delay(int(total_dur))
+                   if total_dur > 0 else "—")
+        images_text = str(total_images) if total_images > 0 else "—"
+        if total_images > 0 and total_dur > 0:
+            ipm = total_images * 60.0 / total_dur
+            ipm_text = f"{int(round(ipm))}"
+        else:
+            ipm_text = "—"
+        delay_text = (_format_delay(int(delay_seconds))
+                      if delay_seconds is not None else "—")
+
+        t.item(row, _COL_COMPLETED).setText(formatted_comp)
+
+        dur_item.setText(dl_text)
+        dur_item.setData(Qt.UserRole,
+                         total_dur if total_dur > 0 else None)
+
+        img_item.setText(images_text)
+        img_item.setData(Qt.UserRole, total_images)
+
+        t.item(row, _COL_IPM).setText(ipm_text)
+
+        delay_item = t.item(row, _COL_DELAY)
+        delay_item.setText(delay_text)
+        delay_item.setData(Qt.UserRole, delay_seconds)
+
+        self._install_copy_button(row=row, formatted_comp=formatted_comp)
+
+        if was_sorting:
+            t.setSortingEnabled(True)
 
         self._update_stats()
+
+    def _collect_column_values(self, col: int) -> list:
+        """Return all non-None ``Qt.UserRole`` values stored in *col*."""
+        t = self.completions_table
+        out = []
+        for row in range(t.rowCount()):
+            item = t.item(row, col)
+            if item is None:
+                continue
+            v = item.data(Qt.UserRole)
+            if v is not None:
+                out.append(v)
+        return out
 
     def _update_stats(self):
         self._update_duration_colors()
 
-        if not self._delays:
+        delays = self._collect_column_values(_COL_DELAY)
+        if not delays:
             self.lbl_median_delay.setText("—")
             return
 
-        s = sorted(self._delays)
+        s = sorted(delays)
         n = len(s)
         mid = n // 2
         median = s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
@@ -200,34 +355,23 @@ class LiveCompletionsWindow(QWidget):
         if n < 2:
             return
 
-        mean = sum(self._delays) / n
-        variance = sum((v - mean) ** 2 for v in self._delays) / n
+        mean = sum(delays) / n
+        variance = sum((v - mean) ** 2 for v in delays) / n
         stddev = math.sqrt(variance)
-
         if stddev < 0.001:
             return
 
-        delay_col = 8
-        for row in range(self.completions_table.rowCount()):
-            idx = row  # _delays[0] = newest = row 0
-            if idx >= len(self._delays):
-                break
-            d = self._delays[idx]
-            item = self.completions_table.item(row, delay_col)
-            if item is None:
-                continue
-            if d > median + stddev:
-                item.setForeground(QBrush(_RED))
-            elif d < median - stddev:
-                item.setForeground(QBrush(_GREEN))
-            else:
-                item.setForeground(QBrush(QColor("white")))
+        self._colour_column_by_bands(
+            _COL_DELAY,
+            high=median + stddev,
+            low=median - stddev,
+        )
 
     def _update_duration_colors(self):
         """Color the Download Duration column: red if > median + 2σ,
         green if < median - 2σ. Uses 2σ (vs 1σ for Delay) because
         download time varies more with study size."""
-        durations = [d for d in self._durations if d is not None]
+        durations = self._collect_column_values(_COL_DURATION)
         if len(durations) < 2:
             return
 
@@ -241,19 +385,28 @@ class LiveCompletionsWindow(QWidget):
         if stddev < 0.001:
             return
 
-        duration_col = 5
-        hi = median + 2 * stddev
-        lo = median - 2 * stddev
-        for row in range(self.completions_table.rowCount()):
-            if row >= len(self._durations):
-                break
-            d = self._durations[row]
-            item = self.completions_table.item(row, duration_col)
-            if item is None or d is None:
+        self._colour_column_by_bands(
+            _COL_DURATION,
+            high=median + 2 * stddev,
+            low=median - 2 * stddev,
+        )
+
+    def _colour_column_by_bands(self, col: int, *,
+                                high: float, low: float):
+        """Paint the cells in *col* red above *high*, green below
+        *low*, white otherwise.  Reads the raw value from each cell's
+        ``Qt.UserRole``, so this is sort-stable."""
+        t = self.completions_table
+        for row in range(t.rowCount()):
+            item = t.item(row, col)
+            if item is None:
                 continue
-            if d > hi:
+            d = item.data(Qt.UserRole)
+            if d is None:
+                continue
+            if d > high:
                 item.setForeground(QBrush(_RED))
-            elif d < lo:
+            elif d < low:
                 item.setForeground(QBrush(_GREEN))
             else:
                 item.setForeground(QBrush(QColor("white")))
@@ -297,8 +450,6 @@ class LiveCompletionsWindow(QWidget):
 
     def _clear(self):
         self.completions_table.setRowCount(0)
-        self._delays.clear()
-        self._durations.clear()
         self.lbl_median_delay.setText("—")
         self._remaining_seconds = 0.0
         self._ete_timer.stop()

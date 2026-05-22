@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
         if total_images < MIN_IMAGES_FOR_COMPLETIONS_ENTRY:
             return
         self.completions_window.add_completion(
+            study_uid=study_uid,
             patient_name=first.patient_name,
             study_description=first.study_description,
             study_time=first.study_time,

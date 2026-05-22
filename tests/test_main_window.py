@@ -155,6 +155,27 @@ class TestMainWindowInit:
         kwargs = mock_add.call_args.kwargs
         assert kwargs["image_count"] == 10
 
+    def test_study_completed_live_passes_study_uid(self):
+        """_on_study_completed_live must forward the study_uid to
+        add_completion so the completions window can aggregate later
+        emits for the same study into a single row."""
+        engine = MagicMock()
+        engine.queue_snapshot.return_value = [
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=100, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+        ]
+        engine.pop_study_wall_clock.return_value = 12.0
+
+        with patch.object(
+                self.win.completions_window, "add_completion") as mock_add:
+            self.win._on_study_completed_live(
+                engine, "S1", fully_complete=True)
+
+        mock_add.assert_called_once()
+        assert mock_add.call_args.kwargs["study_uid"] == "S1"
+
     def test_min_images_for_completions_entry_is_ten(self):
         """The threshold constant for Download Completions filtering
         must be exposed and equal 10.  Pinning it here so the value
