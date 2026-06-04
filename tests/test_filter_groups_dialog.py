@@ -296,7 +296,7 @@ class TestFilterGroupsQuery:
         mock_warning.assert_called_once()
 
     @patch("gui.filter_groups_dialog.DicomOperations")
-    @patch("gui.filter_groups_dialog.threading.Thread")
+    @patch("gui.async_helpers.threading.Thread")
     def test_query_discovers_institutions(
         self, MockThread, MockOps
     ):
@@ -320,7 +320,7 @@ class TestFilterGroupsQuery:
         assert "Found" in self.dialog.lbl_query_status.text()
 
     @patch("gui.filter_groups_dialog.DicomOperations")
-    @patch("gui.filter_groups_dialog.threading.Thread")
+    @patch("gui.async_helpers.threading.Thread")
     def test_query_does_not_overwrite_existing_assignments(
         self, MockThread, MockOps
     ):
@@ -339,3 +339,35 @@ class TestFilterGroupsQuery:
 
         # Should keep existing assignment
         assert self.dialog._assignments["Hospital Alpha"] == "Group A"
+
+    @patch("gui.filter_groups_dialog.DicomOperations")
+    @patch("gui.async_helpers.threading.Thread")
+    def test_query_uses_per_source_local_ae(self, MockThread, MockOps):
+        """Each source PACS must be queried with ITS OWN local AE, not
+        the first source's local config reused for everyone.  Otherwise
+        on multi-source setups with different local destinations the
+        C-FIND is sent from the wrong calling AE."""
+        mock_ops = MagicMock()
+        mock_ops.c_find_institution_names.return_value = []
+        MockOps.return_value = mock_ops
+
+        def run_synchronously(**kwargs):
+            thread = MagicMock()
+            thread.start = lambda: kwargs["target"]()
+            return thread
+        MockThread.side_effect = run_synchronously
+
+        self.dialog._query_institutions()
+
+        # Two sources in populated_config — ct (LOCAL_AE/11112) and
+        # mri (ARZT_4/11113).  DicomOperations must have been
+        # constructed once per source with the matching local config.
+        local_ae_titles_used = sorted(
+            call.args[0]["ae_title"] for call in MockOps.call_args_list
+        )
+        assert local_ae_titles_used == ["ARZT_4", "LOCAL_AE"]
+        # Belt-and-braces: also the local port must differ.
+        local_ports_used = sorted(
+            call.args[0]["port"] for call in MockOps.call_args_list
+        )
+        assert local_ports_used == [11112, 11113]

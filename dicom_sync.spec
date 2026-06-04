@@ -1,11 +1,33 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for DICOM Sync GUI — macOS .app bundle."""
 
+import re
 import sys
 from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH)
+
+
+def _read_version() -> str:
+    """Read ``__version__`` from ``__init__.py`` so the spec and the
+    Python package share one source of truth and can't drift."""
+    init_path = ROOT / "__init__.py"
+    text = init_path.read_text(encoding="utf-8")
+    # Anchor at start of line AND require nothing after the closing
+    # quote except whitespace/end-of-line so a stray
+    # ``__version_history__`` line can't ever be mistaken for the
+    # version literal.
+    m = re.search(
+        r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$',
+        text, re.MULTILINE)
+    if not m:
+        raise RuntimeError(
+            f"could not find __version__ in {init_path}")
+    return m.group(1)
+
+
+_VERSION = _read_version()
 
 a = Analysis(
     [str(ROOT / "main.py")],
@@ -58,8 +80,8 @@ app = BUNDLE(
     bundle_identifier="com.dicomsync.gui",
     info_plist={
         "CFBundleDisplayName": "DICOM Sync",
-        "CFBundleShortVersionString": "1.0.11",
-        "CFBundleVersion": "1.0.11",
+        "CFBundleShortVersionString": _VERSION,
+        "CFBundleVersion": _VERSION,
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "12.0",
         "NSLocalNetworkUsageDescription":

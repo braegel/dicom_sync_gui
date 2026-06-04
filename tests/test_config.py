@@ -11,7 +11,7 @@ import pytest
 
 from core.config import (
     AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES, RETRIEVE_METHODS,
-    DEFAULT_CONFIG_FILE, get_local_ip,
+    DEFAULT_CONFIG_FILE, get_local_ip, default_priority_terms,
 )
 
 
@@ -172,6 +172,75 @@ class TestPacsNode:
         assert restored.local_port == 22222
         assert restored.local_syntax == "JPEGLossless"
         assert restored.fallback_folder == "/my/fallback"
+
+
+class TestPacsNodePrioritySeriesTerms:
+    """Per-source priority series list: keyword / regex entries that
+    bias the engine's per-cycle queue ordering toward studies whose
+    series descriptions match.  List index 0 = highest priority."""
+
+    DEFAULT_TERMS = (
+        "cct", "cta", "ct-a", "angio", "nevas",
+        "perf", "perfusion", "ctp", "ct-p",
+    )
+
+    def test_default_priority_terms_helper_returns_expected_entries(self):
+        terms = default_priority_terms()
+        assert [t["term"] for t in terms] == list(self.DEFAULT_TERMS)
+        assert all(t["is_regex"] is False for t in terms)
+
+    def test_default_priority_terms_returns_fresh_list_each_call(self):
+        """Mutating the returned list must not poison subsequent
+        callers — important since the helper is used as a default
+        value seeded into every new PacsNode."""
+        a = default_priority_terms()
+        a.append({"term": "polluted", "is_regex": False})
+        b = default_priority_terms()
+        assert {t["term"] for t in b} == set(self.DEFAULT_TERMS)
+
+    def test_fresh_pacsnode_has_default_priority_terms(self):
+        node = PacsNode()
+        assert [t["term"] for t in node.priority_series_terms] == \
+            list(self.DEFAULT_TERMS)
+
+    def test_priority_terms_round_trip_through_to_from_dict(self):
+        node = PacsNode()
+        node.priority_series_terms = [
+            {"term": "stroke", "is_regex": False},
+            {"term": r"^CTA\b", "is_regex": True},
+        ]
+        restored = PacsNode.from_dict(node.to_dict())
+        assert restored.priority_series_terms == [
+            {"term": "stroke", "is_regex": False},
+            {"term": r"^CTA\b", "is_regex": True},
+        ]
+
+    def test_priority_terms_empty_list_is_preserved_on_roundtrip(self):
+        """If the user explicitly clears the list, the empty list
+        must survive the to_dict / from_dict cycle (no
+        re-defaulting)."""
+        node = PacsNode()
+        node.priority_series_terms = []
+        restored = PacsNode.from_dict(node.to_dict())
+        assert restored.priority_series_terms == []
+
+    def test_from_dict_without_priority_key_applies_defaults(self):
+        """Legacy config files (missing the new key) must produce a
+        node whose priority list is the bundled defaults."""
+        # Take a fresh node's dict, drop the new key, reload.
+        d = PacsNode().to_dict()
+        d.pop("priority_series_terms", None)
+        restored = PacsNode.from_dict(d)
+        assert [t["term"] for t in restored.priority_series_terms] == \
+            list(self.DEFAULT_TERMS)
+
+    def test_two_pacsnodes_have_independent_priority_lists(self):
+        """Mutating one node's list must not leak into another's."""
+        a = PacsNode(name="A")
+        b = PacsNode(name="B")
+        a.priority_series_terms.append({"term": "extra", "is_regex": False})
+        assert {t["term"] for t in b.priority_series_terms} == \
+            set(self.DEFAULT_TERMS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

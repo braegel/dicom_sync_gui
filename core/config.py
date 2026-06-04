@@ -30,6 +30,24 @@ TRANSFER_SYNTAXES_NAMES = [
 RETRIEVE_METHODS = ["C-MOVE", "C-GET"]
 
 
+def default_priority_terms() -> List[Dict[str, Any]]:
+    """Default priority series terms seeded on every new PacsNode.
+
+    These bias the engine's per-cycle download queue toward studies
+    whose series descriptions match — typical neuro/vascular series
+    that radiologists routinely want first.  List index is priority
+    (0 = highest).  All entries default to plain substring matching;
+    the user can toggle the per-row ``is_regex`` flag in the dialog.
+
+    A fresh list is returned on every call so callers can mutate
+    their copy without leaking into other nodes.
+    """
+    return [{"term": t, "is_regex": False} for t in (
+        "cct", "cta", "ct-a", "angio", "nevas",
+        "perf", "perfusion", "ctp", "ct-p",
+    )]
+
+
 def get_local_ip() -> str:
     """Get local IP address."""
     try:
@@ -62,7 +80,8 @@ class PacsNode:
                  local_syntax: str = "JPEG2000Lossless",
                  fallback_folder: str = "",
                  notification_sound_enabled: bool = True,
-                 notification_sound_path: str = ""):
+                 notification_sound_path: str = "",
+                 priority_series_terms: Optional[List[Dict[str, Any]]] = None):
         self.name = name
         self.ae_title = ae_title
         self.ip_address = ip_address
@@ -80,6 +99,18 @@ class PacsNode:
         self.fallback_folder = fallback_folder
         self.notification_sound_enabled = notification_sound_enabled
         self.notification_sound_path = notification_sound_path
+        # Per-source ordered list of {"term": str, "is_regex": bool}.
+        # ``None`` (the default) seeds the bundled defaults via the
+        # shared helper so every fresh node gets the standard list.
+        # An empty list passed explicitly is preserved (user-cleared).
+        # An explicit non-empty list is deep-copied so the caller can
+        # keep using its own list without leaking mutations into the
+        # node, symmetric to the defensive copy in ``from_dict``.
+        if priority_series_terms is None:
+            self.priority_series_terms = default_priority_terms()
+        else:
+            self.priority_series_terms = [
+                dict(e) for e in priority_series_terms]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -98,6 +129,10 @@ class PacsNode:
             "fallback_folder": self.fallback_folder,
             "notification_sound_enabled": self.notification_sound_enabled,
             "notification_sound_path": self.notification_sound_path,
+            # Deep-copy entry dicts so callers can mutate the result
+            # without leaking into the live PacsNode state.
+            "priority_series_terms": [
+                dict(e) for e in self.priority_series_terms],
         }
 
     @classmethod
@@ -118,6 +153,15 @@ class PacsNode:
             fallback_folder=data.get("fallback_folder", ""),
             notification_sound_enabled=data.get("notification_sound_enabled", True),
             notification_sound_path=data.get("notification_sound_path", ""),
+            # Missing key → bundled defaults (legacy migration).
+            # Explicit ``[]`` (user-cleared) is preserved.  Deep-copy
+            # the entry dicts so the caller's ``data`` mapping cannot
+            # mutate the live PacsNode list (and vice versa).
+            priority_series_terms=(
+                [dict(e) for e in data["priority_series_terms"]]
+                if "priority_series_terms" in data
+                else default_priority_terms()
+            ),
         )
 
 

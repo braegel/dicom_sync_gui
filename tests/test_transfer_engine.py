@@ -1308,3 +1308,149 @@ class TestSingleAEPerCycle:
             f"GC'd AEs cause a segfault in mark_stacks")
         # All 3 series should have been transferred in each cycle
         assert ops.c_move_series.call_count == 6
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — priority series ordering
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPrioritySeriesOrdering:
+    """``_apply_priority_ordering`` reorders the per-cycle job list so
+    studies whose series descriptions match a configured term float to
+    the top, in the order the terms appear in
+    ``PacsNode.priority_series_terms``."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.engine = TransferEngine(self.config, "ct")
+        # Tests configure priority_series_terms directly per case so
+        # they are independent of the default-population logic.
+        self.config.remote_nodes["ct"].priority_series_terms = []
+
+    def _make_job(self, study_uid, series_uid, series_description,
+                  remote_count=100):
+        return SeriesJob(
+            study_uid=study_uid,
+            series_uid=series_uid,
+            series_description=series_description,
+            patient_name="P",
+            patient_id="PID",
+            modality="CT",
+            remote_count=remote_count,
+        )
+
+    def test_empty_priority_list_keeps_original_order(self):
+        """Regression sentinel: with no terms configured, ordering is
+        a no-op (pre-1.0.12 behaviour)."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Axial"),
+            self._make_job("S2", "S2.1", "CCT brain"),
+            self._make_job("S3", "S3.1", "Sagittal"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.series_uid for j in out] == ["S1.1", "S2.1", "S3.1"]
+
+    def test_study_with_matching_series_floats_above_unmatched(self):
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("S1", "S1.1", "Axial"),
+            self._make_job("S2", "S2.1", "CCT brain"),
+            self._make_job("S3", "S3.1", "Sagittal"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        # Matched study S2 comes first; the rest preserve order.
+        assert [j.study_uid for j in out] == ["S2", "S1", "S3"]
+
+    def test_priority_order_within_matched_studies(self):
+        """``cct`` (index 0) outranks ``perfusion`` (index 5)."""
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+            {"term": "cta", "is_regex": False},
+            {"term": "ct-a", "is_regex": False},
+            {"term": "angio", "is_regex": False},
+            {"term": "nevas", "is_regex": False},
+            {"term": "perfusion", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("S1", "S1.1", "Perfusion map"),
+            self._make_job("S2", "S2.1", "Axial"),
+            self._make_job("S3", "S3.1", "CCT brain"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.study_uid for j in out] == ["S3", "S1", "S2"]
+
+    def test_unmatched_studies_preserve_relative_order_at_end(self):
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("S1", "S1.1", "Axial"),
+            self._make_job("S2", "S2.1", "Sagittal"),
+            self._make_job("S3", "S3.1", "Coronal"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        # No matches → list returns unchanged.
+        assert [j.study_uid for j in out] == ["S1", "S2", "S3"]
+
+    def test_regex_entry_matches_when_is_regex_true(self):
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": r"^CT[AP]\b", "is_regex": True},
+        ]
+        jobs = [
+            self._make_job("S1", "S1.1", "Axial"),
+            self._make_job("S2", "S2.1", "CTA Carotis"),   # match
+            self._make_job("S3", "S3.1", "Some CTAxial"),  # no match (no boundary)
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert out[0].study_uid == "S2"
+
+    def test_substring_match_is_case_insensitive(self):
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "ANGIO", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("S1", "S1.1", "Axial"),
+            self._make_job("S2", "S2.1", "carotid angio max"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert out[0].study_uid == "S2"
+
+    def test_all_series_of_priority_study_stay_grouped_together(self):
+        """One series of study X matches; the other two don't → all
+        three still ride together at the top, contiguous."""
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("S0", "S0.1", "Axial"),       # unmatched
+            self._make_job("SX", "SX.1", "Localizer"),   # study X, no match
+            self._make_job("SX", "SX.2", "CCT brain"),   # study X, MATCH
+            self._make_job("SX", "SX.3", "Bone window"), # study X, no match
+            self._make_job("SY", "SY.1", "Coronal"),     # unmatched
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        # All three SX series come first; SX stays internally ordered.
+        assert [j.series_uid for j in out[:3]] == [
+            "SX.1", "SX.2", "SX.3"]
+        # Unmatched studies follow in original order.
+        assert [j.study_uid for j in out[3:]] == ["S0", "SY"]
+
+    def test_engine_reads_from_its_own_remote_node(self):
+        """The ``mri`` engine must NOT honour the ``ct`` engine's
+        priority list — each engine reads its own PacsNode."""
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+        ]
+        self.config.remote_nodes["mri"].priority_series_terms = []
+        mri_engine = TransferEngine(self.config, "mri")
+        jobs = [
+            self._make_job("S1", "S1.1", "Axial"),
+            self._make_job("S2", "S2.1", "CCT brain"),
+        ]
+        out = mri_engine._apply_priority_ordering(list(jobs))
+        # No reordering on mri engine.
+        assert [j.study_uid for j in out] == ["S1", "S2"]

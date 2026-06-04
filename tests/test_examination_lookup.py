@@ -339,6 +339,33 @@ class TestEmptyState:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Resource cleanup on exception
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestResourceCleanupOnException:
+    """If ``query_series`` or ``mbps_stats`` raises mid-search, the
+    SQLite TransferLog connection must still be closed instead of
+    leaking the file handle + WAL files."""
+
+    def test_log_closed_when_query_raises(self, empty_dialog):
+        empty_dialog.input_patient_id.setText("PAT001")
+
+        closed = []
+        real_close = TransferLog.close
+
+        def tracking_close(self):
+            closed.append(True)
+            real_close(self)
+
+        with patch.object(TransferLog, "query_series",
+                          side_effect=RuntimeError("DB locked")):
+            with patch.object(TransferLog, "close", tracking_close):
+                empty_dialog.btn_search.click()
+
+        assert closed, "TransferLog.close() was not called after exception"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 

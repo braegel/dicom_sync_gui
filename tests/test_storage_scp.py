@@ -3,6 +3,7 @@ Tests for core.StorageSCP — signal emission and image counting.
 """
 import os
 import tempfile
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -75,3 +76,62 @@ class TestStorageSCPSignal:
 
         scp.handle_store(event)
         assert scp.images_received == 0
+
+
+class TestStorageSCPStartFailure:
+    """``start()`` must surface a bind failure instead of silently
+    reporting success when ``start_server`` raises (port already in use,
+    permission denied, etc.).  Otherwise the caller logs "started" and
+    sends queries to a dead SCP."""
+
+    def test_start_raises_runtime_error_when_start_server_raises(
+            self, qapp, tmp_path):
+        scp = StorageSCP("TEST_AE", 11112, str(tmp_path))
+
+        def boom(*_a, **_kw):
+            raise OSError("port already in use")
+
+        # Patch the AE instance after construction so .start() builds it
+        # via the normal code path, then replace start_server before the
+        # worker thread runs.
+        orig_start = scp.start
+
+        def wrapped_start():
+            # Stub the AE.start_server right after start() creates the AE
+            # but before the worker thread fires.  Easiest: patch the
+            # AE class so the freshly constructed instance picks it up.
+            with patch("core.storage_scp.AE") as ae_cls:
+                ae_instance = MagicMock()
+                ae_instance.start_server.side_effect = boom
+                ae_cls.return_value = ae_instance
+                orig_start()
+
+        with pytest.raises(RuntimeError, match="failed to bind"):
+            wrapped_start()
+
+        # After the failure, the flag must reflect "not running" so a
+        # subsequent stop() is a clean no-op.
+        assert scp.running is False
+
+    def test_start_succeeds_when_start_server_blocks(
+            self, qapp, tmp_path, monkeypatch):
+        scp = StorageSCP("TEST_AE", 11112, str(tmp_path))
+        gate = threading.Event()
+
+        def block(*_a, **_kw):
+            # Simulate a successful bind by blocking the reactor thread
+            # the way pynetdicom's real start_server(block=True) does.
+            gate.wait(timeout=2.0)
+
+        with patch("core.storage_scp.AE") as ae_cls:
+            ae_instance = MagicMock()
+            ae_instance.start_server.side_effect = block
+            ae_cls.return_value = ae_instance
+            try:
+                scp.start()  # must NOT raise
+                assert scp.running is True
+            finally:
+                gate.set()
+                # Let the daemon thread observe the gate flip and exit.
+                if scp._thread is not None:
+                    scp._thread.join(timeout=2.0)

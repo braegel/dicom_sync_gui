@@ -401,3 +401,59 @@ class TestCFindInstitutionNames:
         with patch.object(ops, 'c_find_studies', return_value=[]):
             names = ops.c_find_institution_names()
             assert names == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DicomOperations — association release on exception
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAssociationReleaseOnException:
+    """If the C-FIND or C-MOVE iteration raises mid-stream, the
+    established association must still be released so pynetdicom's TCP
+    socket isn't left dangling until OS timeout."""
+
+    @pytest.fixture
+    def ops(self):
+        local = {"ae_title": "L_AE", "ip_address": "127.0.0.1", "port": 11112}
+        remote = {"ae_title": "R_AE", "ip_address": "10.0.0.1", "port": 104,
+                   "transfer_syntax": "JPEG2000Lossless"}
+        return DicomOperations(local, remote)
+
+    def test_find_releases_assoc_when_iteration_raises(self, ops):
+        mock_assoc = MagicMock()
+        mock_assoc.is_established = True
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("DIMSE timeout")
+
+        mock_assoc.send_c_find.side_effect = boom
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            results = ops.c_find_studies()
+            assert results == []
+            mock_assoc.release.assert_called_once()
+
+    def test_move_releases_assoc_when_iteration_raises(self, ops):
+        mock_assoc = MagicMock()
+        mock_assoc.is_established = True
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("DIMSE timeout")
+
+        mock_assoc.send_c_move.side_effect = boom
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            success, images = ops.c_move_series("1.1.1", "1.1.1.1")
+            assert success is False
+            assert images == 0
+            mock_assoc.release.assert_called_once()
+
+    def test_find_does_not_release_when_assoc_not_established(self, ops):
+        mock_assoc = MagicMock()
+        mock_assoc.is_established = False
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            results = ops.c_find_studies()
+            assert results == []
+            # Nothing to release.
+            mock_assoc.release.assert_not_called()

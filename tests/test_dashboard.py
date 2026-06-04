@@ -212,6 +212,69 @@ class TestDashboardUI:
         assert self.dashboard.max_images_spin.value() == 0
         assert self.dashboard.interval_spin.value() == 60
 
+    # ── Restart button ───────────────────────────────────────────────
+
+    def test_restart_button_exists(self):
+        assert hasattr(self.dashboard, "btn_restart")
+
+    def test_restart_button_disabled_when_service_not_running(self):
+        # Initial state: idle → restart disabled (nothing to restart).
+        assert not self.dashboard.btn_restart.isEnabled()
+
+    def test_restart_button_enabled_while_service_running(self):
+        self.dashboard.set_service_running(True)
+        assert self.dashboard.btn_restart.isEnabled()
+
+    def test_restart_button_disabled_again_after_stop(self):
+        self.dashboard.set_service_running(True)
+        self.dashboard.set_service_running(False)
+        assert not self.dashboard.btn_restart.isEnabled()
+
+    def test_restart_click_emits_stop_then_start_on_stopped(self):
+        """Clicking Restart must first request a stop; after the
+        engine actually stops (set_service_running(False) is called),
+        the dashboard must then re-emit start_requested so the engine
+        is brought up again with the same parameters."""
+        stops = []
+        starts = []
+        self.dashboard.stop_requested.connect(stops.append)
+        self.dashboard.start_requested.connect(
+            lambda *args: starts.append(args))
+
+        self.dashboard.set_service_running(True)
+        self.dashboard.btn_restart.click()
+
+        # First half of restart: stop has been requested, start has not.
+        assert stops == [self.dashboard.remote_key], (
+            "Restart click must emit stop_requested first")
+        assert starts == [], (
+            "Start must not fire until the engine actually stopped")
+
+        # Engine actually stops → main_window calls set_service_running(False).
+        self.dashboard.set_service_running(False)
+
+        # Second half: now start fires with the same params.
+        assert len(starts) == 1, (
+            "After service_stopped, restart must emit start_requested")
+        emitted_key, emitted_params = starts[0]
+        assert emitted_key == self.dashboard.remote_key
+        for k in ("hours", "max_images", "sync_interval"):
+            assert k in emitted_params
+
+    def test_normal_stop_does_not_trigger_restart(self):
+        """A plain Stop click must NOT cause the dashboard to
+        auto-start the engine again."""
+        starts = []
+        self.dashboard.start_requested.connect(
+            lambda *args: starts.append(args))
+
+        self.dashboard.set_service_running(True)
+        self.dashboard.btn_stop.click()
+        self.dashboard.set_service_running(False)
+
+        assert starts == [], (
+            "Plain stop must not auto-restart the engine")
+
     def test_filter_checkbox_default(self):
         # populated_config has filter_groups_enabled = True
         assert self.dashboard.filter_enable_check.isChecked()

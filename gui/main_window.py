@@ -2,6 +2,32 @@
 Main window for DICOM Sync GUI.
 Per-source architecture: each configured source PACS gets its own tab
 with an independent download service, queue, and statistics.
+
+Threading model
+---------------
+The GUI runs on Qt's main thread.  Three categories of cross-thread
+work flow into ``MainWindow``:
+
+1. **TransferEngine signals** — each per-source ``TransferEngine``
+   emits its progress/log/completion signals from its own service-
+   loop thread.  ``Qt.AutoConnection`` marshals them onto the GUI
+   thread before any slot in this file runs.  Slots may touch
+   widgets freely.
+
+2. **Built-in StorageSCP signals** — pynetdicom reactor thread, same
+   marshalling rule.
+
+3. **Direct calls into** ``MainWindow._log(msg)`` — happen from
+   either the GUI thread (other handlers in this file) or background
+   workers (e.g. ``_test_echo``'s daemon thread).  ``_log`` therefore
+   forwards through the ``_log_message`` signal, whose
+   ``_append_log`` slot is the only place that actually touches the
+   ``LogWindow``.  No direct widget access from non-GUI threads.
+
+Background work the file launches itself (``_test_echo``,
+``_ensure_storage_scp_for``) uses plain ``threading.Thread(daemon=True)``
+plus a private signal (``_echo_results_ready`` / ``_scp_check_done``)
+to hop back to the GUI thread with the result.
 """
 
 import logging
@@ -26,6 +52,7 @@ from gui.settings_dialog import SettingsDialog
 from gui.dashboard import SourceDashboard
 from gui.log_window import LogWindow
 from gui.filter_groups_dialog import FilterGroupsDialog
+from gui.priority_series_dialog import PrioritySeriesDialog
 from gui.unknown_institution_popup import UnknownInstitutionPopup
 from gui.transfer_stats_window import TransferStatsWindow
 from gui.examination_lookup import ExaminationLookupDialog
@@ -72,8 +99,11 @@ class MainWindow(QMainWindow):
         self._echo_results_ready.connect(self._on_echo_results)
         self._scp_check_done.connect(self._on_scp_check_done)
         # Queue log lines through this signal so direct callers from
-        # any thread are marshalled onto the GUI thread.
-        self._log_message.connect(self._append_log)
+        # any thread are marshalled onto the GUI thread.  ``Qt.AutoConnection``
+        # already picks queued semantics for cross-thread emit, but
+        # pin it explicitly so a future receiver move can't silently
+        # turn this into a direct (=racy) call.
+        self._log_message.connect(self._append_log, Qt.QueuedConnection)
 
         # Pre-generate notification WAVs after the event loop is up so
         # the first study completion doesn't pay the ~30k-sample DSP
@@ -101,8 +131,14 @@ class MainWindow(QMainWindow):
         settings_menu.addAction(settings_action)
 
         filter_action = QAction("Manage Filter Groups...", self)
+        filter_action.setShortcut("Ctrl+Shift+F")
         filter_action.triggered.connect(self._open_filter_groups)
         settings_menu.addAction(filter_action)
+
+        priority_action = QAction("Manage Priority Series...", self)
+        priority_action.setShortcut("Ctrl+Shift+P")
+        priority_action.triggered.connect(self._open_priority_series)
+        settings_menu.addAction(priority_action)
 
         settings_menu.addSeparator()
         quit_action = QAction("Quit", self)
@@ -207,6 +243,13 @@ class MainWindow(QMainWindow):
                 dashboard.refresh_filter_groups()
             self._log("Filter groups updated.")
 
+    def _open_priority_series(self):
+        dlg = PrioritySeriesDialog(self.config, self)
+        if dlg.exec() == PrioritySeriesDialog.Accepted:
+            self._log("Priority series terms updated.")
+        else:
+            self._log("Priority series dialog cancelled (no changes).")
+
     # ── C-ECHO ────────────────────────────────────────────────────────────
 
     def _test_echo(self):
@@ -296,7 +339,14 @@ class MainWindow(QMainWindow):
 
     def _on_study_completed_live(self, engine, study_uid: str,
                                    fully_complete: bool):
-        """Add a completion entry to the live completions window."""
+        """Add a completion entry to the live completions window.
+
+        Threshold filtering (``MIN_IMAGES_FOR_COMPLETIONS_ENTRY``) is
+        applied inside ``add_completion`` against the *cumulative*
+        image count of any pre-existing row for this study, so a
+        first-wave emit below the threshold does not erase a later
+        emit that crosses it.
+        """
         if not fully_complete:
             return
         study_jobs = [j for j in engine.queue_snapshot()
@@ -306,8 +356,6 @@ class MainWindow(QMainWindow):
         first = study_jobs[0]
         wall_clock = engine.pop_study_wall_clock(study_uid)
         total_images = sum(j.transferred_images for j in study_jobs)
-        if total_images < MIN_IMAGES_FOR_COMPLETIONS_ENTRY:
-            return
         self.completions_window.add_completion(
             study_uid=study_uid,
             patient_name=first.patient_name,
@@ -317,6 +365,7 @@ class MainWindow(QMainWindow):
             institution_name=first.institution_name,
             download_duration_seconds=wall_clock,
             image_count=total_images,
+            min_images_threshold=MIN_IMAGES_FOR_COMPLETIONS_ENTRY,
         )
 
     def _log(self, msg: str):
@@ -420,6 +469,10 @@ class MainWindow(QMainWindow):
         """Handle SCP check result on the main thread."""
         node = self.config.remote_nodes.get(remote_key)
         if not node:
+            # Source removed mid-flight — drop the queued start params
+            # so they don't leak (and don't get accidentally consumed by
+            # a future same-keyed re-add).
+            self._pending_start_params.pop(remote_key, None)
             return
 
         if not local_reachable:
@@ -436,7 +489,18 @@ class MainWindow(QMainWindow):
                     node.local_port,
                     storage_path,
                 )
-                scp.start()
+                try:
+                    scp.start()
+                except RuntimeError as e:
+                    # Port already in use, permission denied, etc.  Drop
+                    # the pending start so the engine doesn't fire C-MOVEs
+                    # at a dead local SCP, and surface the failure in
+                    # the log instead of leaking the traceback to stderr.
+                    self._log(
+                        f"Storage SCP startup failed for {remote_key}: "
+                        f"{e}. Engine not started.")
+                    self._pending_start_params.pop(remote_key, None)
+                    return
                 self.storage_scps[scp_key] = scp
             else:
                 self._log(
@@ -547,16 +611,16 @@ class MainWindow(QMainWindow):
         """Wait up to *total_timeout* seconds per engine while keeping the
         Qt event loop pumping so the status bar/window stays responsive.
 
-        Calls ``thread.join(timeout=…)`` in short slices and processes
+        Calls ``engine.join(timeout=…)`` in short slices and processes
         pending Qt events between slices instead of a single 30-second
-        blocking join per engine."""
+        blocking join per engine.  Uses the engine's public ``join``
+        instead of reaching into its private ``_thread`` so the
+        thread-lifecycle is owned in one place."""
         import time
         for engine in self.engines.values():
-            thread = getattr(engine, "_thread", None)
-            if thread is None or not thread.is_alive():
-                continue
             end = time.monotonic() + total_timeout
-            while thread.is_alive() and time.monotonic() < end:
+            while time.monotonic() < end:
                 remaining = max(0.0, end - time.monotonic())
-                thread.join(timeout=min(0.1, remaining))
+                if engine.join(timeout=min(0.1, remaining)):
+                    break
                 QApplication.processEvents()

@@ -77,11 +77,15 @@ class ExaminationLookupDialog(QDialog):
             return
 
         log = TransferLog(self._db_path)
-        results = log.query_series(**kw)
-        # Compute baseline mbps stats in SQL (one round trip) instead
-        # of dragging the full series table into Python.
-        baseline = log.mbps_stats() if results else None
-        log.close()
+        try:
+            results = log.query_series(**kw)
+            # Compute baseline mbps stats in SQL (one round trip) instead
+            # of dragging the full series table into Python.
+            baseline = log.mbps_stats() if results else None
+        finally:
+            # ``try/finally`` so a query-side error doesn't leak the
+            # SQLite connection (and its WAL files).
+            log.close()
 
         self._populate_table(results)
         self._check_resend(results, baseline)

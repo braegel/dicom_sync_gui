@@ -11,7 +11,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QTableWidget, QPushButton
+from PySide6.QtWidgets import (
+    QApplication, QTableWidget, QPushButton, QHeaderView,
+)
 
 from core.transfer_engine import TransferEngine, SeriesJob
 from gui.live_completions import LiveCompletionsWindow
@@ -315,66 +317,101 @@ class TestMedianLabel:
 
 
 class TestDelayColorCoding:
-    """Delay cell colored red if > median + 1 stddev,
-    green if < median - 1 stddev."""
+    """Delay cell coloured red if > median + 2σ, green if < median − 2σ.
 
-    def _add_entries(self, window):
-        """Add entries with delays: 3, 5, 5, 5, 7 min.
-        Median=5, stddev≈1.26. So 3min → green, 7min → red, 5min → neutral."""
-        delays = [
-            ("080000", "08:03:00"),  # 3 min
-            ("090000", "09:05:00"),  # 5 min
-            ("100000", "10:05:00"),  # 5 min
-            ("110000", "11:05:00"),  # 5 min
-            ("120000", "12:07:00"),  # 7 min
-        ]
-        for i, (acq, comp) in enumerate(delays):
+    1.0.12: thresholds unified with Download Duration (both ±2σ).  The
+    previous Delay code used ±1σ which over-triggered red/green on
+    naturally-spread datasets.
+    """
+
+    def _add_entries_with_delays(self, window, delays_seconds):
+        """Add one completion per delay (seconds).
+
+        ``study_time`` is fixed at ``"080000"`` so the rendered delay
+        is determined purely by ``completed_time``.  Patient names
+        differ per entry so insertion order is observable.
+        """
+        for i, d in enumerate(delays_seconds):
+            comp_h = 8 + d // 3600
+            comp_m = (d % 3600) // 60
+            comp_s = d % 60
             window.add_completion(
                 patient_name=f"P{i}",
                 study_description="CT",
-                study_time=acq,
-                completed_time=comp,
+                study_time="080000",
+                completed_time=f"{comp_h:02d}:{comp_m:02d}:{comp_s:02d}",
                 institution_name="X",
             )
 
     def test_slow_delay_is_red(self, window):
-        """7 min delay (> median + 1σ) → red text or red background."""
-        self._add_entries(window)
-        # 7-min entry was added last → row 0 (newest on top)
+        """Strong outlier > median + 2σ → red.
+
+        Delays: 5 min × 8 + 30 min.  median=300s, σ≈471s,
+        2σ≈943s → 1800s > 1243s → outlier is red.
+        """
+        delays = [300] * 8 + [1800]
+        self._add_entries_with_delays(window, delays)
         delay_col = _find_delay_column(window)
         item = window.completions_table.item(0, delay_col)
         assert item is not None
         fg = item.foreground().color().name()
         bg = item.background().color().name()
-        # Should have red coloring (foreground or background)
-        assert "#e74c3c" in fg or "#e74c3c" in bg or "red" in fg or "red" in bg
+        assert ("#e74c3c" in fg or "#e74c3c" in bg
+                or "red" in fg or "red" in bg)
 
     def test_fast_delay_is_green(self, window):
-        """3 min delay (< median - 1σ) → green text or green background."""
-        self._add_entries(window)
-        # 3-min entry was added first → bottom row (row 4)
+        """Strong outlier < median − 2σ → green.
+
+        Delays: 30 sec + 5 min × 8.  median=300s, σ≈85s,
+        2σ≈170s → 30s < 130s → outlier is green.
+        """
+        delays = [30] + [300] * 8
+        self._add_entries_with_delays(window, delays)
         last_row = window.completions_table.rowCount() - 1
         delay_col = _find_delay_column(window)
         item = window.completions_table.item(last_row, delay_col)
         assert item is not None
         fg = item.foreground().color().name()
         bg = item.background().color().name()
-        assert "#2ecc71" in fg or "#2ecc71" in bg or "green" in fg or "green" in bg
+        assert ("#2ecc71" in fg or "#2ecc71" in bg
+                or "green" in fg or "green" in bg)
 
     def test_normal_delay_no_color(self, window):
-        """5 min delay (≈ median) → no special coloring."""
-        self._add_entries(window)
-        # 5-min entries are rows 1, 2, 3
+        """A delay near the median is not coloured."""
+        delays = [300] * 8 + [1800]
+        self._add_entries_with_delays(window, delays)
         delay_col = _find_delay_column(window)
+        # Row 1 is a 5-min entry (one of the 8 baseline values).
         item = window.completions_table.item(1, delay_col)
         assert item is not None
         fg = item.foreground().color().name()
-        # Should not be red or green
         assert "#e74c3c" not in fg
         assert "#2ecc71" not in fg
 
+    def test_one_sigma_delay_does_not_trigger_red(self, window):
+        """Discrimination: a delay that's > median + 1σ but
+        < median + 2σ must stay neutral.  This catches the regression
+        if the threshold ever slips back to ±1σ.
+
+        Delays: [80, 90, 100×6, 110, 120, 135] seconds.
+        median=100s, σ≈13.87s, 1σ→113.87s, 2σ→127.74s.
+        The 120s entry sits between 1σ and 2σ and must NOT be red.
+        """
+        delays = [80, 90, 100, 100, 100, 100, 100, 100, 110, 120, 135]
+        self._add_entries_with_delays(window, delays)
+        delay_col = _find_delay_column(window)
+        # 120 was added at index 9; with insertRow(0) the newest is
+        # row 0, so index i lands at row (n-1)-i.
+        row_of_120 = (len(delays) - 1) - 9
+        item = window.completions_table.item(row_of_120, delay_col)
+        assert item is not None
+        fg = item.foreground().color().name()
+        assert "#e74c3c" not in fg, (
+            "120s delay is > median+1σ but < median+2σ — "
+            "must NOT be coloured red under the ±2σ rule")
+
     def test_colors_update_when_new_entry_changes_stats(self, window):
-        """Adding a new entry should re-color all existing delay cells."""
+        """Adding a new entry must re-colour all existing delay cells."""
         window.add_completion(
             patient_name="A", study_description="CT",
             study_time="080000", completed_time="08:03:00",
@@ -387,17 +424,53 @@ class TestDelayColorCoding:
         )
         # Both are 3 min, identical → no coloring (stddev=0)
         delay_col = _find_delay_column(window)
-        # Now add an outlier
+        # Now add an extreme outlier.
         window.add_completion(
             patient_name="C", study_description="CT",
             study_time="100000", completed_time="10:20:00",
             institution_name="X",
         )
-        # 20 min entry should now be red (row 0)
+        # 20-min entry should now be red (row 0).  Spread:
+        # [180, 180, 1200]: median=180, σ≈481, 2σ≈962 → 1200>1142 → red.
         item = window.completions_table.item(0, delay_col)
         fg = item.foreground().color().name()
         bg = item.background().color().name()
         assert "#e74c3c" in fg or "#e74c3c" in bg
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Column resizing — user can drag column borders (Excel / LibreOffice style)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestColumnResizing:
+    """Every column in the completions table must be user-resizable
+    by dragging the column border."""
+
+    def test_all_columns_use_interactive_resize_mode(self, window):
+        header = window.completions_table.horizontalHeader()
+        for col in range(window.completions_table.columnCount()):
+            mode = header.sectionResizeMode(col)
+            assert mode == QHeaderView.Interactive, (
+                f"column {col} resize mode is {mode}; "
+                f"expected QHeaderView.Interactive so the user can "
+                f"drag its border like in Excel / LibreOffice")
+
+    def test_user_set_column_width_persists(self, window):
+        """When the user drags a column border to a new width, the
+        width must stick.  ResizeToContents would snap back; only
+        Interactive mode keeps the manual width."""
+        window.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:01:00",
+            institution_name="X",
+        )
+        target = 200
+        # Patient column index — looked up by header label so the
+        # test stays robust against future column reorderings.
+        patient_col = _column_index_for_header(window, "patient")
+        assert patient_col >= 0
+        window.completions_table.setColumnWidth(patient_col, target)
+        assert window.completions_table.columnWidth(patient_col) == target
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1006,6 +1079,60 @@ class TestAggregateByStudyUid:
         text = QApplication.clipboard().text()
         assert "08:20:00" in text
         assert "08:15:30" not in text
+
+
+class TestMinImagesThreshold:
+    """``add_completion`` honours an optional ``min_images_threshold``
+    that suppresses tiny entries.  The threshold is applied against
+    the CUMULATIVE image count for the row so a late second-wave
+    emit can promote a previously-suppressed study into the table."""
+
+    def test_first_emit_below_threshold_creates_no_row(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=5,
+            min_images_threshold=10,
+        )
+        assert window.completions_table.rowCount() == 0
+
+    def test_second_wave_crosses_threshold_creates_row(self, window):
+        """Wave 1 has 5 images (below threshold) → no row.  Wave 2
+        adds 50 more → since the cumulative new+existing of 50 alone
+        is over the threshold, the row is now created."""
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=5,
+            min_images_threshold=10,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:25:30",
+            institution_name="X", image_count=50,
+            min_images_threshold=10,
+        )
+        assert window.completions_table.rowCount() == 1
+
+    def test_threshold_aggregates_against_existing_row(self, window):
+        """Once a row exists, threshold checks fold the new wave into
+        the existing count — never blocks an update that takes the
+        total even higher."""
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=50,
+            min_images_threshold=10,
+        )
+        # Add a 3-image wave — sum is 53, comfortably above threshold.
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=3,
+            min_images_threshold=10,
+        )
+        images_col = _column_index_for_header(window, "images")
+        assert window.completions_table.item(0, images_col).text() == "53"
 
 
 class TestSortableColumns:

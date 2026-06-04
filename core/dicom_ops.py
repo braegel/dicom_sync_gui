@@ -5,7 +5,7 @@ Abstracted from the original CLI script for GUI use.
 
 import logging
 import warnings
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pydicom import Dataset
 from pydicom.uid import (
@@ -90,10 +90,15 @@ class DicomOperations:
             logger.debug(f"C-ECHO failed: {e}")
         return False
 
-    def c_find_studies(self, study_date: str = None, patient_id: str = None,
-                       study_uid: str = None) -> List[Dataset]:
+    def c_find_studies(self,
+                       study_date: Optional[str] = None,
+                       patient_id: Optional[str] = None,
+                       study_uid: Optional[str] = None
+                       ) -> List[Dataset]:
         ds = Dataset()
         ds.QueryRetrieveLevel = 'STUDY'
+        # DICOM convention: an empty-string tag value means "please
+        # include this tag in the response" (universal matching).
         ds.PatientID = patient_id or ''
         ds.PatientName = ''
         ds.StudyInstanceUID = study_uid or ''
@@ -118,7 +123,7 @@ class DicomOperations:
         ds.InstitutionName = ''
         return self._execute_find(ds)
 
-    def c_find_institution_names(self, study_date: str = None
+    def c_find_institution_names(self, study_date: Optional[str] = None
                                   ) -> List[str]:
         """Discover unique InstitutionName values via series-level query.
 
@@ -186,20 +191,25 @@ class DicomOperations:
             assoc = self.ae.associate(config['ip_address'], config['port'],
                                      ae_title=config['ae_title'])
             if assoc.is_established:
-                # Suppress pydicom's "VR UI value length exceeds maximum"
-                # warning that some PACS implementations trigger; scoped
-                # to the actual call site instead of process-wide.
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        'ignore',
-                        message='.*value length.*exceeds the maximum length.*VR UI.*')
-                    for status, dataset in assoc.send_c_find(
-                            query_ds, StudyRootQueryRetrieveInformationModelFind):
-                        if status is None or dataset is None:
-                            continue
-                        if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
-                            results.append(dataset)
-                assoc.release()
+                # ``try/finally`` so a DIMSE-level error mid-iteration
+                # doesn't leave the TCP association dangling until the
+                # OS socket timeout.
+                try:
+                    # Suppress pydicom's "VR UI value length exceeds
+                    # maximum" warning that some PACS implementations
+                    # trigger; scoped to the call site, not process-wide.
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            'ignore',
+                            message='.*value length.*exceeds the maximum length.*VR UI.*')
+                        for status, dataset in assoc.send_c_find(
+                                query_ds, StudyRootQueryRetrieveInformationModelFind):
+                            if status is None or dataset is None:
+                                continue
+                            if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
+                                results.append(dataset)
+                finally:
+                    assoc.release()
         except Exception as e:
             logger.error(f"C-FIND error: {e}")
         return results
@@ -227,17 +237,21 @@ class DicomOperations:
                 self.remote_config['ip_address'], self.remote_config['port'],
                 ae_title=self.remote_config['ae_title'])
             if assoc.is_established:
-                for status, _ in assoc.send_c_move(
-                        query_ds, move_dest, StudyRootQueryRetrieveInformationModelMove):
-                    if status is None:
-                        continue
-                    if getattr(status, "Status", None) == 0x0000:
-                        success = True
-                    completed = getattr(
-                        status, 'NumberOfCompletedSuboperations', None)
-                    if completed is not None:
-                        images = completed
-                assoc.release()
+                # ``try/finally`` so a mid-stream DIMSE failure does not
+                # leak the established TCP association.
+                try:
+                    for status, _ in assoc.send_c_move(
+                            query_ds, move_dest, StudyRootQueryRetrieveInformationModelMove):
+                        if status is None:
+                            continue
+                        if getattr(status, "Status", None) == 0x0000:
+                            success = True
+                        completed = getattr(
+                            status, 'NumberOfCompletedSuboperations', None)
+                        if completed is not None:
+                            images = completed
+                finally:
+                    assoc.release()
         except Exception as e:
             logger.error(f"C-MOVE error: {e}")
         return success, images

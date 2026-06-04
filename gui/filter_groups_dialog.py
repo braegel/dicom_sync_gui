@@ -11,8 +11,6 @@ Workflow:
 
 import json
 import logging
-import threading
-import weakref
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
@@ -28,6 +26,7 @@ from PySide6.QtGui import QFont, QColor
 
 from core.config import AppConfig
 from core.dicom_ops import DicomOperations
+from gui.async_helpers import run_in_background
 from gui.styles import BTN_GREEN, BTN_GREEN_LARGE, BTN_RED, BTN_BLUE, BTN_BLUE_LARGE
 
 logger = logging.getLogger("dicom_sync")
@@ -376,18 +375,22 @@ class FilterGroupsDialog(QDialog):
         self.btn_query.setEnabled(False)
         self.lbl_query_status.setText("Querying...")
 
-        # Snapshot config data for thread safety
-        remotes = {k: (self.config.get_local_dict(),
+        # Snapshot config data for thread safety.  Each source must
+        # be queried with ITS OWN local destination AE — on multi-source
+        # setups the local AE/port can differ per source (different
+        # workstations), and reusing one source's local config for
+        # everyone makes the C-FIND fire from the wrong calling AE.
+        remotes = {k: (self.config.get_local_dict_for(k),
                        v.to_dict(), k)
                    for k, v in self.config.remote_nodes.items()}
 
-        # Use a weak reference so the background thread does not prevent
-        # GC of the dialog on the main thread.  Without this, closing the
-        # dialog while a query is running causes the QDialog destructor to
-        # run on the background thread → segfault.
-        weak_self = weakref.ref(self)
-
-        def run_query():
+        # Run the C-FIND on a background thread; ``run_in_background``
+        # owns the weakref-shim that keeps a closed dialog from being
+        # finalized on the worker thread (which used to segfault the
+        # QDialog destructor).  Results are delivered via the
+        # ``_query_results_ready`` Qt signal — Qt.AutoConnection
+        # marshals the call back to the GUI thread.
+        def discover() -> Set[str]:
             discovered: Set[str] = set()
             for remote_key, (local_cfg, remote_cfg, name) in remotes.items():
                 try:
@@ -397,11 +400,11 @@ class FilterGroupsDialog(QDialog):
                     discovered.update(names)
                 except Exception as e:
                     logger.error(f"Query failed for {remote_key}: {e}")
-            obj = weak_self()
-            if obj is not None:
-                obj._query_results_ready.emit(discovered)
+            return discovered
 
-        threading.Thread(target=run_query, daemon=True).start()
+        run_in_background(
+            self, discover, self._query_results_ready.emit,
+            label="filter_groups_query")
 
     def _on_query_results(self, discovered: set):
         """Handle query results on the main thread."""

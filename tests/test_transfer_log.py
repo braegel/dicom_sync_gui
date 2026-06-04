@@ -152,6 +152,22 @@ class TestSchema:
         tl.close()
         assert os.path.exists(nested)
 
+    def test_insert_rejects_bool_for_int_column(self, log):
+        """``isinstance(True, int)`` is True in Python — without an
+        explicit bool guard a caller bug like ``image_count=True``
+        would silently land as ``1`` in the int column.  The schema
+        check must reject it instead."""
+        with pytest.raises(TypeError, match="image_count"):
+            log.record_series(
+                source_pacs="x", study_uid="1", series_uid="2",
+                patient_id="P", accession_number="A",
+                study_date="20260101", study_time="120000",
+                modality="CT", study_description="Test",
+                series_description="Axial", series_number="1",
+                image_count=True,  # accidental bool — must raise
+                duration_seconds=10.0,
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Byte estimation

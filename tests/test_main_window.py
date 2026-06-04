@@ -92,11 +92,12 @@ class TestMainWindowInit:
             "for done series of this study only")
         assert kwargs["download_duration_seconds"] == 30.0
 
-    def test_study_completed_live_skips_entry_below_min_images(self):
+    def test_study_completed_live_forwards_threshold_below_min_images(self):
         """Studies whose total downloaded image count is below
-        MIN_IMAGES_FOR_COMPLETIONS_ENTRY (10) must NOT appear in the
-        Download Completions window — they're too small to be
-        meaningful exam records."""
+        MIN_IMAGES_FOR_COMPLETIONS_ENTRY (10) must pass the threshold
+        through to ``add_completion`` — the LiveCompletionsWindow
+        applies the cutoff against the cumulative running total so
+        late-arriving second-wave images can still create the row."""
         engine = MagicMock()
         engine.queue_snapshot.return_value = [
             MagicMock(study_uid="S1", status="done",
@@ -115,10 +116,14 @@ class TestMainWindowInit:
             self.win._on_study_completed_live(
                 engine, "S1", fully_complete=True)
 
-        mock_add.assert_not_called()
+        mock_add.assert_called_once()
+        kwargs = mock_add.call_args.kwargs
+        assert kwargs["image_count"] == 9
+        assert kwargs["min_images_threshold"] == 10
 
-    def test_study_completed_live_skips_entry_just_below_threshold(self):
-        """Boundary: 9 downloaded images must be filtered out."""
+    def test_study_completed_live_forwards_threshold_just_below(self):
+        """Boundary: 9 downloaded images forward the cutoff so the
+        window can decide based on the cumulative count."""
         engine = MagicMock()
         engine.queue_snapshot.return_value = [
             MagicMock(study_uid="S1", status="done",
@@ -133,7 +138,10 @@ class TestMainWindowInit:
             self.win._on_study_completed_live(
                 engine, "S1", fully_complete=True)
 
-        mock_add.assert_not_called()
+        mock_add.assert_called_once()
+        kwargs = mock_add.call_args.kwargs
+        assert kwargs["image_count"] == 9
+        assert kwargs["min_images_threshold"] == 10
 
     def test_study_completed_live_includes_entry_at_threshold(self):
         """Boundary: exactly 10 downloaded images must appear."""
@@ -438,12 +446,17 @@ class TestMainWindowLog:
         self.win = MainWindow(populated_config)
 
     def test_log_appends_to_window(self):
+        # ``_log`` routes through a Qt.QueuedConnection signal so the
+        # append happens on the next event-loop iteration; pump
+        # events so the assertion sees the result.
         self.win._log("Test message")
+        QApplication.processEvents()
         text = self.win.log_window.log_text.toPlainText()
         assert "Test message" in text
 
     def test_log_has_timestamp(self):
         self.win._log("Timestamped message")
+        QApplication.processEvents()
         text = self.win.log_window.log_text.toPlainText()
         # Should contain HH:MM:SS pattern
         assert "]" in text and "[" in text
@@ -586,6 +599,47 @@ class TestMainWindowSCP:
 
         assert len(self.win.storage_scps) == 1
 
+    def test_scp_check_pops_pending_when_node_gone(self):
+        """If the source has been removed between scheduling the SCP
+        check and the check result coming back, the pending-start
+        params must be dropped — otherwise they leak forever and may
+        be consumed by a future same-keyed re-add."""
+        params = {"hours": 3}
+        self.win._pending_start_params = {"ct": params}
+
+        # Pull the source out from under us.
+        node_dict = self.win.config.remote_nodes["ct"].to_dict()
+        del self.win.config.remote_nodes["ct"]
+
+        self.win._on_scp_check_done("ct", True, node_dict)
+
+        assert "ct" not in self.win._pending_start_params
+
+    @patch("gui.main_window.StorageSCP")
+    @patch.object(MainWindow, "_start_engine")
+    def test_scp_bind_failure_is_handled(self, mock_start_engine, MockSCP):
+        """When ``StorageSCP.start()`` raises (port already in use),
+        the handler must log it, drop the pending-params entry, and
+        NOT start the engine — otherwise the engine fires C-MOVEs to
+        a dead local SCP."""
+        mock_scp = MagicMock()
+        mock_scp.start.side_effect = RuntimeError(
+            "Storage SCP failed to bind on port 11112")
+        MockSCP.return_value = mock_scp
+
+        node = self.win.config.remote_nodes["ct"]
+        params = {"hours": 3, "max_images": 0, "sync_interval": 60}
+        self.win._pending_start_params = {"ct": params}
+        # Must not raise out to the Qt event loop.
+        self.win._on_scp_check_done("ct", False, node.to_dict())
+
+        mock_start_engine.assert_not_called()
+        assert "ct" not in self.win._pending_start_params
+        # The (ae_title, port) key must not be left in storage_scps as
+        # a half-built SCP — otherwise the next start would skip the
+        # init path on a dead instance.
+        assert ("LOCAL_AE", 11112) not in self.win.storage_scps
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MainWindow — close event
@@ -616,26 +670,24 @@ class TestMainWindowClose:
     @patch("gui.main_window.QMessageBox.question",
            return_value=16384)  # Yes
     def test_close_waits_for_engine_thread(self, mock_question):
-        """After Quit-Anyway, the engine thread must be join()ed so
-        the in-flight C-MOVE can finish — otherwise the daemon thread
-        is killed mid-transfer and the SQLite log is inconsistent.
+        """After Quit-Anyway, the engine must be join()ed so the
+        in-flight C-MOVE can finish — otherwise the daemon thread is
+        killed mid-transfer and the SQLite log is inconsistent.
 
-        The poll-join loop checks ``is_alive`` three times per engine
-        before terminating: outer guard, while-condition entry, and
-        while-condition recheck after the first join slice.  Report
-        alive twice then dead so the loop terminates after a single
-        join slice."""
+        Drive ``engine.join`` to report 'still running' once then
+        'finished' so the responsive-join loop runs one slice and
+        terminates."""
         mock_engine = MagicMock()
         mock_engine.is_running = True
-        mock_engine._thread.is_alive.side_effect = [True, True, False]
+        mock_engine.join.side_effect = [False, True]
         self.win.engines["ct"] = mock_engine
         event = MagicMock()
         self.win.closeEvent(event)
         mock_engine.stop.assert_called_once()
-        assert mock_engine._thread.join.called
+        assert mock_engine.join.called
         # Sanity: a finite, positive timeout was supplied (don't hang
         # forever).
-        _, kwargs = mock_engine._thread.join.call_args
+        _, kwargs = mock_engine.join.call_args
         assert "timeout" in kwargs and kwargs["timeout"] > 0
 
     @patch("gui.main_window.QMessageBox.question",

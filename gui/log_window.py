@@ -5,7 +5,7 @@ Accessible from the menu bar.
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout,
-    QFileDialog, QLabel,
+    QFileDialog, QLabel, QMessageBox,
 )
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QFont
@@ -62,9 +62,17 @@ class LogWindow(QWidget):
     def _save_to_file(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Log", "dicom_sync.log", "Text Files (*.log *.txt)")
-        if path:
+        if not path:
+            return
+        try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.log_text.toPlainText())
+        except OSError as e:
+            # Permission denied, disk full, read-only FS, etc.  Surface
+            # the failure as a dialog instead of crashing to the console.
+            QMessageBox.warning(
+                self, "Save failed",
+                f"Could not save log to {path}:\n{e}")
 
     def _update_line_count(self):
         text = self.log_text.toPlainText()

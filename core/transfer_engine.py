@@ -6,6 +6,7 @@ Emits Qt signals so the GUI can display queue and progress in real time.
 """
 
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -276,6 +277,13 @@ class TransferEngine:
     def _remote_node(self):
         return self.config.remote_nodes[self.remote_key]
 
+    @property
+    def _active_node_or_none(self):
+        """Return the engine's ``PacsNode`` or ``None`` if the source
+        has been removed from the config (vs. ``_remote_node`` which
+        raises ``KeyError`` in that case)."""
+        return self.config.remote_nodes.get(self.remote_key)
+
     def queue_snapshot(self) -> List[SeriesJob]:
         """Return a shallow copy of the current job queue.
 
@@ -533,6 +541,16 @@ class TransferEngine:
                 dicom_ops, studies, seen_series, max_images)
             jobs.extend(prior_jobs)
 
+        # Reorder so studies whose series descriptions match a
+        # configured priority term float to the top of the queue,
+        # in the order the terms appear in the source's
+        # ``priority_series_terms`` list.  Done BEFORE the
+        # ``studies_queried`` emit so the engine's announced
+        # work-list and the queue it actually downloads are in the
+        # same order (future consumers of ``studies_queried`` won't
+        # silently disagree with the queue's order).
+        jobs = self._apply_priority_ordering(jobs)
+
         # Emit study metadata for study rate display.  Covers ALL studies
         # from the query (including filtered-out and time-filtered ones)
         # with InstitutionName patched from series-level where available.
@@ -542,6 +560,113 @@ class TransferEngine:
             [dict(v) for v in study_metadata.values()])
 
         return jobs
+
+    def _apply_priority_ordering(
+            self, jobs: List[SeriesJob]) -> List[SeriesJob]:
+        """Apply this engine's source-level priority list to *jobs*.
+
+        Reads ``priority_series_terms`` from the bound ``PacsNode``
+        and delegates the sort to the pure
+        :py:meth:`_sort_jobs_by_priority` helper (which doesn't need
+        a TransferEngine instance and is therefore easy to test in
+        isolation).
+        """
+        # ``self._remote_node`` raises KeyError if the source was
+        # deleted from the config between construction and this
+        # cycle's query.  Today the Settings dialog only opens when
+        # the engine is stopped, but a future change might loosen
+        # that — fall back to "no reorder" instead of crashing the
+        # cycle.
+        node = self._active_node_or_none
+        if node is None:
+            return jobs
+        terms = list(getattr(node, "priority_series_terms", []))
+        if not terms:
+            return jobs
+        return self._sort_jobs_by_priority(
+            jobs, terms, log_label=self.remote_key)
+
+    @staticmethod
+    def _sort_jobs_by_priority(jobs: List[SeriesJob],
+                               terms: List[Dict[str, Any]],
+                               log_label: str = "") -> List[SeriesJob]:
+        """Pure stable-sort: studies that contain at least one
+        priority-matching series float to the top, in the order the
+        terms appear.  Empty *terms* short-circuits.
+
+        Composed of three small helpers, each independently testable:
+        ``_compile_matchers`` → ``_compute_study_priorities`` →
+        stable-sort.
+        """
+        if not terms:
+            return jobs
+        matchers = TransferEngine._compile_matchers(terms, log_label)
+        study_prio = TransferEngine._compute_study_priorities(
+            jobs, matchers)
+        # Stable sort by (study_priority, original_position) so:
+        #   - priority studies float to the top in priority order,
+        #   - within the same priority slot, original order is kept,
+        #   - all series of a study stay grouped together (they
+        #     share the same study_prio key).
+        indexed = list(enumerate(jobs))
+        indexed.sort(
+            key=lambda pair: (study_prio[pair[1].study_uid], pair[0]))
+        return [j for _, j in indexed]
+
+    @staticmethod
+    def _compile_matchers(terms: List[Dict[str, Any]],
+                          log_label: str = "") -> list:
+        """Build one matcher per term.  Each matcher takes a series
+        description and returns ``True`` if it matches.  Invalid
+        regexes are logged and become permanently-False matchers."""
+        prefix = f"[{log_label}] " if log_label else ""
+        matchers = []
+        for entry in terms:
+            t = entry.get("term", "") if isinstance(entry, dict) else ""
+            if not t:
+                matchers.append(lambda _s: False)
+                continue
+            if entry.get("is_regex"):
+                try:
+                    pat = re.compile(t, re.IGNORECASE)
+                    matchers.append(
+                        lambda s, p=pat: bool(p.search(s or "")))
+                except re.error as exc:
+                    # Visible in the log so the user can tell why a
+                    # priority entry no longer biases the queue.
+                    logger.warning(
+                        f"{prefix}priority regex {t!r} did not "
+                        f"compile: {exc} — the entry will match "
+                        f"nothing this cycle")
+                    matchers.append(lambda _s: False)
+            else:
+                needle = t.casefold()
+                matchers.append(
+                    lambda s, n=needle: n in (s or "").casefold())
+        return matchers
+
+    @staticmethod
+    def _compute_study_priorities(
+            jobs: List[SeriesJob], matchers: list) -> Dict[str, int]:
+        """Per study_uid: index of the FIRST matcher that fires on any
+        of its series descriptions.  Studies with no match get the
+        sentinel ``len(matchers)`` and end up at the bottom."""
+        sentinel = len(matchers)
+        out: Dict[str, int] = {}
+        for j in jobs:
+            best = sentinel
+            for i, m in enumerate(matchers):
+                if m(j.series_description):
+                    best = i
+                    break
+            # Keep the *lowest* matcher index seen across the study's
+            # series.  ``study_uid not in out`` handles the first
+            # series we see for this study (no prior value), then the
+            # subsequent ones tighten ``best`` if they hit a higher-
+            # priority term.
+            if j.study_uid not in out or best < out[j.study_uid]:
+                out[j.study_uid] = best
+        return out
 
     def _build_study_jobs(
             self, dicom_ops: DicomOperations, study_ds,
@@ -814,18 +939,46 @@ class TransferEngine:
             current_studies, seen_series: Set[str],
             max_images: int) -> List[SeriesJob]:
         """Resolve the prior-study series jobs for a single patient."""
+        prior_studies = self._find_prior_candidates(
+            dicom_ops, pid, current_studies)
+        prior_studies = self._top_n_priors(
+            prior_studies, current_studies, pid)
+
+        jobs: List[SeriesJob] = []
+        for ps in prior_studies:
+            jobs.extend(self._build_prior_jobs_for_study(
+                dicom_ops, ps, pid, seen_series, max_images))
+
+        if jobs:
+            self._log(f"  {len(jobs)} prior series for patient {pid}")
+        return jobs
+
+    def _find_prior_candidates(self,
+                               dicom_ops: DicomOperations,
+                               pid: str,
+                               current_studies) -> list:
+        """Query the PACS for the patient's full study history and
+        drop the studies already covered by the current cycle's time
+        window."""
         current_uids = {getattr(s, 'StudyInstanceUID', '')
                         for s in current_studies
                         if getattr(s, 'PatientID', '') == pid}
-
         all_raw = dicom_ops.c_find_studies(patient_id=pid)
         self._log(f"  [Prior] patient {pid}: {len(all_raw)} total studies on PACS, "
                   f"{len(current_uids)} in current window")
         prior_studies = [s for s in all_raw
                          if getattr(s, 'StudyInstanceUID', '') not in current_uids]
         self._log(f"  [Prior] {len(prior_studies)} candidate prior studies")
+        return prior_studies
 
-        prior_studies.sort(
+    def _top_n_priors(self, prior_studies: list,
+                      current_studies, pid: str) -> list:
+        """Sort newest-first, optionally filter to matching modality,
+        then truncate to the configured count."""
+        # ``sorted(...)`` returns a fresh list so future callers can
+        # reuse ``prior_studies`` without seeing it mutated under them.
+        prior_studies = sorted(
+            prior_studies,
             key=lambda x: (getattr(x, 'StudyDate', ''),
                            getattr(x, 'StudyTime', '')),
             reverse=True)
@@ -837,15 +990,7 @@ class TransferEngine:
         count = min(self.config.prior_studies_count, len(prior_studies))
         self._log(f"  [Prior] downloading {count} of {len(prior_studies)} "
                   f"(configured max: {self.config.prior_studies_count})")
-
-        jobs: List[SeriesJob] = []
-        for ps in prior_studies[:count]:
-            jobs.extend(self._build_prior_jobs_for_study(
-                dicom_ops, ps, pid, seen_series, max_images))
-
-        if jobs:
-            self._log(f"  {len(jobs)} prior series for patient {pid}")
-        return jobs
+        return prior_studies[:count]
 
     def _filter_priors_by_modality(
             self, prior_studies, current_studies, pid: str):

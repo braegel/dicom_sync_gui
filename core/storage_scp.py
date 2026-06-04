@@ -104,6 +104,17 @@ class StorageSCP(QObject):
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         self._ready.wait(timeout=5.0)
+        # ``_ready`` is set immediately before ``start_server``.  On
+        # success that call blocks forever; on failure it raises
+        # synchronously and the worker exits.  Give the worker a beat
+        # to either settle into start_server (success path) or finish
+        # raising + run its ``finally`` (failure path) before we trust
+        # ``_running_flag``.  The previous pure-flag check raced under
+        # heavy suite load.
+        self._thread.join(timeout=0.2)
+        if not self.running:
+            raise RuntimeError(
+                f"Storage SCP failed to bind on port {self.port}")
         logger.info(f"Storage SCP started on port {self.port}")
 
     def stop(self):

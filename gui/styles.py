@@ -39,6 +39,16 @@ BTN_STOP = _button_style("#c0392b", "#e74c3c", padding="10px 24px", bold=False)
 BTN_OK_BLUE = _button_style("#2980b9", "#3498db", padding="8px 24px")
 BTN_DOWNLOAD_SELECTED = _button_style(
     "#d35400", "#e67e22", padding="10px 24px", bold=False)
+# Amber / orange — used for user-initiated cycle-restart actions
+# (e.g. the dashboard Restart button: tears the engine down and
+# brings a fresh one up).  Mid-impact: bigger than a plain blue
+# action but not destructive like a red Stop / Remove.
+BTN_AMBER = _button_style("#e67e22", "#f39c12")
+BTN_AMBER_LARGE = _button_style(
+    "#e67e22", "#f39c12", padding="8px 22px")
+
+# Muted helper-text style for dialog hint labels.
+LBL_HINT_STYLE = "QLabel { color: #969696; }"
 
 
 # ── Application-wide dark theme ──────────────────────────────────────────
