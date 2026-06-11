@@ -61,7 +61,7 @@ class ServiceParams:
     sync_interval: int
     selection_mode: bool
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.hours <= 0:
             raise ValueError(
                 f"ServiceParams.hours must be > 0, got {self.hours!r}")
@@ -110,7 +110,8 @@ MIN_IMAGES_FOR_NOTIFICATION_SOUND = 21
 class StatsLabel(QLabel):
     """A label that is color-coded relative to the median-all baseline."""
 
-    def __init__(self, text="\u2014", parent=None):
+    def __init__(self, text: str = "\u2014",
+                 parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setAlignment(Qt.AlignCenter)
         font = QFont()
@@ -122,7 +123,7 @@ class StatsLabel(QLabel):
         self.setMinimumHeight(50)
         self.setStyleSheet(self._style("white"))
 
-    def set_value(self, value: float, median_all: float):
+    def set_value(self, value: float, median_all: float) -> None:
         """Update text and colour.
 
         *median_all* is the overall-median baseline.  A value more than
@@ -161,7 +162,8 @@ class SourceDashboard(QWidget):
     stop_requested = Signal(str)          # remote_key
     selection_confirmed = Signal(str, list)  # remote_key, [series_uid, ...]
 
-    def __init__(self, config, remote_key: str, parent=None):
+    def __init__(self, config, remote_key: str,
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.config = config
         self.remote_key = remote_key
@@ -224,11 +226,11 @@ class SourceDashboard(QWidget):
         self._restart_safety_timer.timeout.connect(
             self._on_restart_safety_timeout)
 
-    def _save_config_debounced(self):
+    def _save_config_debounced(self) -> None:
         """Schedule a config save 500ms in the future; coalesces bursts."""
         self._save_timer.start()
 
-    def flush_pending_save(self):
+    def flush_pending_save(self) -> None:
         """Synchronously persist any pending debounced save."""
         if self._save_timer.isActive():
             self._save_timer.stop()
@@ -238,7 +240,7 @@ class SourceDashboard(QWidget):
     def _remote_node(self):
         return self.config.remote_nodes.get(self.remote_key)
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         """Build the dashboard top-to-bottom.  Each section lives in its
         own ``_build_*`` helper; they run in layout order and attach
         their widgets to *layout* themselves.  ``_initializing`` is True
@@ -259,7 +261,7 @@ class SourceDashboard(QWidget):
         # Construction complete — accept user-driven toggle events now.
         self._initializing = False
 
-    def _build_service_controls(self, layout: QVBoxLayout):
+    def _build_service_controls(self, layout: QVBoxLayout) -> None:
         """Service Controls group: parameter spinboxes + Start/Stop/
         Restart and the (initially hidden) selection-mode buttons."""
         node = self._remote_node
@@ -357,7 +359,7 @@ class SourceDashboard(QWidget):
         ctrl_group.setLayout(ctrl_layout)
         layout.addWidget(ctrl_group)
 
-    def _build_filter_section(self, layout: QVBoxLayout):
+    def _build_filter_section(self, layout: QVBoxLayout) -> None:
         """Institution Filter group: master toggle, multi-select group
         dropdown, and the small-series exception row."""
         filter_group = QGroupBox("Institution Filter")
@@ -435,7 +437,7 @@ class SourceDashboard(QWidget):
         self._update_filter_button_text()
         self._update_filter_enabled_state()
 
-    def _build_restart_banner(self, layout: QVBoxLayout):
+    def _build_restart_banner(self, layout: QVBoxLayout) -> None:
         """Hidden warning banner shown once settings change while the
         service is running."""
         self.restart_banner = QLabel(
@@ -448,7 +450,7 @@ class SourceDashboard(QWidget):
         self.restart_banner.setVisible(False)
         layout.addWidget(self.restart_banner)
 
-    def _build_stats_section(self, layout: QVBoxLayout):
+    def _build_stats_section(self, layout: QVBoxLayout) -> None:
         """Throughput Statistics group: the four colour-coded
         images-per-minute StatsLabels."""
         stats_group = QGroupBox("Transfer Speed (images / minute)")
@@ -476,7 +478,7 @@ class SourceDashboard(QWidget):
         stats_group.setLayout(sl)
         layout.addWidget(stats_group)
 
-    def _build_study_rate_section(self, layout: QVBoxLayout):
+    def _build_study_rate_section(self, layout: QVBoxLayout) -> None:
         """Studies / Hour group: per-group (or total) rate labels."""
         self.study_rate_group = QGroupBox("Studies / Hour")
         self.study_rate_layout = QHBoxLayout()
@@ -485,7 +487,7 @@ class SourceDashboard(QWidget):
         self.study_rate_group.setLayout(self.study_rate_layout)
         layout.addWidget(self.study_rate_group)
 
-    def _build_queue_table(self, layout: QVBoxLayout):
+    def _build_queue_table(self, layout: QVBoxLayout) -> None:
         """Series Queue group: the 11-column queue table (checkbox
         column 0 hidden outside selection mode, Group column 10 hidden
         while filtering is off)."""
@@ -521,7 +523,7 @@ class SourceDashboard(QWidget):
         table_group.setLayout(tl)
         layout.addWidget(table_group, 1)  # stretch factor 1 = takes all space
 
-    def _build_summary_bar(self, layout: QVBoxLayout):
+    def _build_summary_bar(self, layout: QVBoxLayout) -> None:
         """Bottom summary bar: totals, cycle counter, status label."""
         summary = QHBoxLayout()
         self.lbl_total_images = QLabel("Total: 0 images")
@@ -539,7 +541,7 @@ class SourceDashboard(QWidget):
 
     # ── Filter group handling ─────────────────────────────────────────
 
-    def _populate_filter_menu(self):
+    def _populate_filter_menu(self) -> None:
         """Build the checkable menu items for each filter group."""
         self.filter_menu.clear()
         active = set(self.config.active_filter_groups)
@@ -557,7 +559,7 @@ class SourceDashboard(QWidget):
             empty_action.setEnabled(False)
             self.filter_menu.addAction(empty_action)
 
-    def _on_filter_group_toggled(self, checked: bool):
+    def _on_filter_group_toggled(self, checked: bool) -> None:
         """Update active groups when a menu item is toggled."""
         if self._initializing:
             return
@@ -571,7 +573,7 @@ class SourceDashboard(QWidget):
         self._save_config_debounced()
         self._update_filter_button_text()
 
-    def _on_filter_toggled(self, enabled: bool):
+    def _on_filter_toggled(self, enabled: bool) -> None:
         """Master switch for filtering."""
         if self._initializing:
             return
@@ -582,7 +584,7 @@ class SourceDashboard(QWidget):
         self._rebuild_study_rate_labels()
         self._on_settings_changed()
 
-    def _on_small_series_toggled(self, checked: bool):
+    def _on_small_series_toggled(self, checked: bool) -> None:
         if self._initializing:
             return
         self.config.filter_allow_small_series = checked
@@ -590,14 +592,14 @@ class SourceDashboard(QWidget):
         self._update_filter_enabled_state()
         self._on_settings_changed()
 
-    def _on_small_series_max_changed(self, value: int):
+    def _on_small_series_max_changed(self, value: int) -> None:
         if self._initializing:
             return
         self.config.filter_small_series_max = value
         self._save_config_debounced()
         self._on_settings_changed()
 
-    def _update_filter_enabled_state(self):
+    def _update_filter_enabled_state(self) -> None:
         enabled = self.filter_enable_check.isChecked()
         self.filter_btn.setEnabled(enabled)
         if hasattr(self, "series_table"):
@@ -613,7 +615,7 @@ class SourceDashboard(QWidget):
             self.lbl_filter_info.setText(
                 "Filtering disabled \u2014 all studies will be downloaded.")
 
-    def _update_filter_button_text(self):
+    def _update_filter_button_text(self) -> None:
         active = self.config.active_filter_groups
         if not active:
             self.filter_btn.setText("Select Groups...")
@@ -632,7 +634,7 @@ class SourceDashboard(QWidget):
                 f"Filtering active: {len(active)} group(s), "
                 f"{count} institution(s)")
 
-    def refresh_filter_groups(self):
+    def refresh_filter_groups(self) -> None:
         """Called when filter groups are edited in the dialog."""
         # Remove active selections that no longer exist
         valid_names = set(self.config.filter_group_names)
@@ -645,7 +647,7 @@ class SourceDashboard(QWidget):
         self._update_filter_enabled_state()
         self._rebuild_study_rate_labels()
 
-    def _on_sound_toggled(self, checked: bool):
+    def _on_sound_toggled(self, checked: bool) -> None:
         node = self._remote_node
         if node:
             node.notification_sound_enabled = checked
@@ -653,12 +655,12 @@ class SourceDashboard(QWidget):
 
     # ── Service control handlers ──────────────────────────────────────────
 
-    def _on_settings_changed(self):
+    def _on_settings_changed(self) -> None:
         if self._service_running:
             self._settings_dirty = True
             self.restart_banner.setVisible(True)
 
-    def _on_start_clicked(self):
+    def _on_start_clicked(self) -> None:
         self._settings_dirty = False
         self.restart_banner.setVisible(False)
         # Save per-source params to config (immediate — user-intent
@@ -675,12 +677,12 @@ class SourceDashboard(QWidget):
         self.lbl_status.setText("Starting service…")
         self.start_requested.emit(self.remote_key, params)
 
-    def _on_stop_clicked(self):
+    def _on_stop_clicked(self) -> None:
         self._settings_dirty = False
         self.restart_banner.setVisible(False)
         self.stop_requested.emit(self.remote_key)
 
-    def _on_restart_clicked(self):
+    def _on_restart_clicked(self) -> None:
         """Stop the service and start it again as soon as it has
         actually stopped.  The two-phase flow piggybacks on the
         existing stop/start signals — no new wiring needed in
@@ -713,7 +715,7 @@ class SourceDashboard(QWidget):
         self._restart_safety_timer.start(60_000)
         self.stop_requested.emit(self.remote_key)
 
-    def _on_restart_safety_timeout(self):
+    def _on_restart_safety_timeout(self) -> None:
         """Fired if a Restart click never gets its corresponding
         ``set_service_running(False)`` callback within 60 s — clears
         the pending flag so the status label and cycle handlers
@@ -737,7 +739,7 @@ class SourceDashboard(QWidget):
             selection_mode=self.manual_selection_check.isChecked(),
         )
 
-    def set_service_running(self, running: bool):
+    def set_service_running(self, running: bool) -> None:
         self._service_running = running
         self._apply_control_enabled(running)
         if running:
@@ -781,7 +783,7 @@ class SourceDashboard(QWidget):
                     params.selection_mode)
             self._on_start_clicked()
 
-    def _apply_control_enabled(self, running: bool):
+    def _apply_control_enabled(self, running: bool) -> None:
         """Enable / disable the service-control buttons and spinboxes
         for the running / idle state."""
         self.btn_start.setEnabled(not running)
@@ -791,7 +793,7 @@ class SourceDashboard(QWidget):
         self.max_images_spin.setEnabled(not running)
         self.interval_spin.setEnabled(not running)
 
-    def _apply_selection_ui_visible(self, visible: bool):
+    def _apply_selection_ui_visible(self, visible: bool) -> None:
         """Toggle the manual-selection helpers (used when the engine
         is in selection-mode), all in one place."""
         self.btn_download_selected.setVisible(visible)
@@ -886,7 +888,7 @@ class SourceDashboard(QWidget):
         ete_item.setTextAlignment(Qt.AlignCenter)
         return ete_item
 
-    def _update_series_summary(self, queue: list):
+    def _update_series_summary(self, queue: list) -> None:
         """Refresh the 'Series: done / total' summary label."""
         done_count = sum(1 for job in queue if job["status"] == "done")
         self.lbl_total_series.setText(
@@ -894,7 +896,7 @@ class SourceDashboard(QWidget):
 
     # ── Slots called by engine signals ────────────────────────────────────
 
-    def on_queue_updated(self, queue: list):
+    def on_queue_updated(self, queue: list) -> None:
         """Render the series table from the full queue list.
 
         The engine emits the full queue after EVERY completed series,
@@ -922,7 +924,7 @@ class SourceDashboard(QWidget):
             self._rebuild_queue_table(queue)
             self._rendered_uids = uids
 
-    def _rebuild_queue_table(self, queue: list):
+    def _rebuild_queue_table(self, queue: list) -> None:
         """Full rebuild of the series table (uid sequence changed)."""
         rate = self._get_rate()
         self.series_table.setRowCount(0)
@@ -959,7 +961,7 @@ class SourceDashboard(QWidget):
 
         self._update_series_summary(queue)
 
-    def _update_queue_cells_in_place(self, queue: list):
+    def _update_queue_cells_in_place(self, queue: list) -> None:
         """Same uid sequence as currently rendered — refresh only the
         cells that can change between per-series progress emits.  The
         static columns (patient, study, series, modality, images,
@@ -978,7 +980,7 @@ class SourceDashboard(QWidget):
 
         self._update_series_summary(queue)
 
-    def on_queue_ready_for_selection(self, queue: list):
+    def on_queue_ready_for_selection(self, queue: list) -> None:
         """Engine paused after query — show checkboxes for manual selection."""
         self._last_queue = queue
         # The table now holds selection-mode rows (checkbox column,
@@ -1034,7 +1036,7 @@ class SourceDashboard(QWidget):
         # Allow checking/unchecking in the table
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-    def _set_all_series_checked(self, checked: bool):
+    def _set_all_series_checked(self, checked: bool) -> None:
         """Check or uncheck every row of the selection table."""
         state = Qt.Checked if checked else Qt.Unchecked
         for row in range(self.series_table.rowCount()):
@@ -1042,7 +1044,7 @@ class SourceDashboard(QWidget):
             if cb_item is not None:
                 cb_item.setCheckState(state)
 
-    def _on_download_selected_clicked(self):
+    def _on_download_selected_clicked(self) -> None:
         """Collect checked series UIDs and confirm selection to the engine."""
         selected_uids = []
         for row in range(self.series_table.rowCount()):
@@ -1053,14 +1055,14 @@ class SourceDashboard(QWidget):
                     selected_uids.append(uid)
         self.selection_confirmed.emit(self.remote_key, selected_uids)
 
-    def on_series_started(self, info: dict):
+    def on_series_started(self, info: dict) -> None:
         if self._restart_pending:
             return  # keep the "Restarting\u2026" label stable
         self.lbl_status.setText(
             f"Transferring: {info['patient_name']} \u2014 "
             f"[{info.get('modality', '')}] {info['series_description']}")
 
-    def on_stats_updated(self, stats: TransferStats):
+    def on_stats_updated(self, stats: TransferStats) -> None:
         self._current_stats = stats
         self.lbl_total_images.setText(f"Total: {stats.total_images} images")
         self._refresh_stats_display()
@@ -1068,13 +1070,13 @@ class SourceDashboard(QWidget):
         if self._last_queue:
             self._update_ete_column()
 
-    def on_cycle_started(self, cycle: int):
+    def on_cycle_started(self, cycle: int) -> None:
         self.lbl_cycle.setText(f"Cycle: {cycle}")
         if self._restart_pending:
             return
         self.lbl_status.setText(f"Cycle {cycle} \u2014 querying...")
 
-    def on_cycle_finished(self, cycle: int, images: int):
+    def on_cycle_finished(self, cycle: int, images: int) -> None:
         if self._restart_pending:
             return
         if images > 0:
@@ -1086,7 +1088,7 @@ class SourceDashboard(QWidget):
 
     # ── Stats display ─────────────────────────────────────────────────────
 
-    def _refresh_stats_display(self):
+    def _refresh_stats_display(self) -> None:
         stats = self._current_stats
         if not stats or stats.completed_count == 0:
             return
@@ -1103,7 +1105,7 @@ class SourceDashboard(QWidget):
 
         self.lbl_total_images.setText(f"Total: {stats.total_images} images")
 
-    def _update_ete_column(self):
+    def _update_ete_column(self) -> None:
         """Update only the ETE column without rebuilding the whole table."""
         rate = self._get_rate()
         queue = self._last_queue
@@ -1118,7 +1120,7 @@ class SourceDashboard(QWidget):
 
     # ── Study rate ────────────────────────────────────────────────────────
 
-    def _rebuild_study_rate_labels(self):
+    def _rebuild_study_rate_labels(self) -> None:
         """Create or recreate per-group (or total) labels."""
         # Clear existing.  ``deleteLater()`` schedules the QLabel for
         # destruction at the end of the current event-loop slice;
@@ -1162,7 +1164,7 @@ class SourceDashboard(QWidget):
     def on_study_completed(self, study_uid: str,
                            institution_name: str,
                            fully_complete: bool = True,
-                           image_count: Optional[int] = None):
+                           image_count: Optional[int] = None) -> None:
         """Slot for study_completed — play notification sound
         only when the study was fully downloaded *and* enough images
         actually arrived.
@@ -1181,7 +1183,7 @@ class SourceDashboard(QWidget):
             return
         self._play_notification_if_allowed(institution_name)
 
-    def _play_notification_if_allowed(self, institution_name: str):
+    def _play_notification_if_allowed(self, institution_name: str) -> None:
         """Play notification sound if enabled and institution passes filter."""
         node = self._remote_node
         if not node or not node.notification_sound_enabled:
@@ -1207,7 +1209,7 @@ class SourceDashboard(QWidget):
             return False
         return stats.median_n_ipm(5) < median_all * (1 - SPEED_BAND_RATIO)
 
-    def _play_sound(self, path: str):
+    def _play_sound(self, path: str) -> None:
         """Play a WAV file via the long-lived QSoundEffect (lazy)."""
         if self._sound_effect is None:
             self._sound_effect = QSoundEffect(self)
@@ -1215,11 +1217,11 @@ class SourceDashboard(QWidget):
         self._sound_effect.setSource(QUrl.fromLocalFile(path))
         self._sound_effect.play()
 
-    def on_studies_queried(self, studies: list):
+    def on_studies_queried(self, studies: list) -> None:
         """Slot for the studies_queried signal — receives raw query results."""
         self._update_study_rate_display(studies)
 
-    def _update_study_rate_display(self, studies: list):
+    def _update_study_rate_display(self, studies: list) -> None:
         """Refresh the study rate labels and trigger high-load popup."""
         rates = self._compute_study_rates(studies)
 
@@ -1288,7 +1290,7 @@ class SourceDashboard(QWidget):
             "skipped": QColor(COLOR_MUTED),
         }.get(status, QColor("#d4d4d4"))
 
-    def reset(self):
+    def reset(self) -> None:
         self.series_table.setRowCount(0)
         self._current_stats = None
         self._last_queue = []
@@ -1305,7 +1307,7 @@ class SourceDashboard(QWidget):
         self.lbl_status.setText("Idle")
         self._rebuild_study_rate_labels()
 
-    def sync_from_config(self):
+    def sync_from_config(self) -> None:
         """Update spinboxes from the current config node values."""
         node = self._remote_node
         if node:

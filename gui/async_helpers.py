@@ -38,7 +38,7 @@ class _CallbackRelay(QObject):
 
     delivered = Signal(object)
 
-    def __init__(self, on_done: Callable[[Any], None], parent: QObject):
+    def __init__(self, on_done: Callable[[Any], None], parent: QObject) -> None:
         super().__init__(parent)
         # Connect explicitly to be sure the slot runs on the relay's
         # owning thread even when the connection is established from
@@ -46,7 +46,7 @@ class _CallbackRelay(QObject):
         self.delivered.connect(self._invoke)
         self._on_done = on_done
 
-    def _invoke(self, result: object):
+    def _invoke(self, result: object) -> None:
         try:
             self._on_done(result)
         except Exception as e:

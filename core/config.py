@@ -12,6 +12,7 @@ import logging
 import os
 import platform
 import socket
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("dicom_sync")
@@ -63,6 +64,7 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+@dataclass(eq=False)
 class PacsNode:
     """Represents a source PACS node with per-source service *and* local
     destination parameters.
@@ -73,52 +75,46 @@ class PacsNode:
         deliver images to (the local receiver for *this* source)
       - fallback_folder: directory to save images when no local PACS is
         reachable (a built-in SCP will be spawned automatically)
+
+    ``eq=False`` keeps the pre-dataclass identity semantics: nodes are
+    mutable config objects compared by object identity (``in`` checks,
+    dict membership), not field-by-field.
     """
 
-    def __init__(self, name: str = "", ae_title: str = "", ip_address: str = "",
-                 port: int = 104, transfer_syntax: str = "JPEG2000Lossless",
-                 retrieve_method: str = "C-MOVE",
-                 hours: int = 3, max_images: int = 0,
-                 sync_interval: int = 60,
-                 local_ae_title: str = "LOCAL_AE",
-                 local_port: int = 11112,
-                 local_syntax: str = "JPEG2000Lossless",
-                 fallback_folder: str = "",
-                 notification_sound_enabled: bool = True,
-                 notification_sound_path: str = "",
-                 priority_series_terms: Optional[List[Dict[str, Any]]] = None):
-        self.name = name
-        self.ae_title = ae_title
-        self.ip_address = ip_address
-        self.port = port
-        self.transfer_syntax = transfer_syntax
-        # Only "C-MOVE" is honored; "C-GET" may still appear in old
-        # config files but the engine has no C-GET path (see
-        # RETRIEVE_METHODS above).
-        self.retrieve_method = retrieve_method
-        # Per-source service parameters
-        self.hours = hours
-        self.max_images = max_images
-        self.sync_interval = sync_interval
-        # Per-source local destination (C-MOVE target)
-        self.local_ae_title = local_ae_title
-        self.local_port = local_port
-        self.local_syntax = local_syntax
-        self.fallback_folder = fallback_folder
-        self.notification_sound_enabled = notification_sound_enabled
-        self.notification_sound_path = notification_sound_path
-        # Per-source ordered list of {"term": str, "is_regex": bool}.
-        # ``None`` (the default) seeds the bundled defaults via the
-        # shared helper so every fresh node gets the standard list.
-        # An empty list passed explicitly is preserved (user-cleared).
+    name: str = ""
+    ae_title: str = ""
+    ip_address: str = ""
+    port: int = 104
+    transfer_syntax: str = "JPEG2000Lossless"
+    # Only "C-MOVE" is honored; "C-GET" may still appear in old config
+    # files but the engine has no C-GET path (see RETRIEVE_METHODS).
+    retrieve_method: str = "C-MOVE"
+    # Per-source service parameters
+    hours: int = 3
+    max_images: int = 0
+    sync_interval: int = 60
+    # Per-source local destination (C-MOVE target)
+    local_ae_title: str = "LOCAL_AE"
+    local_port: int = 11112
+    local_syntax: str = "JPEG2000Lossless"
+    fallback_folder: str = ""
+    notification_sound_enabled: bool = True
+    notification_sound_path: str = ""
+    # Per-source ordered list of {"term": str, "is_regex": bool}.
+    # ``None`` (the default) seeds the bundled defaults in
+    # ``__post_init__`` so every fresh node gets the standard list.
+    # An empty list passed explicitly is preserved (user-cleared).
+    priority_series_terms: Optional[List[Dict[str, Any]]] = None
+
+    def __post_init__(self):
         # An explicit non-empty list is deep-copied so the caller can
         # keep using its own list without leaking mutations into the
         # node, symmetric to the defensive copy in ``from_dict``.
-        if priority_series_terms is None:
+        if self.priority_series_terms is None:
             self.priority_series_terms = default_priority_terms()
         else:
             self.priority_series_terms = [
-                dict(e) for e in priority_series_terms]
+                dict(e) for e in self.priority_series_terms]
 
     def to_dict(self) -> Dict[str, Any]:
         return {

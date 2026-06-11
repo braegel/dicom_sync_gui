@@ -12,10 +12,10 @@ Workflow:
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QWidget,
     QPushButton, QGroupBox, QListWidget, QComboBox,
     QSpinBox, QMessageBox, QSplitter, QInputDialog, QHeaderView,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView,
@@ -39,7 +39,8 @@ class FilterGroupsDialog(QDialog):
 
     _query_results_ready = Signal(set)
 
-    def __init__(self, config: AppConfig, parent=None):
+    def __init__(self, config: AppConfig,
+                 parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.config = config
 
@@ -59,7 +60,7 @@ class FilterGroupsDialog(QDialog):
 
     # ── UI ────────────────────────────────────────────────────────────────
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         # ── Top: Query institutions from PACS ──
@@ -214,7 +215,7 @@ class FilterGroupsDialog(QDialog):
 
     # ── Group management ──────────────────────────────────────────────────
 
-    def _refresh_group_list(self):
+    def _refresh_group_list(self) -> None:
         self.group_list.clear()
         for name in self._group_names:
             count = sum(
@@ -222,7 +223,7 @@ class FilterGroupsDialog(QDialog):
             self.group_list.addItem(f"{name}  ({count} institutions)")
         self._refresh_assign_combo()
 
-    def _refresh_assign_combo(self):
+    def _refresh_assign_combo(self) -> None:
         current = self.assign_combo.currentText()
         self.assign_combo.clear()
         for name in self._group_names:
@@ -231,12 +232,12 @@ class FilterGroupsDialog(QDialog):
         if idx >= 0:
             self.assign_combo.setCurrentIndex(idx)
 
-    def _on_group_selected(self, row):
+    def _on_group_selected(self, row: int) -> None:
         enabled = row >= 0
         self.btn_rename_group.setEnabled(enabled)
         self.btn_remove_group.setEnabled(enabled)
 
-    def _add_group(self):
+    def _add_group(self) -> None:
         name = self.group_name_edit.text().strip()
         if not name:
             return
@@ -249,7 +250,7 @@ class FilterGroupsDialog(QDialog):
         self.group_name_edit.clear()
         self._refresh_group_list()
 
-    def _rename_group(self):
+    def _rename_group(self) -> None:
         row = self.group_list.currentRow()
         if row < 0:
             return
@@ -277,7 +278,7 @@ class FilterGroupsDialog(QDialog):
         self._refresh_group_list()
         self._refresh_institution_tree()
 
-    def _remove_group(self):
+    def _remove_group(self) -> None:
         row = self.group_list.currentRow()
         if row < 0:
             return
@@ -302,7 +303,7 @@ class FilterGroupsDialog(QDialog):
 
     # ── Institution tree ──────────────────────────────────────────────────
 
-    def _refresh_institution_tree(self):
+    def _refresh_institution_tree(self) -> None:
         self.institution_tree.clear()
         # Collect all known institutions (from assignments + discovered)
         all_institutions = sorted(
@@ -319,7 +320,7 @@ class FilterGroupsDialog(QDialog):
                 item.setText(1, "(unassigned)")
             self.institution_tree.addTopLevelItem(item)
 
-    def _assign_selected(self):
+    def _assign_selected(self) -> None:
         group = self.assign_combo.currentText()
         if not group:
             QMessageBox.warning(
@@ -338,7 +339,7 @@ class FilterGroupsDialog(QDialog):
         self._refresh_institution_tree()
         self._refresh_group_list()
 
-    def _unassign_selected(self):
+    def _unassign_selected(self) -> None:
         selected = self.institution_tree.selectedItems()
         if not selected:
             return
@@ -351,7 +352,7 @@ class FilterGroupsDialog(QDialog):
         self._refresh_institution_tree()
         self._refresh_group_list()
 
-    def _add_institution_manually(self):
+    def _add_institution_manually(self) -> None:
         name = self.manual_inst_edit.text().strip()
         if not name:
             return
@@ -362,7 +363,7 @@ class FilterGroupsDialog(QDialog):
 
     # ── Query PACS for institutions ───────────────────────────────────────
 
-    def _query_institutions(self):
+    def _query_institutions(self) -> None:
         if not self.config.remote_nodes:
             QMessageBox.warning(
                 self, "No Source PACS",
@@ -414,7 +415,7 @@ class FilterGroupsDialog(QDialog):
             self, discover, self._query_results_ready.emit,
             label="filter_groups_query")
 
-    def _on_query_results(self, discovered: set):
+    def _on_query_results(self, discovered: set) -> None:
         """Handle query results on the main thread."""
         new_count = 0
         for inst in discovered:
@@ -433,7 +434,7 @@ class FilterGroupsDialog(QDialog):
 
     # ── Export / Import ────────────────────────────────────────────────
 
-    def _export_groups(self):
+    def _export_groups(self) -> None:
         """Export the current (unsaved) filter groups to a JSON file."""
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Filter Groups",
@@ -456,7 +457,7 @@ class FilterGroupsDialog(QDialog):
             QMessageBox.critical(
                 self, "Export Failed", f"Could not write file:\n{e}")
 
-    def _import_groups(self):
+    def _import_groups(self) -> None:
         """Import filter groups from a JSON file into the dialog's working data."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Import Filter Groups", "",
@@ -524,7 +525,7 @@ class FilterGroupsDialog(QDialog):
 
     # ── Save ──────────────────────────────────────────────────────────
 
-    def _save(self):
+    def _save(self) -> None:
         # Clean up assignments: remove entries whose group no longer exists
         cleaned = {}
         for inst, grp in self._assignments.items():

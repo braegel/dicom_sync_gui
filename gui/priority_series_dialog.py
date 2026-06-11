@@ -27,7 +27,8 @@ logger = logging.getLogger("dicom_sync")
 class PrioritySeriesDialog(QDialog):
     """Edit the per-source priority series term list."""
 
-    def __init__(self, config: AppConfig, parent=None):
+    def __init__(self, config: AppConfig,
+                 parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.config = config
         # Deep-copied working list per source so cancel discards
@@ -49,7 +50,7 @@ class PrioritySeriesDialog(QDialog):
 
     # ── UI ────────────────────────────────────────────────────────────────
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         # ── Source picker ──
@@ -148,7 +149,7 @@ class PrioritySeriesDialog(QDialog):
 
     # ── Source switching ─────────────────────────────────────────────────
 
-    def _close_pending_edit(self):
+    def _close_pending_edit(self) -> None:
         """Commit any in-progress cell edit so the typed text lands
         in the item model before any subsequent ``_collect_table``
         read.  Without this, a half-edited Term cell is still owned
@@ -171,7 +172,7 @@ class PrioritySeriesDialog(QDialog):
         delegate.commitData.emit(editor)
         delegate.closeEditor.emit(editor)
 
-    def _on_source_changed(self, index: int):
+    def _on_source_changed(self, index: int) -> None:
         self._close_pending_edit()
 
         # Persist current source's edits back into the working dict
@@ -185,7 +186,7 @@ class PrioritySeriesDialog(QDialog):
         self._current_key = new_key
         self._render_table(self._working_lists.get(new_key, []))
 
-    def _render_table(self, entries: List[Dict]):
+    def _render_table(self, entries: List[Dict]) -> None:
         self.terms_table.setRowCount(0)
         for entry in entries:
             self._append_table_row(
@@ -193,7 +194,7 @@ class PrioritySeriesDialog(QDialog):
                 bool(entry.get("is_regex")),
             )
 
-    def _append_table_row(self, term: str, is_regex: bool):
+    def _append_table_row(self, term: str, is_regex: bool) -> None:
         row = self.terms_table.rowCount()
         self.terms_table.insertRow(row)
         self.terms_table.setItem(row, 0, QTableWidgetItem(term))
@@ -240,7 +241,7 @@ class PrioritySeriesDialog(QDialog):
         rows = self.terms_table.selectionModel().selectedRows()
         return rows[0].row() if rows else -1
 
-    def _on_add_row(self):
+    def _on_add_row(self) -> None:
         """Append a blank row.
 
         Selects the new row but does NOT enter the cell's edit mode
@@ -252,7 +253,7 @@ class PrioritySeriesDialog(QDialog):
         new_row = self.terms_table.rowCount() - 1
         self.terms_table.selectRow(new_row)
 
-    def _on_remove_row(self):
+    def _on_remove_row(self) -> None:
         row = self._selected_row()
         if row < 0:
             return
@@ -267,7 +268,8 @@ class PrioritySeriesDialog(QDialog):
         is_regex = bool(cb.isChecked()) if cb is not None else False
         return term, is_regex
 
-    def _set_row_payload(self, row: int, term: str, is_regex: bool):
+    def _set_row_payload(self, row: int, term: str,
+                         is_regex: bool) -> None:
         """Write *term* + *is_regex* into *row*, creating the term
         item if it doesn't yet exist."""
         t = self.terms_table
@@ -280,7 +282,7 @@ class PrioritySeriesDialog(QDialog):
         if cb is not None:
             cb.setChecked(is_regex)
 
-    def _swap_rows(self, a: int, b: int):
+    def _swap_rows(self, a: int, b: int) -> None:
         """Swap the two rows in place — avoids re-creating every
         QCheckBox widget every time the user nudges a row up or
         down, which would otherwise churn the GC for no reason."""
@@ -298,22 +300,22 @@ class PrioritySeriesDialog(QDialog):
         t.clearSelection()
         t.selectRow(b)
 
-    def _on_move_up(self):
+    def _on_move_up(self) -> None:
         row = self._selected_row()
         if row > 0:
             self._swap_rows(row, row - 1)
 
-    def _on_move_down(self):
+    def _on_move_down(self) -> None:
         row = self._selected_row()
         if 0 <= row < self.terms_table.rowCount() - 1:
             self._swap_rows(row, row + 1)
 
-    def _on_reset_to_defaults(self):
+    def _on_reset_to_defaults(self) -> None:
         self._render_table(default_priority_terms())
 
     # ── Save / Cancel ────────────────────────────────────────────────────
 
-    def _on_save(self):
+    def _on_save(self) -> None:
         # Flush the currently-displayed list back into the working dict.
         if self._current_key:
             self._working_lists[self._current_key] = self._collect_table()
@@ -337,7 +339,8 @@ class PrioritySeriesDialog(QDialog):
         self.config.save()
         self.accept()
 
-    def _find_whitespace_only_term(self):
+    def _find_whitespace_only_term(
+            self) -> Optional[tuple[str, int, str, str]]:
         """Return ``(key, row_idx, title, message)`` for the first
         non-empty whitespace-only term, or ``None`` if all clean."""
         for key, entries in self._working_lists.items():
@@ -355,7 +358,8 @@ class PrioritySeriesDialog(QDialog):
                         f"saving.")
         return None
 
-    def _find_invalid_regex(self):
+    def _find_invalid_regex(
+            self) -> Optional[tuple[str, int, str, str]]:
         """Return ``(key, row_idx, title, message)`` for the first
         regex row that fails to compile, or ``None`` if all clean."""
         for key, entries in self._working_lists.items():
@@ -382,7 +386,7 @@ class PrioritySeriesDialog(QDialog):
                         f"{e}{context}")
         return None
 
-    def _commit_to_config(self):
+    def _commit_to_config(self) -> None:
         """Write every working list back onto its ``PacsNode``, dropping
         rows whose term is the empty string (no input from the user)."""
         for key, entries in self._working_lists.items():
@@ -396,7 +400,7 @@ class PrioritySeriesDialog(QDialog):
             if node is not None:
                 node.priority_series_terms = cleaned
 
-    def _show_source(self, remote_key: str):
+    def _show_source(self, remote_key: str) -> None:
         """Programmatically switch the combo to *remote_key*.
 
         Renders the target source's table without re-triggering the

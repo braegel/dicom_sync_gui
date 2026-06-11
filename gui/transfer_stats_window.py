@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
     QPushButton, QComboBox, QTabWidget,
 )
-from PySide6.QtGui import QFont, QPainter
+from PySide6.QtGui import QCloseEvent, QFont, QPainter
 
 from core.stats_utils import median, tukey_quartiles
 from core.transfer_log import TransferLog
@@ -27,7 +27,7 @@ logger = logging.getLogger("dicom_sync")
 
 class TransferStatsWindow(QWidget):
 
-    def __init__(self, db_path: str, parent=None):
+    def __init__(self, db_path: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._db_path = db_path
         # Open one TransferLog for the window's lifetime instead of
@@ -43,14 +43,14 @@ class TransferStatsWindow(QWidget):
         self._setup_ui()
         self._refresh()
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: QCloseEvent) -> None:
         try:
             self._log.close()
         except Exception:
             pass
         super().closeEvent(event)
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         # ── Filters ──────────────────────────────────────────────────
@@ -149,7 +149,7 @@ class TransferStatsWindow(QWidget):
 
     # ── Data loading ─────────────────────────────────────────────────
 
-    def _get_filters(self):
+    def _get_filters(self) -> tuple[str | None, str | None]:
         source = None
         modality = None
         if self.filter_source.currentIndex() > 0:
@@ -158,7 +158,7 @@ class TransferStatsWindow(QWidget):
             modality = self.filter_modality.currentText()
         return source, modality
 
-    def _on_refresh_clicked(self):
+    def _on_refresh_clicked(self) -> None:
         """Re-enumerate the filter combos from the full log on a
         worker thread, then refresh the views."""
         def job():
@@ -175,7 +175,7 @@ class TransferStatsWindow(QWidget):
 
         run_in_background(self, job, apply, label="stats_filters")
 
-    def _populate_filter_combos(self, all_series):
+    def _populate_filter_combos(self, all_series: list[dict]) -> None:
         """Rebuild the Source/Modality combos from *all_series* rows,
         preserving the current selection where still valid."""
         sources = sorted({r["source_pacs"] for r in all_series})
@@ -206,7 +206,7 @@ class TransferStatsWindow(QWidget):
         self.filter_source.blockSignals(False)
         self.filter_modality.blockSignals(False)
 
-    def _refresh(self):
+    def _refresh(self) -> None:
         """Query the log on a worker thread and update all views.
 
         The full-history ``SELECT *`` used to run synchronously on
@@ -258,7 +258,8 @@ class TransferStatsWindow(QWidget):
 
     # ── Summary ──────────────────────────────────────────────────────
 
-    def _update_summary(self, series, studies):
+    def _update_summary(self, series: list[dict],
+                        studies: list[dict]) -> None:
         n_studies = len(studies)
         n_series = len(series)
         n_images = sum(r["image_count"] for r in series)
@@ -305,7 +306,7 @@ class TransferStatsWindow(QWidget):
             return dt.strftime("%Y-%m")
         return dt.strftime("%Y-%m-%d")
 
-    def _update_boxplot(self, series):
+    def _update_boxplot(self, series: list[dict]) -> None:
         self._chart.removeAllSeries()
         for axis in self._chart.axes():
             self._chart.removeAxis(axis)
@@ -341,7 +342,8 @@ class TransferStatsWindow(QWidget):
 
     # ── Source table ─────────────────────────────────────────────────
 
-    def _update_source_table(self, series, studies):
+    def _update_source_table(self, series: list[dict],
+                             studies: list[dict]) -> None:
         headers = ["Source", "Studies", "Series", "Images", "Median Mbit/s"]
         sources = {}
         for r in studies:
@@ -377,7 +379,7 @@ class TransferStatsWindow(QWidget):
 
     # ── Modality table ───────────────────────────────────────────────
 
-    def _update_modality_table(self, series):
+    def _update_modality_table(self, series: list[dict]) -> None:
         headers = ["Modality", "Series", "Images", "Median Mbit/s"]
         mods = {}
         for r in series:
@@ -405,7 +407,7 @@ class TransferStatsWindow(QWidget):
 
     # ── Study table ──────────────────────────────────────────────────
 
-    def _update_study_table(self, studies):
+    def _update_study_table(self, studies: list[dict]) -> None:
         headers = ["Date", "Time", "Source", "Modality", "Description",
                     "Series", "Images", "Wall Clock (s)", "Mbit/s"]
         self.study_table.setColumnCount(len(headers))
@@ -424,7 +426,7 @@ class TransferStatsWindow(QWidget):
 
     # ── Series table ─────────────────────────────────────────────────
 
-    def _update_series_table(self, series):
+    def _update_series_table(self, series: list[dict]) -> None:
         headers = ["Date", "Time", "Source", "Modality", "Study",
                     "Series", "Images", "Duration (s)", "img/min", "Mbit/s"]
         self.series_table.setColumnCount(len(headers))

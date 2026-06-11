@@ -14,7 +14,7 @@ from typing import List, Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox,
+    QComboBox, QWidget,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -24,7 +24,7 @@ from gui.styles import BTN_OK_BLUE
 logger = logging.getLogger("dicom_sync")
 
 
-def _play_alert():
+def _play_alert() -> None:
     """Play system beep / alert sound."""
     try:
         from PySide6.QtWidgets import QApplication
@@ -42,7 +42,7 @@ class UnknownInstitutionPopup(QDialog):
     """
 
     def __init__(self, institution_name: str, group_names: List[str],
-                 parent=None):
+                 parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.institution_name = institution_name
         self.group_names = group_names
@@ -58,7 +58,7 @@ class UnknownInstitutionPopup(QDialog):
         # Play alert sound
         _play_alert()
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
@@ -112,7 +112,7 @@ class UnknownInstitutionPopup(QDialog):
 
         layout.addLayout(btn_layout)
 
-    def _on_ok(self):
+    def _on_ok(self) -> None:
         if self.group_combo and self.group_combo.currentIndex() > 0:
             self.assigned_group = self.group_combo.currentText()
         self.accept()

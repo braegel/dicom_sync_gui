@@ -21,7 +21,7 @@ MAX_LOG_LINES = 5000
 class LogWindow(QWidget):
     """Floating window that shows the application log in real time."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("DICOM Sync — Log")
         self.setWindowFlags(Qt.Window)
@@ -29,7 +29,7 @@ class LogWindow(QWidget):
         self.resize(800, 500)
         self._setup_ui()
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         self.log_text = QTextEdit()
@@ -61,16 +61,16 @@ class LogWindow(QWidget):
         layout.addLayout(bottom)
 
     @Slot(str)
-    def append_log(self, message: str):
+    def append_log(self, message: str) -> None:
         """Append a log line. Thread-safe if called via signal/slot."""
         self.log_text.append(message)
         self._update_line_count()
 
-    def _clear(self):
+    def _clear(self) -> None:
         self.log_text.clear()
         self._update_line_count()
 
-    def _save_to_file(self):
+    def _save_to_file(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Log", "dicom_sync.log", "Text Files (*.log *.txt)")
         if not path:
@@ -85,7 +85,7 @@ class LogWindow(QWidget):
                 self, "Save failed",
                 f"Could not save log to {path}:\n{e}")
 
-    def _update_line_count(self):
+    def _update_line_count(self) -> None:
         # Use the document's block count (O(1)) instead of scanning the full
         # text with toPlainText() (O(document size)), which made appending N
         # lines quadratic overall.  Each block corresponds to one displayed

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
-    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
+    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QWidget,
 )
 
 from core.transfer_log import TransferLog
@@ -22,14 +22,14 @@ logger = logging.getLogger("dicom_sync")
 
 class ExaminationLookupDialog(QDialog):
 
-    def __init__(self, db_path: str, parent=None):
+    def __init__(self, db_path: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._db_path = db_path
         self.setWindowTitle("Examination Lookup")
         self.setMinimumSize(700, 400)
         self._setup_ui()
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
@@ -61,7 +61,7 @@ class ExaminationLookupDialog(QDialog):
         self.results_table.setAlternatingRowColors(True)
         layout.addWidget(self.results_table, 1)
 
-    def _search(self):
+    def _search(self) -> None:
         self.lbl_resend_warning.setText("")
         pid = self.input_patient_id.text().strip()
         acc = self.input_accession.text().strip()
@@ -106,13 +106,13 @@ class ExaminationLookupDialog(QDialog):
         run_in_background(self, job, self._on_search_results,
                           label="exam_lookup")
 
-    def _on_search_results(self, payload):
+    def _on_search_results(self, payload: tuple) -> None:
         results, baseline = payload
         self.btn_search.setEnabled(True)
         self._populate_table(results)
         self._check_resend(results, baseline)
 
-    def _populate_table(self, results):
+    def _populate_table(self, results: list[dict]) -> None:
         headers = ["Acquisition Time", "Download Start", "Download End",
                     "Source", "Modality", "Study",
                     "Series", "Images", "Duration (s)", "Mbit/s"]
@@ -145,7 +145,8 @@ class ExaminationLookupDialog(QDialog):
             self.results_table.setItem(row, 8, QTableWidgetItem(f"{r['duration_seconds']:.1f}"))
             self.results_table.setItem(row, 9, QTableWidgetItem(f"{r['estimated_mbps']:.2f}"))
 
-    def _check_resend(self, results, baseline):
+    def _check_resend(self, results: list[dict],
+                      baseline: dict | None) -> None:
         if not results or not baseline:
             return
         threshold = baseline["median"] - 2 * baseline["stddev"]

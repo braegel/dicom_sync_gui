@@ -74,7 +74,7 @@ def _parse_time(s: str) -> Optional[tuple[int, int, int]]:
         return None
 
 
-def _time_to_seconds(h, m, s):
+def _time_to_seconds(h: int, m: int, s: int) -> int:
     return h * 3600 + m * 60 + s
 
 
@@ -88,7 +88,8 @@ def _format_delay(total_seconds: int) -> str:
 
 class LiveCompletionsWindow(QWidget):
 
-    def __init__(self, parent=None, language: str = "en"):
+    def __init__(self, parent: Optional[QWidget] = None,
+                 language: str = "en") -> None:
         super().__init__(parent)
         self.setWindowTitle("Download Completions")
         self.setWindowFlags(Qt.Window)
@@ -102,7 +103,7 @@ class LiveCompletionsWindow(QWidget):
         #      cells they're colouring, which is also sort-stable.
         self._setup_ui()
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         self.completions_table = QTableWidget()
@@ -220,7 +221,7 @@ class LiveCompletionsWindow(QWidget):
                        institution_name: str = "",
                        download_duration_seconds: Optional[float] = None,
                        image_count: Optional[int] = None,
-                       min_images_threshold: Optional[int] = None):
+                       min_images_threshold: Optional[int] = None) -> None:
         """Add (or aggregate) a completed-study entry.
 
         When *study_uid* is supplied and a row with the same UID
@@ -352,7 +353,8 @@ class LiveCompletionsWindow(QWidget):
                 return row
         return -1
 
-    def _install_copy_button(self, *, row: int, formatted_comp: str):
+    def _install_copy_button(self, *, row: int,
+                             formatted_comp: str) -> None:
         """Place a Copy button in column 0 of *row* that copies the
         localized "Image transfer completed: HH:MM:SS" line to the
         clipboard.  Replaces any existing button at that cell so the
@@ -372,7 +374,7 @@ class LiveCompletionsWindow(QWidget):
                              formatted_comp: str,
                              new_image_count: Optional[int],
                              new_duration: Optional[float],
-                             delay_seconds: Optional[float]):
+                             delay_seconds: Optional[float]) -> None:
         """Fold a repeat ``study_completed`` emit into the existing row.
 
         Sums ``image_count`` and ``download_duration_seconds`` against
@@ -452,7 +454,7 @@ class LiveCompletionsWindow(QWidget):
                 out.append(v)
         return out
 
-    def _update_stats(self):
+    def _update_stats(self) -> None:
         # Colour both stat columns: red if > median + 2σ, green if
         # < median − 2σ (±2σ keeps only the strong outliers visible;
         # since 1.0.12 Delay and Download Duration share the same
@@ -467,7 +469,7 @@ class LiveCompletionsWindow(QWidget):
 
         self._colour_column_by_stat_bands(_COL_DELAY)
 
-    def _colour_column_by_stat_bands(self, col: int):
+    def _colour_column_by_stat_bands(self, col: int) -> None:
         """Compute median ± 2σ over the raw (``Qt.UserRole``) values
         of *col* and paint outliers via ``_colour_column_by_bands``.
 
@@ -487,7 +489,7 @@ class LiveCompletionsWindow(QWidget):
         )
 
     def _colour_column_by_bands(self, col: int, *,
-                                high: float, low: float):
+                                high: float, low: float) -> None:
         """Paint the cells in *col* red above *high*, green below
         *low*, white otherwise.  Reads the raw value from each cell's
         ``Qt.UserRole``, so this is sort-stable."""
@@ -507,7 +509,7 @@ class LiveCompletionsWindow(QWidget):
                 item.setForeground(QBrush(QColor("white")))
 
     def update_transfer_progress(self, pending_images: int,
-                                 images_per_minute: float):
+                                 images_per_minute: float) -> None:
         """Update the ETE countdown from the current queue state."""
         if pending_images <= 0 or images_per_minute <= 0:
             self._remaining_seconds = 0.0
@@ -520,7 +522,7 @@ class LiveCompletionsWindow(QWidget):
         if not self._ete_timer.isActive():
             self._ete_timer.start()
 
-    def _tick_countdown(self):
+    def _tick_countdown(self) -> None:
         self._remaining_seconds = max(self._remaining_seconds - 1.0, 0.0)
         if self._remaining_seconds <= 0:
             self._ete_timer.stop()
@@ -529,7 +531,7 @@ class LiveCompletionsWindow(QWidget):
             return
         self._refresh_countdown_labels()
 
-    def _refresh_countdown_labels(self):
+    def _refresh_countdown_labels(self) -> None:
         secs = int(self._remaining_seconds)
         if secs >= 3600:
             h = secs // 3600
@@ -543,7 +545,7 @@ class LiveCompletionsWindow(QWidget):
         expected = datetime.now() + timedelta(seconds=secs)
         self.lbl_expected_completion.setText(expected.strftime("%H:%M:%S"))
 
-    def _clear(self):
+    def _clear(self) -> None:
         self.completions_table.setRowCount(0)
         self.lbl_median_delay.setText(_DASH)
         self._remaining_seconds = 0.0

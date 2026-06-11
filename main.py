@@ -12,6 +12,7 @@ Dependencies:
 
 import gc
 import logging
+import logging.handlers
 import os
 import platform
 import sys
@@ -34,14 +35,20 @@ def _log_file_path() -> str:
     return os.path.join(log_dir, "dicom_sync_gui.log")
 
 
-# Setup logging before imports
+# Setup logging before imports.  Rotating handler because the app
+# runs 24/7 as a service — an unbounded plain FileHandler would grow
+# the log file without limit on the host.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(_log_file_path()),
+        logging.handlers.RotatingFileHandler(
+            _log_file_path(),
+            maxBytes=2 * 1024 * 1024,  # 2 MB per file
+            backupCount=3,             # keep ~8 MB of history
+        ),
     ]
 )
 logger = logging.getLogger("dicom_sync")

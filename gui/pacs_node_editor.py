@@ -6,35 +6,35 @@ editing a source PACS lives in its own module and the dialog file
 focuses on list management + dialog flow.  Currently used by
 ``SettingsDialog``; the API is generic enough to plug into another
 dialog if one ever needs it.
+
+The former ``is_local=True`` mode (basic connection fields only, with
+an Auto-detect-IP button) had no caller and was removed; the editor
+always shows the full source-PACS form.
 """
 
 from typing import Optional
 
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QSpinBox, QWidget,
 )
 
-from core.config import (
-    PacsNode, TRANSFER_SYNTAXES_NAMES, get_local_ip,
-)
+from core.config import PacsNode, TRANSFER_SYNTAXES_NAMES
 
 
 class PacsNodeEditor(QWidget):
     """Widget for editing a single source PACS node.
 
-    When *is_local=False* (default), includes:
-      - Remote PACS connection fields (name, AE, IP, port, syntax, retrieve)
+    Includes:
+      - Remote PACS connection fields (name, AE, IP, port, syntax)
       - Per-source service parameters (hours, max images, interval)
       - Local destination fields (local AE, port, syntax, fallback folder)
-    When *is_local=True*, only the basic connection fields are shown.
+      - Notification sound file
     """
 
-    def __init__(self, is_local: bool = False, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.is_local = is_local
         layout = QFormLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
@@ -44,7 +44,7 @@ class PacsNodeEditor(QWidget):
         self.ip_edit = QLineEdit()
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(11112 if is_local else 104)
+        self.port_spin.setValue(104)
         self.syntax_combo = QComboBox()
         self.syntax_combo.addItems(TRANSFER_SYNTAXES_NAMES)
 
@@ -54,97 +54,82 @@ class PacsNodeEditor(QWidget):
         layout.addRow("Port:", self.port_spin)
         layout.addRow("Transfer Syntax:", self.syntax_combo)
 
-        if is_local:
-            btn = QPushButton("Auto-detect IP")
-            btn.clicked.connect(self._auto_detect_ip)
-            layout.addRow("", btn)
-
         # Retrieve-method combo removed: C-GET was offered but never
         # implemented (the engine always issues C-MOVE).  The attribute
         # stays so existing callers/tests can still check for it.
         self.retrieve_combo = None
-        self.hours_spin = None
-        self.max_images_spin = None
-        self.interval_spin = None
-        self.local_ae_edit = None
-        self.local_port_spin = None
-        self.local_syntax_combo = None
-        self.fallback_edit = None
-        self.fallback_btn = None
-        self.notification_sound_edit = None
 
-        if not is_local:
-            # ── Per-source service parameters ──
-            self._add_separator(layout, "Service Parameters")
+        # ── Per-source service parameters ──
+        self._add_separator(layout, "Service Parameters")
 
-            self.hours_spin = QSpinBox()
-            self.hours_spin.setRange(1, 168)
-            self.hours_spin.setValue(3)
-            self.hours_spin.setSuffix(" hours")
-            layout.addRow("Download last:", self.hours_spin)
+        self.hours_spin = QSpinBox()
+        self.hours_spin.setRange(1, 168)
+        self.hours_spin.setValue(3)
+        self.hours_spin.setSuffix(" hours")
+        layout.addRow("Download last:", self.hours_spin)
 
-            self.max_images_spin = QSpinBox()
-            self.max_images_spin.setRange(0, 99999)
-            self.max_images_spin.setSpecialValueText("No limit")
-            self.max_images_spin.setSuffix(" images")
-            self.max_images_spin.setValue(0)
-            layout.addRow("Max images / series:", self.max_images_spin)
+        self.max_images_spin = QSpinBox()
+        self.max_images_spin.setRange(0, 99999)
+        self.max_images_spin.setSpecialValueText("No limit")
+        self.max_images_spin.setSuffix(" images")
+        self.max_images_spin.setValue(0)
+        layout.addRow("Max images / series:", self.max_images_spin)
 
-            self.interval_spin = QSpinBox()
-            self.interval_spin.setRange(10, 600)
-            self.interval_spin.setValue(60)
-            self.interval_spin.setSuffix(" sec")
-            layout.addRow("Query interval:", self.interval_spin)
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(10, 600)
+        self.interval_spin.setValue(60)
+        self.interval_spin.setSuffix(" sec")
+        layout.addRow("Query interval:", self.interval_spin)
 
-            # ── Local destination (C-MOVE target) ──
-            self._add_separator(layout, "Local Destination (C-MOVE Target)")
+        # ── Local destination (C-MOVE target) ──
+        self._add_separator(layout, "Local Destination (C-MOVE Target)")
 
-            self.local_ae_edit = QLineEdit()
-            self.local_ae_edit.setPlaceholderText("AE title the source sends to")
-            layout.addRow("Local AE Title:", self.local_ae_edit)
+        self.local_ae_edit = QLineEdit()
+        self.local_ae_edit.setPlaceholderText("AE title the source sends to")
+        layout.addRow("Local AE Title:", self.local_ae_edit)
 
-            self.local_port_spin = QSpinBox()
-            self.local_port_spin.setRange(1, 65535)
-            self.local_port_spin.setValue(11112)
-            layout.addRow("Local Port:", self.local_port_spin)
+        self.local_port_spin = QSpinBox()
+        self.local_port_spin.setRange(1, 65535)
+        self.local_port_spin.setValue(11112)
+        layout.addRow("Local Port:", self.local_port_spin)
 
-            self.local_syntax_combo = QComboBox()
-            self.local_syntax_combo.addItems(TRANSFER_SYNTAXES_NAMES)
-            layout.addRow("Preferred Syntax:", self.local_syntax_combo)
+        self.local_syntax_combo = QComboBox()
+        self.local_syntax_combo.addItems(TRANSFER_SYNTAXES_NAMES)
+        layout.addRow("Preferred Syntax:", self.local_syntax_combo)
 
-            self.fallback_edit = QLineEdit()
-            self.fallback_edit.setPlaceholderText(
-                "Folder to store images if no local PACS is reachable")
-            self.fallback_btn = QPushButton("Browse...")
-            self.fallback_btn.clicked.connect(self._browse_fallback)
+        self.fallback_edit = QLineEdit()
+        self.fallback_edit.setPlaceholderText(
+            "Folder to store images if no local PACS is reachable")
+        self.fallback_btn = QPushButton("Browse...")
+        self.fallback_btn.clicked.connect(self._browse_fallback)
 
-            fb_layout = QHBoxLayout()
-            fb_layout.setContentsMargins(0, 0, 0, 0)
-            fb_layout.addWidget(self.fallback_edit)
-            fb_layout.addWidget(self.fallback_btn)
-            fb_widget = QWidget()
-            fb_widget.setLayout(fb_layout)
-            layout.addRow("Fallback Folder:", fb_widget)
+        fb_layout = QHBoxLayout()
+        fb_layout.setContentsMargins(0, 0, 0, 0)
+        fb_layout.addWidget(self.fallback_edit)
+        fb_layout.addWidget(self.fallback_btn)
+        fb_widget = QWidget()
+        fb_widget.setLayout(fb_layout)
+        layout.addRow("Fallback Folder:", fb_widget)
 
-            # ── Notification sound ──
-            self._add_separator(layout, "Notification Sound")
+        # ── Notification sound ──
+        self._add_separator(layout, "Notification Sound")
 
-            self.notification_sound_edit = QLineEdit()
-            self.notification_sound_edit.setPlaceholderText(
-                "Custom WAV file (leave empty for default tone)")
-            ns_btn = QPushButton("Browse...")
-            ns_btn.clicked.connect(self._browse_notification_sound)
+        self.notification_sound_edit = QLineEdit()
+        self.notification_sound_edit.setPlaceholderText(
+            "Custom WAV file (leave empty for default tone)")
+        ns_btn = QPushButton("Browse...")
+        ns_btn.clicked.connect(self._browse_notification_sound)
 
-            ns_layout = QHBoxLayout()
-            ns_layout.setContentsMargins(0, 0, 0, 0)
-            ns_layout.addWidget(self.notification_sound_edit)
-            ns_layout.addWidget(ns_btn)
-            ns_widget = QWidget()
-            ns_widget.setLayout(ns_layout)
-            layout.addRow("Sound File:", ns_widget)
+        ns_layout = QHBoxLayout()
+        ns_layout.setContentsMargins(0, 0, 0, 0)
+        ns_layout.addWidget(self.notification_sound_edit)
+        ns_layout.addWidget(ns_btn)
+        ns_widget = QWidget()
+        ns_widget.setLayout(ns_layout)
+        layout.addRow("Sound File:", ns_widget)
 
     @staticmethod
-    def _add_separator(layout: QFormLayout, title: str):
+    def _add_separator(layout: QFormLayout, title: str) -> None:
         sep = QLabel("─" * 30)
         sep.setStyleSheet("QLabel { color: #666; }")
         layout.addRow("", sep)
@@ -153,26 +138,22 @@ class PacsNodeEditor(QWidget):
         lbl.setStyleSheet("QLabel { color: #2980b9; }")
         layout.addRow("", lbl)
 
-    def _auto_detect_ip(self):
-        self.ip_edit.setText(get_local_ip())
-
-    def _browse_fallback(self):
+    def _browse_fallback(self) -> None:
         path = QFileDialog.getExistingDirectory(
-            self, "Select Fallback Folder",
-            self.fallback_edit.text() if self.fallback_edit else "")
+            self, "Select Fallback Folder", self.fallback_edit.text())
         if path:
             self.fallback_edit.setText(path)
 
-    def _browse_notification_sound(self):
+    def _browse_notification_sound(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Notification Sound",
-            self.notification_sound_edit.text() if self.notification_sound_edit else "",
+            self.notification_sound_edit.text(),
             "WAV Files (*.wav);;All Files (*)")
         if path:
             self.notification_sound_edit.setText(path)
 
     @staticmethod
-    def _select_combo_text(combo, text: str):
+    def _select_combo_text(combo: Optional[QComboBox], text: str) -> None:
         """Set *combo*'s current item to the one whose label equals
         *text*.  Silently no-ops if *combo* is ``None`` or *text* is
         not in the list — same defensive shape every caller used to
@@ -183,27 +164,20 @@ class PacsNodeEditor(QWidget):
         if idx >= 0:
             combo.setCurrentIndex(idx)
 
-    def set_node(self, node: PacsNode):
+    def set_node(self, node: PacsNode) -> None:
         self.name_edit.setText(node.name)
         self.ae_title_edit.setText(node.ae_title)
         self.ip_edit.setText(node.ip_address)
         self.port_spin.setValue(node.port)
         self._select_combo_text(self.syntax_combo, node.transfer_syntax)
         self._select_combo_text(self.local_syntax_combo, node.local_syntax)
-        if self.hours_spin:
-            self.hours_spin.setValue(node.hours)
-        if self.max_images_spin:
-            self.max_images_spin.setValue(node.max_images)
-        if self.interval_spin:
-            self.interval_spin.setValue(node.sync_interval)
-        if self.local_ae_edit:
-            self.local_ae_edit.setText(node.local_ae_title)
-        if self.local_port_spin:
-            self.local_port_spin.setValue(node.local_port)
-        if self.fallback_edit:
-            self.fallback_edit.setText(node.fallback_folder)
-        if self.notification_sound_edit:
-            self.notification_sound_edit.setText(node.notification_sound_path)
+        self.hours_spin.setValue(node.hours)
+        self.max_images_spin.setValue(node.max_images)
+        self.interval_spin.setValue(node.sync_interval)
+        self.local_ae_edit.setText(node.local_ae_title)
+        self.local_port_spin.setValue(node.local_port)
+        self.fallback_edit.setText(node.fallback_folder)
+        self.notification_sound_edit.setText(node.notification_sound_path)
 
     def get_node(self, base: Optional[PacsNode] = None) -> PacsNode:
         """Build a ``PacsNode`` from the editor fields.
@@ -224,22 +198,14 @@ class PacsNodeEditor(QWidget):
             # stale "C-GET" from an old config is normalized here so
             # the saved value matches what the engine actually does.
             retrieve_method="C-MOVE",
-            hours=(self.hours_spin.value()
-                   if self.hours_spin else 3),
-            max_images=(self.max_images_spin.value()
-                        if self.max_images_spin else 0),
-            sync_interval=(self.interval_spin.value()
-                           if self.interval_spin else 60),
-            local_ae_title=(self.local_ae_edit.text().strip()
-                            if self.local_ae_edit else "LOCAL_AE"),
-            local_port=(self.local_port_spin.value()
-                        if self.local_port_spin else 11112),
-            local_syntax=(self.local_syntax_combo.currentText()
-                          if self.local_syntax_combo else "JPEG2000Lossless"),
-            fallback_folder=(self.fallback_edit.text().strip()
-                             if self.fallback_edit else ""),
-            notification_sound_path=(self.notification_sound_edit.text().strip()
-                                     if self.notification_sound_edit else ""),
+            hours=self.hours_spin.value(),
+            max_images=self.max_images_spin.value(),
+            sync_interval=self.interval_spin.value(),
+            local_ae_title=self.local_ae_edit.text().strip(),
+            local_port=self.local_port_spin.value(),
+            local_syntax=self.local_syntax_combo.currentText(),
+            fallback_folder=self.fallback_edit.text().strip(),
+            notification_sound_path=self.notification_sound_edit.text().strip(),
             notification_sound_enabled=(base.notification_sound_enabled
                                         if base is not None else True),
             # ``None`` lets PacsNode seed the bundled defaults (new
@@ -248,28 +214,20 @@ class PacsNodeEditor(QWidget):
                                    if base is not None else None),
         )
 
-    def clear_fields(self):
+    def clear_fields(self) -> None:
         self.name_edit.clear()
         self.ae_title_edit.clear()
         self.ip_edit.clear()
-        self.port_spin.setValue(104 if not self.is_local else 11112)
+        self.port_spin.setValue(104)
         self.syntax_combo.setCurrentIndex(0)
-        if self.hours_spin:
-            self.hours_spin.setValue(3)
-        if self.max_images_spin:
-            self.max_images_spin.setValue(0)
-        if self.interval_spin:
-            self.interval_spin.setValue(60)
-        if self.local_ae_edit:
-            self.local_ae_edit.clear()
-        if self.local_port_spin:
-            self.local_port_spin.setValue(11112)
-        if self.local_syntax_combo:
-            self.local_syntax_combo.setCurrentIndex(0)
-        if self.fallback_edit:
-            self.fallback_edit.clear()
-        if self.notification_sound_edit:
-            self.notification_sound_edit.clear()
+        self.hours_spin.setValue(3)
+        self.max_images_spin.setValue(0)
+        self.interval_spin.setValue(60)
+        self.local_ae_edit.clear()
+        self.local_port_spin.setValue(11112)
+        self.local_syntax_combo.setCurrentIndex(0)
+        self.fallback_edit.clear()
+        self.notification_sound_edit.clear()
 
     def has_minimum_data(self) -> bool:
         """True if at least name and AE title are filled in."""

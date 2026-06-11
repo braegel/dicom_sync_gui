@@ -30,7 +30,7 @@ _NORMAL_FREQ_2 = 1174  # D6 — ascending interval from A5
 _SAD_FREQ_2 = 660      # E5 — descending interval from A5
 
 
-def _remove_quietly(path: str):
+def _remove_quietly(path: str) -> None:
     """Best-effort file removal for the atexit cleanup of generated
     notification WAVs.  ``atexit.register(os.remove, path)`` would
     raise (and print a traceback) at interpreter shutdown if the file

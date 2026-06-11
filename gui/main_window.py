@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QLabel, QApplication,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtGui import QAction, QCloseEvent, QFont
 
 from core.config import AppConfig
 from core.dicom_ops import DicomOperations
@@ -73,7 +73,7 @@ class MainWindow(QMainWindow):
     _scp_check_done = Signal(str, bool, dict)
     _log_message = Signal(str)
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self.config = config
         # Per-source SCPs keyed by (ae_title, port) tuple
@@ -117,7 +117,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._prewarm_sounds)
 
     @staticmethod
-    def _prewarm_sounds():
+    def _prewarm_sounds() -> None:
         try:
             from gui.notification_sound import _generate_default_sound
             _generate_default_sound(sad=False)
@@ -127,7 +127,7 @@ class MainWindow(QMainWindow):
 
     # ── Menu ──────────────────────────────────────────────────────────────
 
-    def _setup_menu(self):
+    def _setup_menu(self) -> None:
         menubar = self.menuBar()
 
         settings_menu = menubar.addMenu("Settings")
@@ -178,7 +178,7 @@ class MainWindow(QMainWindow):
 
     # ── Central UI ────────────────────────────────────────────────────────
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -195,7 +195,7 @@ class MainWindow(QMainWindow):
         self.completions_window = LiveCompletionsWindow(
             self, language=getattr(self.config, "language", "en"))
 
-    def _rebuild_tabs(self):
+    def _rebuild_tabs(self) -> None:
         """Create one SourceDashboard tab per configured source PACS."""
         self.tab_widget.clear()
         self.dashboards.clear()
@@ -221,12 +221,12 @@ class MainWindow(QMainWindow):
             tab_label = f"{node.name} ({key})"
             self.tab_widget.addTab(dashboard, tab_label)
 
-    def _setup_statusbar(self):
+    def _setup_statusbar(self) -> None:
         self.statusBar().showMessage("Ready")
 
     # ── Settings ──────────────────────────────────────────────────────────
 
-    def _open_settings(self):
+    def _open_settings(self) -> None:
         any_running = any(
             e.is_running for e in self.engines.values())
         if any_running:
@@ -241,7 +241,7 @@ class MainWindow(QMainWindow):
             self._rebuild_tabs()
             self._log("Settings saved.")
 
-    def _open_filter_groups(self):
+    def _open_filter_groups(self) -> None:
         dlg = FilterGroupsDialog(self.config, self)
         if dlg.exec() == FilterGroupsDialog.Accepted:
             # Refresh filter dropdowns in all dashboards
@@ -249,7 +249,7 @@ class MainWindow(QMainWindow):
                 dashboard.refresh_filter_groups()
             self._log("Filter groups updated.")
 
-    def _open_priority_series(self):
+    def _open_priority_series(self) -> None:
         dlg = PrioritySeriesDialog(self.config, self)
         if dlg.exec() == PrioritySeriesDialog.Accepted:
             self._log("Priority series terms updated.")
@@ -258,7 +258,7 @@ class MainWindow(QMainWindow):
 
     # ── C-ECHO ────────────────────────────────────────────────────────────
 
-    def _test_echo(self):
+    def _test_echo(self) -> None:
         if not self.config.remote_nodes:
             QMessageBox.warning(
                 self, "Warning",
@@ -304,7 +304,7 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run_echo, daemon=True).start()
 
-    def _on_echo_results(self, results: list):
+    def _on_echo_results(self, results: list) -> None:
         self._echo_action.setEnabled(True)
         QMessageBox.information(
             self, "C-ECHO Results", "Results:\n" + "\n".join(results))
@@ -312,28 +312,28 @@ class MainWindow(QMainWindow):
 
     # ── Log ───────────────────────────────────────────────────────────────
 
-    def _open_transfer_stats(self):
+    def _open_transfer_stats(self) -> None:
         if self._stats_window is None:
             self._stats_window = TransferStatsWindow(default_db_path(), self)
         self._stats_window.show()
         self._stats_window.raise_()
         self._stats_window.activateWindow()
 
-    def _open_examination_lookup(self):
+    def _open_examination_lookup(self) -> None:
         dlg = ExaminationLookupDialog(default_db_path(), self)
         dlg.exec()
 
-    def _show_completions_window(self):
+    def _show_completions_window(self) -> None:
         self.completions_window.show()
         self.completions_window.raise_()
         self.completions_window.activateWindow()
 
-    def _show_log_window(self):
+    def _show_log_window(self) -> None:
         self.log_window.show()
         self.log_window.raise_()
         self.log_window.activateWindow()
 
-    def _update_completions_progress(self):
+    def _update_completions_progress(self) -> None:
         """Aggregate pending images and transfer rate across all
         running engines and push the ETE to the completions window."""
         total_pending = 0
@@ -348,8 +348,8 @@ class MainWindow(QMainWindow):
         self.completions_window.update_transfer_progress(
             total_pending, total_ipm)
 
-    def _on_study_completed_live(self, engine, study_uid: str,
-                                   fully_complete: bool):
+    def _on_study_completed_live(self, engine: TransferEngine, study_uid: str,
+                                   fully_complete: bool) -> None:
         """Add a completion entry to the live completions window.
 
         Threshold filtering (``MIN_IMAGES_FOR_COMPLETIONS_ENTRY``) is
@@ -379,20 +379,20 @@ class MainWindow(QMainWindow):
             min_images_threshold=MIN_IMAGES_FOR_COMPLETIONS_ENTRY,
         )
 
-    def _log(self, msg: str):
+    def _log(self, msg: str) -> None:
         """Log a message.  Safe to call from any thread — routed via
         the ``_log_message`` signal so the GUI work happens on the GUI
         thread.  Does NOT touch the status bar; lifecycle handlers
         update it explicitly."""
         self._log_message.emit(msg)
 
-    def _append_log(self, msg: str):
+    def _append_log(self, msg: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_window.append_log(f"[{timestamp}] {msg}")
 
     # ── Service Start / Stop (per source) ─────────────────────────────────
 
-    def _on_start_service(self, remote_key: str, params: dict):
+    def _on_start_service(self, remote_key: str, params: dict) -> None:
         """Start the download service for one source PACS."""
         if remote_key not in self.config.remote_nodes:
             return
@@ -406,7 +406,7 @@ class MainWindow(QMainWindow):
         self._pending_start_params[remote_key] = params
         self._ensure_storage_scp_for(remote_key)
 
-    def _start_engine(self, remote_key: str, params: dict):
+    def _start_engine(self, remote_key: str, params: dict) -> None:
         """Actually create and start the engine (called on main thread)."""
         dashboard = self.dashboards.get(remote_key)
         if not dashboard:
@@ -429,7 +429,7 @@ class MainWindow(QMainWindow):
             selection_mode=params.get("selection_mode", False),
         )
 
-    def _on_stop_service(self, remote_key: str):
+    def _on_stop_service(self, remote_key: str) -> None:
         """Stop the download service for one source PACS."""
         engine = self.engines.get(remote_key)
         if engine and engine.is_running:
@@ -437,7 +437,7 @@ class MainWindow(QMainWindow):
             self._log(f"Stopping service: {remote_key}...")
 
     def _on_service_stopped(self, remote_key: str,
-                            engine: Optional[TransferEngine] = None):
+                            engine: Optional[TransferEngine] = None) -> None:
         """Called when an engine thread has actually stopped.
 
         Prunes the stopped engine from ``self.engines`` so stale
@@ -472,7 +472,7 @@ class MainWindow(QMainWindow):
 
     # ── Per-source Storage SCP ────────────────────────────────────────────
 
-    def _ensure_storage_scp_for(self, remote_key: str):
+    def _ensure_storage_scp_for(self, remote_key: str) -> None:
         """Start a built-in SCP for this source if its local PACS is
         not reachable and a fallback folder is configured."""
         node = self.config.remote_nodes.get(remote_key)
@@ -505,7 +505,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=check_local, daemon=True).start()
 
     def _on_scp_check_done(self, remote_key: str, local_reachable: bool,
-                           node_dict: dict):
+                           node_dict: dict) -> None:
         """Handle SCP check result on the main thread."""
         node = self.config.remote_nodes.get(remote_key)
         if not node:
@@ -529,6 +529,15 @@ class MainWindow(QMainWindow):
                     node.local_port,
                     storage_path,
                 )
+                # Surface fallback-mode activity in the log — without
+                # this the user has no feedback that images actually
+                # land in the folder.  Throttled in the handler (first
+                # image, then every 25th).  The signal is emitted from
+                # the pynetdicom reactor thread; Qt.AutoConnection
+                # queues the slot onto the GUI thread.
+                scp.image_received.connect(
+                    lambda _ds, k=scp_key:
+                        self._on_fallback_image_received(k))
                 try:
                     scp.start()
                 except RuntimeError as e:
@@ -552,11 +561,24 @@ class MainWindow(QMainWindow):
         params = self._pending_start_params.pop(remote_key, {})
         self._start_engine(remote_key, params)
 
+    def _on_fallback_image_received(self, scp_key: Tuple[str, int]) -> None:
+        """Log built-in SCP receive progress, throttled so a large
+        series doesn't flood the log window (first image, then every
+        25th — the count plateaus are enough to confirm flow)."""
+        scp = self.storage_scps.get(scp_key)
+        if scp is None:
+            return
+        count = scp.images_received
+        if count == 1 or count % 25 == 0:
+            self._log(
+                f"Built-in SCP [{scp_key[0]}:{scp_key[1]}] received "
+                f"{count} image(s) — saving to {scp.storage_path}")
+
     # ── Engine signal wiring ──────────────────────────────────────────────
 
     def _connect_engine_signals(self, remote_key: str,
                                 engine: TransferEngine,
-                                dashboard: SourceDashboard):
+                                dashboard: SourceDashboard) -> None:
         e = engine
         # Dashboard updates
         e.signals.queue_updated.connect(dashboard.on_queue_updated)
@@ -594,7 +616,7 @@ class MainWindow(QMainWindow):
 
     # ── Unknown institution handling ──────────────────────────────────────
 
-    def _on_unknown_institution(self, institution_name: str):
+    def _on_unknown_institution(self, institution_name: str) -> None:
         """Show a NON-modal popup when an unknown institution is
         encountered.
 
@@ -632,7 +654,7 @@ class MainWindow(QMainWindow):
 
     def _on_institution_popup_finished(self, institution_name: str,
                                        popup: UnknownInstitutionPopup,
-                                       result: int):
+                                       result: int) -> None:
         """Apply the unknown-institution popup's outcome once the user
         dismisses it (OK or window close).  Runs on the GUI thread via
         the dialog's ``finished`` signal."""
@@ -660,7 +682,7 @@ class MainWindow(QMainWindow):
 
     # ── Window close ──────────────────────────────────────────────────────
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: QCloseEvent) -> None:
         any_running = any(
             e.is_running for e in self.engines.values())
         if any_running:
@@ -693,7 +715,7 @@ class MainWindow(QMainWindow):
         self.log_window.close()
         event.accept()
 
-    def _join_engines_responsive(self, total_timeout: float):
+    def _join_engines_responsive(self, total_timeout: float) -> None:
         """Wait up to *total_timeout* seconds per engine while keeping the
         Qt event loop pumping so the status bar/window stays responsive.
 

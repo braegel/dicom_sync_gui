@@ -12,31 +12,15 @@ from core.config import AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PacsNodeEditor — local mode (legacy, minimal)
+# PacsNodeEditor — basic connection fields
+# (The former is_local=True mode was removed — it had no caller.)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestPacsNodeEditorLocal:
+class TestPacsNodeEditorBasics:
 
     @pytest.fixture(autouse=True)
     def _create(self, qapp):
-        self.editor = PacsNodeEditor(is_local=True)
-
-    def test_default_port_local(self):
-        assert self.editor.port_spin.value() == 11112
-
-    def test_no_retrieve_combo_for_local(self):
-        assert self.editor.retrieve_combo is None
-
-    def test_no_service_param_spinboxes_for_local(self):
-        assert self.editor.hours_spin is None
-        assert self.editor.max_images_spin is None
-        assert self.editor.interval_spin is None
-
-    def test_no_local_dest_fields_for_local(self):
-        assert self.editor.local_ae_edit is None
-        assert self.editor.local_port_spin is None
-        assert self.editor.local_syntax_combo is None
-        assert self.editor.fallback_edit is None
+        self.editor = PacsNodeEditor()
 
     def test_syntax_combo_populated(self):
         items = [self.editor.syntax_combo.itemText(i)
@@ -74,7 +58,7 @@ class TestPacsNodeEditorLocal:
         self.editor.clear_fields()
         assert self.editor.name_edit.text() == ""
         assert self.editor.ae_title_edit.text() == ""
-        assert self.editor.port_spin.value() == 11112  # local default
+        assert self.editor.port_spin.value() == 104  # remote default
 
     def test_has_minimum_data_true(self):
         self.editor.name_edit.setText("Node")
@@ -105,7 +89,7 @@ class TestPacsNodeEditorRemote:
 
     @pytest.fixture(autouse=True)
     def _create(self, qapp):
-        self.editor = PacsNodeEditor(is_local=False)
+        self.editor = PacsNodeEditor()
 
     def test_default_port_remote(self):
         assert self.editor.port_spin.value() == 104

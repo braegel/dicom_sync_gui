@@ -40,7 +40,8 @@ _LANG_LABELS = {"en": "English", "de": "Deutsch",
 class SettingsDialog(QDialog):
     """Main settings dialog with tabs."""
 
-    def __init__(self, config: AppConfig, parent=None):
+    def __init__(self, config: AppConfig,
+                 parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.config = config
         self.setWindowTitle("Settings")
@@ -57,7 +58,7 @@ class SettingsDialog(QDialog):
 
     # ── UI setup ──────────────────────────────────────────────────────────
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
 
@@ -98,7 +99,7 @@ class SettingsDialog(QDialog):
         key_layout.addRow("Short Name:", self.key_edit)
         right.addLayout(key_layout)
 
-        self.remote_editor = PacsNodeEditor(is_local=False)
+        self.remote_editor = PacsNodeEditor()
         right.addWidget(self.remote_editor)
 
         # Action buttons for the editor
@@ -144,10 +145,15 @@ class SettingsDialog(QDialog):
         group.setLayout(pl)
         gl.addRow(group)
 
-        # Language
+        # Language.  The tooltip is honest about scope: the rest of
+        # the UI is English-only today; widening the translation table
+        # in core/i18n.py is where a fuller i18n pass would start.
         self.language_combo = QComboBox()
         for code in SUPPORTED_LANGUAGES:
             self.language_combo.addItem(_LANG_LABELS.get(code, code), code)
+        self.language_combo.setToolTip(
+            "Currently only affects the \"Image transfer completed\" "
+            "text copied from the Download Completions window.")
         gl.addRow("Language:", self.language_combo)
 
         tabs.addTab(general_tab, "General")
@@ -163,7 +169,7 @@ class SettingsDialog(QDialog):
 
     # ── Mode switching ────────────────────────────────────────────────────
 
-    def _switch_to_new_mode(self):
+    def _switch_to_new_mode(self) -> None:
         """Clear editor, deselect list, show 'Add New' button."""
         self.remote_list.blockSignals(True)
         self.remote_list.setCurrentRow(-1)
@@ -178,7 +184,7 @@ class SettingsDialog(QDialog):
         self.btn_save_changes.setVisible(False)
         self.remove_btn.setEnabled(False)
 
-    def _switch_to_edit_mode(self, key: str):
+    def _switch_to_edit_mode(self, key: str) -> None:
         """Load entry into editor, show 'Save Changes' button."""
         self.mode_label.setText(
             f"Editing \"{key}\" — modify fields and click \"Save Changes\".")
@@ -188,7 +194,7 @@ class SettingsDialog(QDialog):
 
     # ── Config loading ────────────────────────────────────────────────────
 
-    def _load_config(self):
+    def _load_config(self) -> None:
         self.prior_spin.setValue(self.config.prior_studies_count)
         self.prior_modality_check.setChecked(
             self.config.prior_studies_same_modality)
@@ -209,7 +215,7 @@ class SettingsDialog(QDialog):
 
     # ── List selection ────────────────────────────────────────────────────
 
-    def _on_remote_selected(self, row):
+    def _on_remote_selected(self, row: int) -> None:
         if 0 <= row < len(self._remote_keys):
             key = self._remote_keys[row]
             node = self._remote_nodes[key]
@@ -221,7 +227,7 @@ class SettingsDialog(QDialog):
 
     # ── Add new entry from editor fields ─────────────────────────────────
 
-    def _add_remote(self):
+    def _add_remote(self) -> None:
         if not self.remote_editor.has_minimum_data():
             QMessageBox.warning(
                 self, "Incomplete",
@@ -253,7 +259,7 @@ class SettingsDialog(QDialog):
 
     # ── Save changes to existing entry ───────────────────────────────────
 
-    def _save_changes_to_selected(self):
+    def _save_changes_to_selected(self) -> None:
         row = self.remote_list.currentRow()
         if row < 0 or row >= len(self._remote_keys):
             return
@@ -297,7 +303,7 @@ class SettingsDialog(QDialog):
 
     # ── Remove entry ─────────────────────────────────────────────────────
 
-    def _remove_remote(self):
+    def _remove_remote(self) -> None:
         row = self.remote_list.currentRow()
         if row < 0:
             return
@@ -317,7 +323,7 @@ class SettingsDialog(QDialog):
 
     # ── Save all settings ────────────────────────────────────────────────
 
-    def _save(self):
+    def _save(self) -> None:
         if not self._remote_nodes:
             QMessageBox.warning(
                 self, "Warning",
