@@ -6,9 +6,10 @@ StudyDescription, Time Acquired, Time Download Completed, Institution,
 and the delay between acquisition and download with color coding.
 """
 
-import math
 from datetime import datetime, timedelta
 from typing import Dict, Optional
+
+from core.stats_utils import median, median_and_pstdev
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QBrush, QColor
@@ -452,56 +453,37 @@ class LiveCompletionsWindow(QWidget):
         return out
 
     def _update_stats(self):
-        self._update_duration_colors()
+        # Colour both stat columns: red if > median + 2σ, green if
+        # < median − 2σ (±2σ keeps only the strong outliers visible;
+        # since 1.0.12 Delay and Download Duration share the same
+        # threshold).
+        self._colour_column_by_stat_bands(_COL_DURATION)
 
         delays = self._collect_column_values(_COL_DELAY)
         if not delays:
             self.lbl_median_delay.setText(_DASH)
             return
+        self.lbl_median_delay.setText(_format_delay(int(median(delays))))
 
-        s = sorted(delays)
-        n = len(s)
-        mid = n // 2
-        median = s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
-        self.lbl_median_delay.setText(_format_delay(int(median)))
+        self._colour_column_by_stat_bands(_COL_DELAY)
 
-        if n < 2:
+    def _colour_column_by_stat_bands(self, col: int):
+        """Compute median ± 2σ over the raw (``Qt.UserRole``) values
+        of *col* and paint outliers via ``_colour_column_by_bands``.
+
+        No-op when fewer than two values are present or when the
+        spread is (near) zero — identical values get no colouring.
+        Shared by the Delay and Download Duration columns."""
+        values = self._collect_column_values(col)
+        if len(values) < 2:
             return
-
-        mean = sum(delays) / n
-        variance = sum((v - mean) ** 2 for v in delays) / n
-        stddev = math.sqrt(variance)
+        med, stddev = median_and_pstdev(values)
         if stddev < 0.001:
             return
-
         self._colour_column_by_bands(
-            _COL_DELAY,
-            high=median + _STDDEV_BAND_MULTIPLIER * stddev,
-            low=median - _STDDEV_BAND_MULTIPLIER * stddev,
-        )
-
-    def _update_duration_colors(self):
-        """Color the Download Duration column: red if > median + 2σ,
-        green if < median - 2σ. Uses 2σ (vs 1σ for Delay) because
-        download time varies more with study size."""
-        durations = self._collect_column_values(_COL_DURATION)
-        if len(durations) < 2:
-            return
-
-        s = sorted(durations)
-        n = len(s)
-        mid = n // 2
-        median = s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
-        mean = sum(durations) / n
-        variance = sum((v - mean) ** 2 for v in durations) / n
-        stddev = math.sqrt(variance)
-        if stddev < 0.001:
-            return
-
-        self._colour_column_by_bands(
-            _COL_DURATION,
-            high=median + _STDDEV_BAND_MULTIPLIER * stddev,
-            low=median - _STDDEV_BAND_MULTIPLIER * stddev,
+            col,
+            high=med + _STDDEV_BAND_MULTIPLIER * stddev,
+            low=med - _STDDEV_BAND_MULTIPLIER * stddev,
         )
 
     def _colour_column_by_bands(self, col: int, *,

@@ -636,6 +636,92 @@ class TestExportFriendliness:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# mbps_stats — aggregate throughput statistics for the lookup dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _expected_mbps(image_count: int, duration_seconds: float,
+                   modality: str = "CT") -> float:
+    """Reproduce record_series' estimated_mbps formula."""
+    return (estimate_bytes(modality, image_count) * 8
+            / (duration_seconds * 1_000_000))
+
+
+class TestMbpsStats:
+    """``mbps_stats`` returns {count, mean, stddev, median} over all
+    series rows with estimated_mbps > 0, or None below 2 rows.
+
+    The median MUST follow the project-wide convention: for an even
+    number of rows, AVERAGE the two middle values (review item #26 —
+    the old implementation streamed only the upper middle row)."""
+
+    def _record(self, log, sample_series_kwargs, *durations):
+        """Record one series per duration (fixed 100-image CT series
+        so estimated_mbps is fully determined by the duration)."""
+        for i, dur in enumerate(durations):
+            kw = dict(sample_series_kwargs)
+            kw["series_uid"] = f"1.2.3.4.{i}"
+            kw["image_count"] = 100
+            kw["duration_seconds"] = dur
+            log.record_series(**kw)
+
+    def test_none_when_empty(self, log):
+        assert log.mbps_stats() is None
+
+    def test_none_with_single_row(self, log, sample_series_kwargs):
+        self._record(log, sample_series_kwargs, 10.0)
+        assert log.mbps_stats() is None
+
+    def test_odd_row_count_takes_middle(self, log, sample_series_kwargs):
+        # Durations 40 / 20 / 10 s → ascending mbps for 40 / 20 / 10.
+        self._record(log, sample_series_kwargs, 40.0, 20.0, 10.0)
+        stats = log.mbps_stats()
+        assert stats is not None
+        assert stats["count"] == 3
+        assert stats["median"] == pytest.approx(
+            _expected_mbps(100, 20.0))
+
+    def test_even_row_count_averages_middle_pair(
+            self, log, sample_series_kwargs):
+        """Review item #26: even n must average the two middle rows,
+        not return the upper one."""
+        # Durations 40 / 20 / 10 / 5 s → 4 distinct ascending mbps
+        # values; the median is the average of the 20 s and 10 s rows.
+        self._record(log, sample_series_kwargs, 40.0, 20.0, 10.0, 5.0)
+        stats = log.mbps_stats()
+        assert stats is not None
+        assert stats["count"] == 4
+        lower_mid = _expected_mbps(100, 20.0)
+        upper_mid = _expected_mbps(100, 10.0)
+        expected = (lower_mid + upper_mid) / 2
+        assert stats["median"] == pytest.approx(expected)
+        # Guard against a regression to the old upper-middle pick.
+        assert stats["median"] != pytest.approx(upper_mid)
+
+    def test_zero_mbps_rows_excluded(self, log, sample_series_kwargs):
+        """duration_seconds=0 rows get estimated_mbps=0 and must not
+        enter the statistics."""
+        self._record(log, sample_series_kwargs, 40.0, 20.0, 10.0)
+        kw = dict(sample_series_kwargs)
+        kw["series_uid"] = "1.2.3.4.zero"
+        kw["duration_seconds"] = 0.0
+        log.record_series(**kw)
+        stats = log.mbps_stats()
+        assert stats is not None
+        assert stats["count"] == 3
+        assert stats["median"] == pytest.approx(
+            _expected_mbps(100, 20.0))
+
+    def test_mean_and_stddev(self, log, sample_series_kwargs):
+        self._record(log, sample_series_kwargs, 40.0, 20.0, 10.0, 5.0)
+        stats = log.mbps_stats()
+        vals = [_expected_mbps(100, d) for d in (40.0, 20.0, 10.0, 5.0)]
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)  # population
+        assert stats["mean"] == pytest.approx(mean)
+        assert stats["stddev"] == pytest.approx(var ** 0.5)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Series failure tracking — "stop retrying after N attempts"
 # ═══════════════════════════════════════════════════════════════════════════
 

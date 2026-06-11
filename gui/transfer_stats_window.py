@@ -18,25 +18,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QFont, QPainter
 
+from core.stats_utils import median, tukey_quartiles
 from core.transfer_log import TransferLog
 from gui.async_helpers import run_in_background
 
 logger = logging.getLogger("dicom_sync")
-
-
-def _quartiles(vals):
-    """Return (min, Q1, median, Q3, max) for a sorted list of floats."""
-    n = len(vals)
-    if n == 0:
-        return (0, 0, 0, 0, 0)
-    s = sorted(vals)
-    mid = n // 2
-    median = s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
-    lower = s[:mid]
-    upper = s[mid + 1:] if n % 2 else s[mid:]
-    q1 = lower[len(lower) // 2] if lower else s[0]
-    q3 = upper[len(upper) // 2] if upper else s[-1]
-    return (s[0], q1, median, q3, s[-1])
 
 
 class TransferStatsWindow(QWidget):
@@ -287,11 +273,7 @@ class TransferStatsWindow(QWidget):
             mbps_vals = [r["estimated_mbps"] for r in series
                          if r["estimated_mbps"] > 0]
             if mbps_vals:
-                mbps_vals.sort()
-                mid = len(mbps_vals) // 2
-                median = (mbps_vals[mid] if len(mbps_vals) % 2
-                          else (mbps_vals[mid - 1] + mbps_vals[mid]) / 2)
-                self.lbl_median_mbps.setText(f"{median:.1f}")
+                self.lbl_median_mbps.setText(f"{median(mbps_vals):.1f}")
             else:
                 self.lbl_median_mbps.setText("—")
         else:
@@ -343,7 +325,7 @@ class TransferStatsWindow(QWidget):
         bp_series = QBoxPlotSeries()
         for key in sorted(buckets.keys()):
             vals = buckets[key]
-            lo, q1, med, q3, hi = _quartiles(vals)
+            lo, q1, med, q3, hi = tukey_quartiles(vals)
             box = QBoxSet(key)
             box.setValue(QBoxSet.LowerExtreme, lo)
             box.setValue(QBoxSet.LowerQuartile, q1)
@@ -388,10 +370,8 @@ class TransferStatsWindow(QWidget):
             self.source_table.setItem(row, 3, QTableWidgetItem(str(d["images"])))
             vals = d.get("mbps_vals", [])
             if vals:
-                vals.sort()
-                mid = len(vals) // 2
-                med = vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
-                self.source_table.setItem(row, 4, QTableWidgetItem(f"{med:.1f}"))
+                self.source_table.setItem(
+                    row, 4, QTableWidgetItem(f"{median(vals):.1f}"))
             else:
                 self.source_table.setItem(row, 4, QTableWidgetItem("—"))
 
@@ -418,10 +398,8 @@ class TransferStatsWindow(QWidget):
             self.modality_table.setItem(row, 2, QTableWidgetItem(str(d["images"])))
             vals = d["mbps_vals"]
             if vals:
-                vals.sort()
-                mid = len(vals) // 2
-                med = vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
-                self.modality_table.setItem(row, 3, QTableWidgetItem(f"{med:.1f}"))
+                self.modality_table.setItem(
+                    row, 3, QTableWidgetItem(f"{median(vals):.1f}"))
             else:
                 self.modality_table.setItem(row, 3, QTableWidgetItem("—"))
 

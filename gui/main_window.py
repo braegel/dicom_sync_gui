@@ -119,7 +119,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _prewarm_sounds():
         try:
-            from gui.dashboard import _generate_default_sound
+            from gui.notification_sound import _generate_default_sound
             _generate_default_sound(sad=False)
             _generate_default_sound(sad=True)
         except Exception as e:

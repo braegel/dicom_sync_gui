@@ -17,6 +17,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal
 
 from core.dicom_ops import DicomOperations
+from core.stats_utils import median
 from core.transfer_log import TransferLog, default_db_path
 
 logger = logging.getLogger("dicom_sync")
@@ -194,14 +195,10 @@ class TransferStats:
 
     @staticmethod
     def _median(values: List[float]) -> float:
-        if not values:
-            return 0.0
-        s = sorted(values)
-        n = len(s)
-        mid = n // 2
-        if n % 2 == 1:
-            return s[mid]
-        return (s[mid - 1] + s[mid]) / 2
+        """Thin delegate to ``core.stats_utils.median`` — kept as a
+        staticmethod because tests (and possibly external callers)
+        reference ``TransferStats._median`` directly."""
+        return median(values)
 
     def median_n_ipm(self, n: int) -> float:
         """Median images/minute over the last *n* qualifying series."""
@@ -210,13 +207,13 @@ class TransferStats:
         if not qualifying:
             return 0.0
         recent = qualifying[-n:]
-        return self._median([r.images_per_minute for r in recent])
+        return median([r.images_per_minute for r in recent])
 
     def median_all_ipm(self) -> float:
         """Median images/minute across all qualifying series."""
         with self._lock:
             qualifying = self._stats_series_unlocked()
-        return self._median(
+        return median(
             [r.images_per_minute for r in qualifying])
 
     def overall_images_per_minute(self) -> float:
@@ -380,7 +377,15 @@ class TransferEngine:
 
     def _log(self, msg: str):
         logger.info(msg)
-        self.signals.log_message.emit(msg)
+        # The emit runs on the service-loop thread; if the
+        # TransferSignals QObject has already been torn down (test
+        # teardown, app shutdown racing a final cycle), PySide raises
+        # "Signal source has been deleted".  The file log above has
+        # the message either way — same guard as async_helpers.
+        try:
+            self.signals.log_message.emit(msg)
+        except RuntimeError:
+            pass
 
     def _service_loop(self, hours: int, max_images: int, sync_interval: int):
         self.stats.start_session()

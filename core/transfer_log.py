@@ -419,17 +419,24 @@ class TransferLog:
         stddev = var ** 0.5
 
         # Phase 2: median stream.  Re-acquire the lock for the cursor
-        # but release as soon as we've consumed the row we need.
+        # but release as soon as we've consumed the row(s) we need.
+        # For even n the median is the AVERAGE of the two middle rows
+        # (indices mid-1 and mid) — the statistics.median convention
+        # used everywhere else in the project (review item #26; the
+        # old code took only the upper middle row).
         mid = n // 2
-        median = 0.0
+        first_idx = mid if n % 2 else mid - 1
+        middle: List[float] = []
         with self._lock:
             cur = self._conn.execute(
                 "SELECT estimated_mbps FROM series_transfer "
                 "WHERE estimated_mbps > 0 ORDER BY estimated_mbps")
             for i, r in enumerate(cur):
-                if i == mid:
-                    median = float(r[0])
+                if i >= first_idx:
+                    middle.append(float(r[0]))
+                if i >= mid:
                     break
+        median = sum(middle) / len(middle) if middle else 0.0
         return {"count": n, "mean": mean, "stddev": stddev,
                 "median": median}
 

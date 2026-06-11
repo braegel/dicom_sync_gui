@@ -5,18 +5,11 @@ the series queue with ETE (estimated time to completion),
 and real-time throughput statistics with color-coded indicators.
 """
 
-import atexit
-import contextlib
-import io
 import itertools
 import logging
-import math
 import os
-import struct
-import tempfile
-import wave
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
@@ -31,6 +24,18 @@ from PySide6.QtWidgets import (
 )
 
 from core.transfer_engine import TransferStats
+# WAV synthesis lives in gui.notification_sound (which owns the
+# module-level path cache); ``_generate_default_sound`` and the two
+# frequency constants are re-exported here for backwards compatibility
+# — tests and older call sites import them from gui.dashboard.
+from gui.notification_sound import (  # noqa: F401  (re-exports)
+    _NORMAL_FREQ_2, _SAD_FREQ_2, _generate_default_sound,
+)
+from gui.study_rate import (  # noqa: F401  (constants re-exported)
+    COLOR_GREEN, COLOR_RED, COLOR_YELLOW,
+    STUDY_RATE_GOOD_MAX, STUDY_RATE_HIGH_LOAD, STUDY_RATE_WARN_MAX,
+    compute_study_rates, study_rate_color,
+)
 from gui.styles import (
     BTN_AMBER, BTN_BLUE, BTN_DOWNLOAD_SELECTED, BTN_START, BTN_STOP,
 )
@@ -78,29 +83,18 @@ class ServiceParams:
 # ratio from the median-of-all baseline.
 SPEED_BAND_RATIO = 0.2
 
-# Studies-per-hour thresholds that switch the study rate label colour
-# and trigger the high-load popup.
-#
-# Empirically tuned for mid-sized radiology workflows with 1–2 source
-# PACS feeds:
-#   ≤ 5  studies/h — calm, green
-#   ≤ 11 studies/h — busy but tractable, yellow
-#   ≥ 12 studies/h — sustained burst → red + popup to warn the user
-#                   that the system may not keep up with reading flow
-# Adjust here if a different deployment's workload doesn't match.
-STUDY_RATE_GOOD_MAX = 5      # green at ≤
-STUDY_RATE_WARN_MAX = 11     # yellow at ≤
-STUDY_RATE_HIGH_LOAD = 12    # red + popup at ≥
+# Studies-per-hour thresholds (STUDY_RATE_GOOD_MAX / WARN_MAX /
+# HIGH_LOAD) moved to gui.study_rate alongside the pure rate logic;
+# re-imported above so existing ``gui.dashboard`` imports keep working.
 
 # Stats refresh tick (ms)
 STATS_REFRESH_MS = 2000
 # Debounce window for coalescing config writes from UI events (ms)
 CONFIG_SAVE_DEBOUNCE_MS = 500
 
-# Palette
-COLOR_GREEN = "#2ecc71"
-COLOR_YELLOW = "#f1c40f"
-COLOR_RED = "#e74c3c"
+# Palette.  Green/yellow/red are defined in gui.study_rate (single
+# source of truth, shared with the studies-per-hour colour bands) and
+# re-imported above; the remaining accents are dashboard-only.
 COLOR_ORANGE = "#f39c12"
 COLOR_BLUE_ACCENT = "#3498db"
 COLOR_MUTED = "#969696"
@@ -111,78 +105,6 @@ COLOR_MUTED = "#969696"
 # small series, stray priors, or partial fetches that would otherwise
 # spam the user.
 MIN_IMAGES_FOR_NOTIFICATION_SOUND = 21
-
-_default_sound_path: str | None = None
-_sad_sound_path: str | None = None
-
-_NORMAL_FREQ_2 = 1174  # D6 — ascending interval from A5
-_SAD_FREQ_2 = 660      # E5 — descending interval from A5
-
-
-def _remove_quietly(path: str):
-    """Best-effort file removal for the atexit cleanup of generated
-    notification WAVs.  ``atexit.register(os.remove, path)`` would
-    raise (and print a traceback) at interpreter shutdown if the file
-    was already gone — e.g. the OS purged the temp dir, or a test
-    cleared the module-level cache and regenerated the file."""
-    with contextlib.suppress(OSError):
-        os.remove(path)
-
-
-def _generate_default_sound(sad: bool = False) -> str:
-    """Generate a two-tone notification WAV and return its path.
-
-    Normal mode: A5 (880 Hz) → D6 (1174 Hz) — ascending, cheerful.
-    Sad mode:    A5 (880 Hz) → E5 (660 Hz)  — descending, somber.
-    """
-    global _default_sound_path, _sad_sound_path
-    cached = _sad_sound_path if sad else _default_sound_path
-    if cached and os.path.exists(cached):
-        return cached
-
-    freq2 = _SAD_FREQ_2 if sad else _NORMAL_FREQ_2
-    sample_rate = 44100
-    duration = 0.68
-    n_samples = int(sample_rate * duration)
-
-    def _envelope(t: float, start: float, dur: float) -> float:
-        rel = t - start
-        if rel < 0.02:
-            return 0.001 * (300.0) ** (rel / 0.02)
-        remaining = dur - 0.02
-        return 0.3 * (0.001 / 0.3) ** ((rel - 0.02) / remaining)
-
-    raw = []
-    for i in range(n_samples):
-        t = i / sample_rate
-        val = 0.0
-        if t < 0.4:
-            val += _envelope(t, 0, 0.4) * math.sin(2 * math.pi * 880 * t)
-        if 0.18 <= t < 0.68:
-            val += _envelope(t, 0.18, 0.5) * math.sin(
-                2 * math.pi * freq2 * t)
-        raw.append(int(max(-1.0, min(1.0, val)) * 32767))
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(struct.pack(f"<{len(raw)}h", *raw))
-
-    fd, path = tempfile.mkstemp(suffix=".wav", prefix="dicom_notify_")
-    os.write(fd, buf.getvalue())
-    os.close(fd)
-    # The WAV lives in the system temp dir for the whole app run (the
-    # module-level cache above reuses it); without explicit cleanup we
-    # leak up to two orphan files per run.  Quiet removal so a file
-    # that vanished before exit doesn't raise during shutdown.
-    atexit.register(_remove_quietly, path)
-    if sad:
-        _sad_sound_path = path
-    else:
-        _default_sound_path = path
-    return path
 
 
 class StatsLabel(QLabel):
@@ -317,12 +239,31 @@ class SourceDashboard(QWidget):
         return self.config.remote_nodes.get(self.remote_key)
 
     def _setup_ui(self):
+        """Build the dashboard top-to-bottom.  Each section lives in its
+        own ``_build_*`` helper; they run in layout order and attach
+        their widgets to *layout* themselves.  ``_initializing`` is True
+        for the whole build (set in ``__init__``) so setChecked() /
+        setValue() calls inside the builders can't trigger config
+        saves; it flips to False only after the last section exists."""
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
+        self._build_service_controls(layout)
+        self._build_filter_section(layout)
+        self._build_restart_banner(layout)
+        self._build_stats_section(layout)
+        self._build_study_rate_section(layout)
+        self._build_queue_table(layout)
+        self._build_summary_bar(layout)
+
+        # Construction complete — accept user-driven toggle events now.
+        self._initializing = False
+
+    def _build_service_controls(self, layout: QVBoxLayout):
+        """Service Controls group: parameter spinboxes + Start/Stop/
+        Restart and the (initially hidden) selection-mode buttons."""
         node = self._remote_node
 
-        # ── Service Controls ──
         ctrl_group = QGroupBox("Download Service")
         ctrl_layout = QHBoxLayout()
 
@@ -416,7 +357,9 @@ class SourceDashboard(QWidget):
         ctrl_group.setLayout(ctrl_layout)
         layout.addWidget(ctrl_group)
 
-        # ── Filter Groups ──
+    def _build_filter_section(self, layout: QVBoxLayout):
+        """Institution Filter group: master toggle, multi-select group
+        dropdown, and the small-series exception row."""
         filter_group = QGroupBox("Institution Filter")
         filter_vbox = QVBoxLayout()
 
@@ -485,11 +428,16 @@ class SourceDashboard(QWidget):
         filter_group.setLayout(filter_vbox)
         layout.addWidget(filter_group)
 
+        # Initial menu/label state.  Runs BEFORE the queue table exists;
+        # ``_update_filter_enabled_state`` guards its series_table access
+        # with hasattr for exactly this construction window.
         self._populate_filter_menu()
         self._update_filter_button_text()
         self._update_filter_enabled_state()
 
-        # ── Restart Required Banner ──
+    def _build_restart_banner(self, layout: QVBoxLayout):
+        """Hidden warning banner shown once settings change while the
+        service is running."""
         self.restart_banner = QLabel(
             "\u26a0  Settings changed. Restart the service for "
             "changes to take effect.")
@@ -500,7 +448,9 @@ class SourceDashboard(QWidget):
         self.restart_banner.setVisible(False)
         layout.addWidget(self.restart_banner)
 
-        # ── Throughput Statistics ──
+    def _build_stats_section(self, layout: QVBoxLayout):
+        """Throughput Statistics group: the four colour-coded
+        images-per-minute StatsLabels."""
         stats_group = QGroupBox("Transfer Speed (images / minute)")
         sl = QGridLayout()
 
@@ -526,7 +476,8 @@ class SourceDashboard(QWidget):
         stats_group.setLayout(sl)
         layout.addWidget(stats_group)
 
-        # ── Study Rate Display ──
+    def _build_study_rate_section(self, layout: QVBoxLayout):
+        """Studies / Hour group: per-group (or total) rate labels."""
         self.study_rate_group = QGroupBox("Studies / Hour")
         self.study_rate_layout = QHBoxLayout()
         self.study_rate_labels: dict[str, QLabel] = {}
@@ -534,7 +485,10 @@ class SourceDashboard(QWidget):
         self.study_rate_group.setLayout(self.study_rate_layout)
         layout.addWidget(self.study_rate_group)
 
-        # ── Series Queue Table ──
+    def _build_queue_table(self, layout: QVBoxLayout):
+        """Series Queue group: the 11-column queue table (checkbox
+        column 0 hidden outside selection mode, Group column 10 hidden
+        while filtering is off)."""
         table_group = QGroupBox("Series Queue")
         tl = QVBoxLayout()
 
@@ -567,7 +521,8 @@ class SourceDashboard(QWidget):
         table_group.setLayout(tl)
         layout.addWidget(table_group, 1)  # stretch factor 1 = takes all space
 
-        # ── Summary bar ──
+    def _build_summary_bar(self, layout: QVBoxLayout):
+        """Bottom summary bar: totals, cycle counter, status label."""
         summary = QHBoxLayout()
         self.lbl_total_images = QLabel("Total: 0 images")
         self.lbl_total_images.setFont(QFont("", 11, QFont.Bold))
@@ -581,9 +536,6 @@ class SourceDashboard(QWidget):
         summary.addStretch()
         summary.addWidget(self.lbl_status)
         layout.addLayout(summary)
-
-        # Construction complete — accept user-driven toggle events now.
-        self._initializing = False
 
     # ── Filter group handling ─────────────────────────────────────────
 
@@ -1189,54 +1141,23 @@ class SourceDashboard(QWidget):
 
     def _compute_study_rates(self, queue: list,
                              now: datetime | None = None) -> dict[str, int]:
-        """Count unique studies within the last 60 minutes, grouped."""
-        now = now or datetime.now()
-        cutoff = now - timedelta(minutes=60)
-        seen: dict[str, set] = {}  # group -> set of study_uids
+        """Count unique studies within the last 60 minutes, grouped.
 
-        for job in queue:
-            sd = job.get("study_date") or ""
-            # ``or ""`` so a job dict that ever carried an explicit
-            # ``study_time=None`` (engine currently never does, but
-            # ``.get("study_time", "")`` would still return None then)
-            # doesn't crash ``.ljust`` with AttributeError.
-            st = (job.get("study_time") or "").ljust(6, "0")[:6]
-            if not sd:
-                continue
-            try:
-                dt = datetime.strptime(f"{sd}{st}", "%Y%m%d%H%M%S")
-            except ValueError as e:
-                # Surface in the log so an unexpected DICOM time
-                # format doesn't silently zero the studies/hour
-                # display — a user with 10 studies in the queue but
-                # "0 studies/h" otherwise has no way to debug this.
-                logger.debug(
-                    f"_compute_study_rates: could not parse "
-                    f"study_date+study_time {sd!r}+{st!r}: {e}")
-                continue
-            if dt <= cutoff:
-                continue
-
-            if self.config.filter_groups_enabled:
-                group = self.config.institution_assignments.get(
-                    job.get("institution_name", ""), "")
-            else:
-                group = "_total"
-
-            seen.setdefault(group, set()).add(job.get("study_uid", ""))
-
-        return {g: len(uids) for g, uids in seen.items()}
+        Thin wrapper that feeds the relevant config values into the
+        pure ``gui.study_rate.compute_study_rates`` — kept as an
+        instance method for backwards compatibility (tests and older
+        call sites invoke it on the dashboard)."""
+        return compute_study_rates(
+            queue,
+            filter_groups_enabled=self.config.filter_groups_enabled,
+            institution_assignments=self.config.institution_assignments,
+            now=now)
 
     @staticmethod
     def _study_rate_color(n: int) -> str | None:
-        """Return CSS color string for a study rate value."""
-        if n <= 0:
-            return None
-        if n <= STUDY_RATE_GOOD_MAX:
-            return COLOR_GREEN
-        if n <= STUDY_RATE_WARN_MAX:
-            return COLOR_YELLOW
-        return COLOR_RED
+        """Return CSS color string for a study rate value.  Thin
+        wrapper around the pure ``gui.study_rate.study_rate_color``."""
+        return study_rate_color(n)
 
     def on_study_completed(self, study_uid: str,
                            institution_name: str,
