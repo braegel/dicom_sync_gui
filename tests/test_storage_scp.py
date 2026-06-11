@@ -1,6 +1,7 @@
 """
 Tests for core.StorageSCP — signal emission and image counting.
 """
+import inspect
 import os
 import tempfile
 import threading
@@ -9,6 +10,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PySide6.QtCore import QCoreApplication
 
+from pydicom import dcmread
+from pydicom.dataset import Dataset, FileMetaDataset
+from pydicom.uid import ExplicitVRLittleEndian
+
+import core.storage_scp as storage_scp_module
 from core.storage_scp import StorageSCP
 
 
@@ -66,6 +72,55 @@ class TestStorageSCPSignal:
         scp.handle_store(event)
         scp.handle_store(event2)
         assert scp.images_received == 2
+
+    def test_handle_store_writes_conformant_part10_file(self, scp, tmp_path):
+        """End-to-end through the REAL pydicom save path (no mocked
+        save_as): the version-compatibility shim must hand the installed
+        pydicom a keyword it accepts ("write_like_original" on 2.x,
+        "enforce_file_format" on 3.x) and the result must be a
+        standards-conformant Part 10 file -- preamble, "DICM" magic and
+        File Meta Information -- readable by a strict dcmread()."""
+        sop_uid = "1.2.3.4.5"
+        ds = Dataset()
+        ds.SOPClassUID = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture
+        ds.SOPInstanceUID = sop_uid
+        ds.PatientName = "Test^Patient"
+
+        # pynetdicom delivers the file meta separately on the event;
+        # handle_store reattaches it before saving.
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
+        file_meta.MediaStorageSOPInstanceUID = sop_uid
+        file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+        event = MagicMock()
+        event.dataset = ds
+        event.file_meta = file_meta
+
+        result = scp.handle_store(event)
+        assert result == 0x0000
+
+        filepath = tmp_path / f"{sop_uid}.dcm"
+        assert filepath.exists()
+
+        # Strict read (force=False) fails on files lacking the DICM
+        # marker/file meta, so a successful read proves conformance.
+        reread = dcmread(str(filepath))
+        assert reread.SOPInstanceUID == sop_uid
+        assert reread.file_meta.TransferSyntaxUID == ExplicitVRLittleEndian
+        # 128-byte preamble must be present (written, not skipped).
+        assert reread.preamble is not None
+
+    def test_save_as_compat_kwargs_match_installed_pydicom(self):
+        """The import-time shim must pick a keyword the installed
+        Dataset.save_as actually accepts, with the conformance-enforcing
+        value for whichever spelling was chosen."""
+        params = inspect.signature(Dataset.save_as).parameters
+        kwargs = storage_scp_module._SAVE_AS_KWARGS
+        if "enforce_file_format" in params:  # pydicom 3.x
+            assert kwargs == {"enforce_file_format": True}
+        else:  # pydicom 2.x
+            assert kwargs == {"write_like_original": False}
 
     def test_images_received_not_incremented_on_failure(self, scp, tmp_path):
         event = MagicMock()

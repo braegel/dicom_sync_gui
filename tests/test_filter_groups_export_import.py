@@ -8,8 +8,139 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.config import AppConfig
+from core.config import (
+    AppConfig, merge_filter_group_data, write_filter_groups_json,
+)
 from gui.filter_groups_dialog import FilterGroupsDialog
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# merge_filter_group_data — pure helper shared by AppConfig and the dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMergeFilterGroupData:
+    """The pure merge/replace helper has no I/O — it is fed parsed
+    import data and returns fresh copies plus a summary dict."""
+
+    GROUPS = ["Group A", "Group B"]
+    ASSIGNMENTS = {"Hospital Alpha": "Group A", "Clinic Beta": "Group B"}
+
+    # ── merge mode ──
+
+    def test_merge_appends_only_new_groups(self):
+        groups, _, summary = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            ["Group A", "Group C"], {}, merge=True)
+        assert groups == ["Group A", "Group B", "Group C"]
+        assert summary["groups_added"] == 1  # only Group C is new
+
+    def test_merge_adds_new_institution(self):
+        _, assignments, summary = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            [], {"New Clinic": "Group A"}, merge=True)
+        assert assignments["New Clinic"] == "Group A"
+        assert summary["institutions_added"] == 1
+        assert summary["institutions_updated"] == 0
+
+    def test_merge_updates_changed_assignment(self):
+        _, assignments, summary = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            [], {"Hospital Alpha": "Group B"}, merge=True)
+        assert assignments["Hospital Alpha"] == "Group B"
+        assert summary["institutions_updated"] == 1
+        assert summary["institutions_added"] == 0
+
+    def test_merge_identical_assignment_not_counted_as_update(self):
+        _, _, summary = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            [], {"Hospital Alpha": "Group A"}, merge=True)
+        assert summary["institutions_updated"] == 0
+
+    def test_merge_preserves_existing_data(self):
+        groups, assignments, _ = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            ["Group D"], {"New Clinic": "Group D"}, merge=True)
+        assert "Group A" in groups
+        assert assignments["Clinic Beta"] == "Group B"
+
+    def test_merge_summary_counts_combined(self):
+        _, _, summary = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            ["Group A", "Group C", "Group D"],
+            {"Hospital Alpha": "Group C",   # update
+             "Clinic Beta": "Group B",      # unchanged
+             "New One": "Group D",          # added
+             "New Two": "Group D"},         # added
+            merge=True)
+        assert summary == {"groups_added": 2,
+                           "institutions_added": 2,
+                           "institutions_updated": 1}
+
+    # ── replace mode ──
+
+    def test_replace_returns_imported_data(self):
+        groups, assignments, _ = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            ["X"], {"Inst": "X"}, merge=False)
+        assert groups == ["X"]
+        assert assignments == {"Inst": "X"}
+
+    def test_replace_summary_counts_everything_as_added(self):
+        _, _, summary = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            ["X", "Y"], {"A": "X", "B": "Y"}, merge=False)
+        assert summary == {"groups_added": 2,
+                           "institutions_added": 2,
+                           "institutions_updated": 0}
+
+    # ── purity: inputs must never be mutated ──
+
+    @pytest.mark.parametrize("merge", [True, False])
+    def test_inputs_not_mutated(self, merge):
+        groups_in = list(self.GROUPS)
+        assignments_in = dict(self.ASSIGNMENTS)
+        imported_groups = ["Group Z"]
+        imported_assignments = {"Hospital Alpha": "Group Z"}
+        merge_filter_group_data(
+            groups_in, assignments_in,
+            imported_groups, imported_assignments, merge)
+        assert groups_in == self.GROUPS
+        assert assignments_in == self.ASSIGNMENTS
+        assert imported_groups == ["Group Z"]
+        assert imported_assignments == {"Hospital Alpha": "Group Z"}
+
+    @pytest.mark.parametrize("merge", [True, False])
+    def test_returns_fresh_copies(self, merge):
+        """Returned containers must be new objects so the caller can
+        assign them without aliasing its inputs (the dialog reassigns
+        them onto its working copies)."""
+        imported_groups = ["Group Z"]
+        imported_assignments = {"Inst": "Group Z"}
+        groups, assignments, _ = merge_filter_group_data(
+            self.GROUPS, self.ASSIGNMENTS,
+            imported_groups, imported_assignments, merge)
+        assert groups is not self.GROUPS
+        assert groups is not imported_groups
+        assert assignments is not self.ASSIGNMENTS
+        assert assignments is not imported_assignments
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# write_filter_groups_json — shared export writer
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestWriteFilterGroupsJson:
+
+    def test_writes_expected_shape(self, tmp_path):
+        path = str(tmp_path / "out.json")
+        write_filter_groups_json(
+            path, ["G1"], {"Klinik München": "G1"})
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data == {
+            "filter_group_names": ["G1"],
+            "institution_assignments": {"Klinik München": "G1"},
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════

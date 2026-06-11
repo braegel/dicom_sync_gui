@@ -397,6 +397,51 @@ class TestAppConfigPersistence:
         config = AppConfig(config_path=tmp_config_path)
         assert config.load() is False
 
+    def test_load_oserror_returns_false(self, tmp_config_path, monkeypatch):
+        """An unreadable file (permissions, stale mount) must not crash
+        startup — load() logs and returns False, same as a parse error."""
+        with open(tmp_config_path, "w") as f:
+            json.dump({"remotes": {}}, f)
+
+        real_open = open
+
+        def deny_open(path, *args, **kwargs):
+            if path == tmp_config_path:
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_open)
+        config = AppConfig(config_path=tmp_config_path)
+        assert config.load() is False
+
+    def test_load_invalid_utf8_returns_false(self, tmp_config_path):
+        """A corrupt (non-UTF-8 binary) file must not crash load()."""
+        with open(tmp_config_path, "wb") as f:
+            f.write(b"\x80\x81\xff\xfe not utf-8")
+        config = AppConfig(config_path=tmp_config_path)
+        assert config.load() is False
+
+    def test_save_returns_true_on_success(self, populated_config):
+        assert populated_config.save() is True
+
+    def test_save_returns_false_on_oserror(self, populated_config,
+                                           monkeypatch):
+        """save() must swallow OSError (one caller is a QTimer slot,
+        where an exception would propagate into the Qt event loop)
+        and report failure via its return value instead."""
+        def fail_replace(src, dst):
+            raise OSError(28, "No space left on device", dst)
+
+        monkeypatch.setattr("core.config.os.replace", fail_replace)
+        assert populated_config.save() is False
+
+    def test_save_unwritable_location_returns_false(self):
+        """A config path inside an uncreatable directory (e.g. under a
+        read-only root) must yield False, not an exception."""
+        config = AppConfig(
+            config_path="/nonexistent_ro_root/sub/dir/config.json")
+        assert config.save() is False
+
     def test_load_empty_json(self, tmp_config_path):
         with open(tmp_config_path, "w") as f:
             json.dump({}, f)
@@ -567,7 +612,9 @@ class TestConstants:
         assert len(TRANSFER_SYNTAXES_NAMES) >= 5
 
     def test_retrieve_methods(self):
-        assert RETRIEVE_METHODS == ["C-MOVE", "C-GET"]
+        # C-GET was removed from the offered list — it was never
+        # implemented (the engine always issues C-MOVE).
+        assert RETRIEVE_METHODS == ["C-MOVE"]
 
 
 class TestGetLocalIP:

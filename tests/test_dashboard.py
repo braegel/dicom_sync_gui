@@ -394,6 +394,134 @@ class TestDashboardQueue:
         assert "\u2014" in ipm_item.text()
 
 
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# SourceDashboard \u2014 incremental queue updates
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+class TestIncrementalQueueUpdate:
+    """on_queue_updated must do a full rebuild only when the incoming
+    series_uid sequence differs from the rendered one; an identical
+    sequence (the per-series progress emit) updates the mutable cells
+    in place, so the user's row selection survives the update."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def _make_job_dict(self, **overrides):
+        base = {
+            "patient_name": "Doe^John",
+            "patient_id": "12345",
+            "study_description": "CT Head",
+            "series_description": "Axial",
+            "modality": "CT",
+            "series_number": "1",
+            "study_uid": "1.2.3.4",
+            "series_uid": "1.2.3.4.5",
+            "remote_count": 100,
+            "local_count": 10,
+            "status": "queued",
+            "institution_name": "Hospital",
+            "images_per_minute": 0.0,
+            "study_date": "",
+            "study_time": "",
+        }
+        base.update(overrides)
+        return base
+
+    def test_same_uid_sequence_updates_status_in_place(self):
+        """Second emit with identical uids but changed status: status
+        cell text changes, row count stays, and the static cells are
+        the very same QTableWidgetItem instances (no rebuild)."""
+        self.dashboard.on_queue_updated([
+            self._make_job_dict(series_uid="1.1", status="queued"),
+            self._make_job_dict(series_uid="1.2", status="queued"),
+        ])
+        table = self.dashboard.series_table
+        assert "Queued" in table.item(0, 8).text()
+        patient_item = table.item(0, 1)  # static cell, col 1 = Patient
+
+        self.dashboard.on_queue_updated([
+            self._make_job_dict(series_uid="1.1", status="done",
+                                local_count=100,
+                                images_per_minute=120.0),
+            self._make_job_dict(series_uid="1.2", status="transferring"),
+        ])
+        assert table.rowCount() == 2
+        # Mutable cells were refreshed...
+        assert "Done" in table.item(0, 8).text()
+        assert "Transferring" in table.item(1, 8).text()
+        assert table.item(0, 7).text() == "120"   # img/min
+        assert table.item(0, 6).text() == "0"     # pending
+        assert "1 / 2" in self.dashboard.lbl_total_series.text()
+        # ...but the static cells were NOT rebuilt.
+        assert table.item(0, 1) is patient_item
+
+    def test_different_uid_sequence_triggers_rebuild(self):
+        """A new uid sequence (new query cycle) must rebuild the table
+        so the row count matches the new queue."""
+        self.dashboard.on_queue_updated([
+            self._make_job_dict(series_uid="1.1"),
+            self._make_job_dict(series_uid="1.2"),
+        ])
+        assert self.dashboard.series_table.rowCount() == 2
+
+        self.dashboard.on_queue_updated([
+            self._make_job_dict(series_uid="2.1"),
+            self._make_job_dict(series_uid="2.2"),
+            self._make_job_dict(series_uid="2.3"),
+        ])
+        assert self.dashboard.series_table.rowCount() == 3
+
+    def test_row_selection_survives_in_place_update(self):
+        """The point of the in-place path: a selected row stays
+        selected across per-series progress emits."""
+        self.dashboard.on_queue_updated([
+            self._make_job_dict(series_uid="1.1"),
+            self._make_job_dict(series_uid="1.2"),
+        ])
+        self.dashboard.series_table.selectRow(1)
+
+        self.dashboard.on_queue_updated([
+            self._make_job_dict(series_uid="1.1", status="transferring"),
+            self._make_job_dict(series_uid="1.2"),
+        ])
+        selected = {
+            ix.row() for ix in
+            self.dashboard.series_table.selectionModel().selectedRows()
+        }
+        assert selected == {1}
+
+    def test_selection_mode_forces_rebuild_on_next_update(self):
+        """After on_queue_ready_for_selection rendered checkbox rows,
+        the next on_queue_updated must do a full rebuild even when the
+        uid sequence is identical (the checkbox items must go away)."""
+        queue = [self._make_job_dict(series_uid="1.1")]
+        self.dashboard.on_queue_updated(queue)
+        self.dashboard.on_queue_ready_for_selection(queue)
+        # Selection mode rendered a checkbox item in column 0.
+        assert self.dashboard.series_table.item(0, 0) is not None
+
+        self.dashboard.on_queue_updated(queue)
+        # Full rebuild dropped the checkbox item again.
+        assert self.dashboard.series_table.item(0, 0) is None
+        assert self.dashboard.series_table.rowCount() == 1
+
+    def test_reset_forces_rebuild_on_next_update(self):
+        """reset() empties the table, so a following emit with the
+        previously-rendered uid sequence must rebuild, not patch
+        nonexistent rows in place."""
+        queue = [self._make_job_dict(series_uid="1.1")]
+        self.dashboard.on_queue_updated(queue)
+        self.dashboard.reset()
+        assert self.dashboard.series_table.rowCount() == 0
+
+        self.dashboard.on_queue_updated(queue)
+        assert self.dashboard.series_table.rowCount() == 1
+        assert self.dashboard.series_table.item(0, 1).text() == "Doe^John"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SourceDashboard — stats display
 # ═══════════════════════════════════════════════════════════════════════════

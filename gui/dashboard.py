@@ -5,6 +5,8 @@ the series queue with ETE (estimated time to completion),
 and real-time throughput statistics with color-coded indicators.
 """
 
+import atexit
+import contextlib
 import io
 import itertools
 import logging
@@ -16,6 +18,22 @@ import wave
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Optional
+
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QFont, QAction
+from PySide6.QtMultimedia import QSoundEffect
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
+    QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
+    QPushButton, QSpinBox, QFormLayout, QCheckBox, QComboBox,
+    QListWidget, QListWidgetItem, QMenu, QToolButton, QFrame,
+    QMessageBox, QApplication,
+)
+
+from core.transfer_engine import TransferStats
+from gui.styles import (
+    BTN_AMBER, BTN_BLUE, BTN_DOWNLOAD_SELECTED, BTN_START, BTN_STOP,
+)
 
 logger = logging.getLogger("dicom_sync")
 
@@ -54,21 +72,6 @@ class ServiceParams:
     def to_dict(self) -> dict:
         return asdict(self)
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QAction
-from PySide6.QtMultimedia import QSoundEffect
-from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
-    QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
-    QPushButton, QSpinBox, QFormLayout, QCheckBox, QComboBox,
-    QListWidget, QListWidgetItem, QMenu, QToolButton, QFrame,
-    QMessageBox, QApplication,
-)
-
-from core.transfer_engine import TransferStats
-from gui.styles import (
-    BTN_AMBER, BTN_BLUE, BTN_DOWNLOAD_SELECTED, BTN_START, BTN_STOP,
-)
 
 # ── UI thresholds and colors ─────────────────────────────────────────────
 # A series rate is shaded green/red when it deviates by more than this
@@ -116,6 +119,16 @@ _NORMAL_FREQ_2 = 1174  # D6 — ascending interval from A5
 _SAD_FREQ_2 = 660      # E5 — descending interval from A5
 
 
+def _remove_quietly(path: str):
+    """Best-effort file removal for the atexit cleanup of generated
+    notification WAVs.  ``atexit.register(os.remove, path)`` would
+    raise (and print a traceback) at interpreter shutdown if the file
+    was already gone — e.g. the OS purged the temp dir, or a test
+    cleared the module-level cache and regenerated the file."""
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
 def _generate_default_sound(sad: bool = False) -> str:
     """Generate a two-tone notification WAV and return its path.
 
@@ -160,6 +173,11 @@ def _generate_default_sound(sad: bool = False) -> str:
     fd, path = tempfile.mkstemp(suffix=".wav", prefix="dicom_notify_")
     os.write(fd, buf.getvalue())
     os.close(fd)
+    # The WAV lives in the system temp dir for the whole app run (the
+    # module-level cache above reuses it); without explicit cleanup we
+    # leak up to two orphan files per run.  Quiet removal so a file
+    # that vanished before exit doesn't raise during shutdown.
+    atexit.register(_remove_quietly, path)
     if sad:
         _sad_sound_path = path
     else:
@@ -227,6 +245,15 @@ class SourceDashboard(QWidget):
         self.remote_key = remote_key
         self._current_stats: Optional[TransferStats] = None
         self._last_queue: list = []
+        # series_uid sequence of the queue currently rendered in
+        # ``series_table`` by ``on_queue_updated``.  Lets the next
+        # queue emit decide between a cheap in-place cell update (uid
+        # sequence unchanged — the common per-series progress case)
+        # and a full table rebuild.  ``None`` means "no valid normal-
+        # mode render" and forces a rebuild; it is reset whenever the
+        # table content comes from somewhere else (selection mode,
+        # ``reset()``).
+        self._rendered_uids: Optional[list[str]] = None
         self._service_running = False
         self._settings_dirty = False
         # True between a Restart-click and the subsequent
@@ -421,7 +448,7 @@ class SourceDashboard(QWidget):
 
         self.lbl_filter_info = QLabel("")
         self.lbl_filter_info.setStyleSheet(
-            "QLabel { color: #f39c12; font-style: italic; }")
+            f"QLabel {{ color: {COLOR_ORANGE}; font-style: italic; }}")
         fl.addWidget(self.lbl_filter_info)
 
         fl.addStretch()
@@ -852,21 +879,101 @@ class SourceDashboard(QWidget):
         s = seconds % 60
         return f"{m}:{s:02d}"
 
+    # ── Queue-table cell builders ─────────────────────────────────────────
+    # Single source of truth per mutable column — shared by the
+    # full-rebuild and in-place paths of ``on_queue_updated`` (and the
+    # stats-driven ``_update_ete_column``) so text and colour can never
+    # drift between them.
+
+    @staticmethod
+    def _make_pending_item(job: dict) -> QTableWidgetItem:
+        """Pending column (6): remote minus local images, floored at 0."""
+        pending = job["remote_count"] - job["local_count"]
+        return QTableWidgetItem(str(max(pending, 0)))
+
+    @staticmethod
+    def _make_ipm_item(job: dict) -> QTableWidgetItem:
+        """img/min column (7): rate in blue once the series is done."""
+        ipm = job.get("images_per_minute", 0.0)
+        if job["status"] == "done" and ipm > 0:
+            ipm_item = QTableWidgetItem(f"{ipm:.0f}")
+            ipm_item.setForeground(QColor(COLOR_BLUE_ACCENT))
+        else:
+            ipm_item = QTableWidgetItem("—")
+            ipm_item.setForeground(QColor(COLOR_MUTED))
+        ipm_item.setTextAlignment(Qt.AlignCenter)
+        return ipm_item
+
+    @classmethod
+    def _make_status_item(cls, status: str) -> QTableWidgetItem:
+        """Status column (8): human-readable text + status colour."""
+        status_item = QTableWidgetItem(cls._status_text(status))
+        status_item.setForeground(cls._status_color(status))
+        return status_item
+
+    @classmethod
+    def _make_ete_item(cls, status: str, cumulative_pending: int,
+                       rate: float) -> QTableWidgetItem:
+        """ETE column (9): check-mark when done, dash when dead or
+        unknown, otherwise the cumulative pending image count for this
+        and all preceding rows divided by the current rate."""
+        if status in ("done", "error", "skipped"):
+            ete_text = "✓" if status == "done" else "—"
+            ete_item = QTableWidgetItem(ete_text)
+            if status == "done":
+                ete_item.setForeground(QColor(COLOR_GREEN))
+            else:
+                ete_item.setForeground(QColor(COLOR_MUTED))
+        elif rate > 0:
+            ete_seconds = cumulative_pending / rate
+            ete_item = QTableWidgetItem(cls._format_ete(ete_seconds))
+            ete_item.setForeground(QColor(COLOR_ORANGE))
+        else:
+            ete_item = QTableWidgetItem("—")
+            ete_item.setForeground(QColor(COLOR_MUTED))
+        ete_item.setTextAlignment(Qt.AlignCenter)
+        return ete_item
+
+    def _update_series_summary(self, queue: list):
+        """Refresh the 'Series: done / total' summary label."""
+        done_count = sum(1 for job in queue if job["status"] == "done")
+        self.lbl_total_series.setText(
+            f"Series: {done_count} / {len(queue)}")
+
     # ── Slots called by engine signals ────────────────────────────────────
 
     def on_queue_updated(self, queue: list):
-        """Rebuild the series table from the full queue list."""
+        """Render the series table from the full queue list.
+
+        The engine emits the full queue after EVERY completed series,
+        so unconditionally tearing the table down and rebuilding it is
+        O(n²) widget churn per cycle, flickers visibly, and destroys
+        the user's row selection on each emit.  Instead we compare the
+        incoming series_uid sequence with the one currently rendered:
+
+        * sequence differs (new cycle, selection filtering, first
+          render) → full rebuild as before;
+        * sequence identical (the common per-series progress emit) →
+          update only the mutable cells in place — Pending (6),
+          img/min (7), Status (8), ETE (9) and the done-count summary.
+          Row selection intentionally survives these updates.
+        """
         self._last_queue = queue
         # Hide selection UI — engine is now downloading or idle
-        self.btn_download_selected.setVisible(False)
-        self.btn_select_all.setVisible(False)
-        self.btn_deselect_all.setVisible(False)
+        self._apply_selection_ui_visible(False)
         self.series_table.setColumnHidden(0, True)
 
-        rate = self._get_rate()
+        uids = [job["series_uid"] for job in queue]
+        if uids == self._rendered_uids:
+            self._update_queue_cells_in_place(queue)
+        else:
+            self._rebuild_queue_table(queue)
+            self._rendered_uids = uids
 
+    def _rebuild_queue_table(self, queue: list):
+        """Full rebuild of the series table (uid sequence changed)."""
+        rate = self._get_rate()
         self.series_table.setRowCount(0)
-        done_count = 0
         cumulative = self._compute_cumulative_pending(queue)
 
         for i, job in enumerate(queue):
@@ -884,43 +991,13 @@ class SourceDashboard(QWidget):
             self.series_table.setItem(
                 row, 5, QTableWidgetItem(str(job["remote_count"])))
 
-            pending = job["remote_count"] - job["local_count"]
-            pending_item = QTableWidgetItem(str(max(pending, 0)))
-            self.series_table.setItem(row, 6, pending_item)
-
-            # img/min column
-            ipm = job.get("images_per_minute", 0.0)
-            status = job["status"]
-            if status == "done" and ipm > 0:
-                ipm_item = QTableWidgetItem(f"{ipm:.0f}")
-                ipm_item.setForeground(QColor("#3498db"))
-            else:
-                ipm_item = QTableWidgetItem("\u2014")
-                ipm_item.setForeground(QColor("#969696"))
-            ipm_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(row, 7, ipm_item)
-
-            status_item = QTableWidgetItem(self._status_text(status))
-            status_item.setForeground(self._status_color(status))
-            self.series_table.setItem(row, 8, status_item)
-
-            # ETE column
-            if status in ("done", "error", "skipped"):
-                ete_text = "\u2014" if status != "done" else "\u2713"
-                ete_item = QTableWidgetItem(ete_text)
-                if status == "done":
-                    ete_item.setForeground(QColor("#2ecc71"))
-                else:
-                    ete_item.setForeground(QColor("#969696"))
-            elif rate > 0:
-                ete_seconds = cumulative[i] / rate
-                ete_item = QTableWidgetItem(self._format_ete(ete_seconds))
-                ete_item.setForeground(QColor("#f39c12"))
-            else:
-                ete_item = QTableWidgetItem("\u2014")
-                ete_item.setForeground(QColor("#969696"))
-            ete_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(row, 9, ete_item)
+            self.series_table.setItem(row, 6, self._make_pending_item(job))
+            self.series_table.setItem(row, 7, self._make_ipm_item(job))
+            self.series_table.setItem(
+                row, 8, self._make_status_item(job["status"]))
+            self.series_table.setItem(
+                row, 9, self._make_ete_item(
+                    job["status"], cumulative[i], rate))
 
             # Group column
             group = self.config.institution_assignments.get(
@@ -928,15 +1005,34 @@ class SourceDashboard(QWidget):
             self.series_table.setItem(
                 row, 10, QTableWidgetItem(group))
 
-            if status == "done":
-                done_count += 1
+        self._update_series_summary(queue)
 
-        self.lbl_total_series.setText(
-            f"Series: {done_count} / {len(queue)}")
+    def _update_queue_cells_in_place(self, queue: list):
+        """Same uid sequence as currently rendered — refresh only the
+        cells that can change between per-series progress emits.  The
+        static columns (patient, study, series, modality, images,
+        group) are keyed by series_uid and cannot have changed."""
+        rate = self._get_rate()
+        cumulative = self._compute_cumulative_pending(queue)
+
+        for i, job in enumerate(queue):
+            self.series_table.setItem(i, 6, self._make_pending_item(job))
+            self.series_table.setItem(i, 7, self._make_ipm_item(job))
+            self.series_table.setItem(
+                i, 8, self._make_status_item(job["status"]))
+            self.series_table.setItem(
+                i, 9, self._make_ete_item(
+                    job["status"], cumulative[i], rate))
+
+        self._update_series_summary(queue)
 
     def on_queue_ready_for_selection(self, queue: list):
         """Engine paused after query — show checkboxes for manual selection."""
         self._last_queue = queue
+        # The table now holds selection-mode rows (checkbox column,
+        # "Waiting" statuses) — force the next on_queue_updated to do a
+        # full rebuild even if the uid sequence happens to match.
+        self._rendered_uids = None
         self.series_table.setRowCount(0)
         self.series_table.setColumnHidden(0, False)
 
@@ -965,7 +1061,7 @@ class SourceDashboard(QWidget):
                 row, 6, QTableWidgetItem(str(max(pending, 0))))
             self.series_table.setItem(row, 7, QTableWidgetItem("\u2014"))
             status_item = QTableWidgetItem("\u23f3 Waiting")
-            status_item.setForeground(QColor("#f39c12"))
+            status_item.setForeground(QColor(COLOR_ORANGE))
             self.series_table.setItem(row, 8, status_item)
             self.series_table.setItem(row, 9, QTableWidgetItem("\u2014"))
 
@@ -1064,23 +1160,9 @@ class SourceDashboard(QWidget):
         for i, job in enumerate(queue):
             if i >= self.series_table.rowCount():
                 break
-            status = job["status"]
-            if status in ("done", "error", "skipped"):
-                ete_text = "\u2713" if status == "done" else "\u2014"
-                ete_item = QTableWidgetItem(ete_text)
-                if status == "done":
-                    ete_item.setForeground(QColor("#2ecc71"))
-                else:
-                    ete_item.setForeground(QColor("#969696"))
-            elif rate > 0:
-                ete_seconds = cumulative[i] / rate
-                ete_item = QTableWidgetItem(self._format_ete(ete_seconds))
-                ete_item.setForeground(QColor("#f39c12"))
-            else:
-                ete_item = QTableWidgetItem("\u2014")
-                ete_item.setForeground(QColor("#969696"))
-            ete_item.setTextAlignment(Qt.AlignCenter)
-            self.series_table.setItem(i, 9, ete_item)
+            self.series_table.setItem(
+                i, 9, self._make_ete_item(
+                    job["status"], cumulative[i], rate))
 
     # ── Study rate ────────────────────────────────────────────────────────
 
@@ -1252,8 +1334,11 @@ class SourceDashboard(QWidget):
             msg.setIcon(QMessageBox.Warning)
             msg.setWindowTitle("High Study Load")
             msg.setText(
-                "The incoming study rate has exceeded the threshold "
-                "(≥12 studies/hour). Please check system capacity.",
+                # Threshold interpolated from the constant so the
+                # message can never drift from the actual trigger.
+                f"The incoming study rate has exceeded the threshold "
+                f"(≥{STUDY_RATE_HIGH_LOAD} studies/hour). "
+                f"Please check system capacity.",
             )
             msg.setModal(False)
             msg.setAttribute(Qt.WA_DeleteOnClose)
@@ -1275,17 +1360,19 @@ class SourceDashboard(QWidget):
     @staticmethod
     def _status_color(status: str) -> QColor:
         return {
-            "queued": QColor("#969696"),
-            "transferring": QColor("#f39c12"),
-            "done": QColor("#2ecc71"),
-            "error": QColor("#e74c3c"),
-            "skipped": QColor("#969696"),
+            "queued": QColor(COLOR_MUTED),
+            "transferring": QColor(COLOR_ORANGE),
+            "done": QColor(COLOR_GREEN),
+            "error": QColor(COLOR_RED),
+            "skipped": QColor(COLOR_MUTED),
         }.get(status, QColor("#d4d4d4"))
 
     def reset(self):
         self.series_table.setRowCount(0)
         self._current_stats = None
         self._last_queue = []
+        # Table was just cleared — next on_queue_updated must rebuild.
+        self._rendered_uids = None
         self._last_high_load_groups = set()
         self.stat_last.setText("\u2014")
         self.stat_med5.setText("\u2014")

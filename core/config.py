@@ -12,7 +12,7 @@ import logging
 import os
 import platform
 import socket
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("dicom_sync")
 
@@ -27,7 +27,12 @@ TRANSFER_SYNTAXES_NAMES = [
     "DeflatedExplicitVRLittleEndian",
 ]
 
-RETRIEVE_METHODS = ["C-MOVE", "C-GET"]
+# Retrieve methods offered in the UI.  "C-GET" was removed from the
+# list: it was never implemented (the engine always issues C-MOVE),
+# so offering it silently misled the user.  The ``retrieve_method``
+# field on PacsNode is kept so existing config files round-trip; a
+# real C-GET implementation can re-add the option here.
+RETRIEVE_METHODS = ["C-MOVE"]
 
 
 def default_priority_terms() -> List[Dict[str, Any]]:
@@ -87,7 +92,10 @@ class PacsNode:
         self.ip_address = ip_address
         self.port = port
         self.transfer_syntax = transfer_syntax
-        self.retrieve_method = retrieve_method  # "C-MOVE" or "C-GET"
+        # Only "C-MOVE" is honored; "C-GET" may still appear in old
+        # config files but the engine has no C-GET path (see
+        # RETRIEVE_METHODS above).
+        self.retrieve_method = retrieve_method
         # Per-source service parameters
         self.hours = hours
         self.max_images = max_images
@@ -163,6 +171,83 @@ class PacsNode:
                 else default_priority_terms()
             ),
         )
+
+
+# ── Filter groups: shared export / import helpers ────────────────────────
+# Used both by AppConfig (persisted state) and by FilterGroupsDialog
+# (which operates on unsaved working copies), so the merge semantics
+# and the on-disk JSON shape cannot drift apart between the two.
+
+def write_filter_groups_json(path: str, group_names: List[str],
+                             assignments: Dict[str, str]):
+    """Write filter group names and institution assignments to a JSON file.
+
+    The file shape is the export format consumed by
+    ``merge_filter_group_data`` / ``AppConfig.import_filter_groups``:
+    ``{"filter_group_names": [...], "institution_assignments": {...}}``.
+    """
+    data = {
+        "filter_group_names": list(group_names),
+        "institution_assignments": dict(assignments),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def merge_filter_group_data(
+    group_names: List[str],
+    assignments: Dict[str, str],
+    imported_groups: List[str],
+    imported_assignments: Dict[str, str],
+    merge: bool,
+) -> Tuple[List[str], Dict[str, str], Dict[str, int]]:
+    """Merge or replace filter group data with imported data (pure, no I/O).
+
+    Args:
+        group_names: Current ordered list of group names.
+        assignments: Current {institution: group_name} mapping.
+        imported_groups: Group names read from an export file.
+        imported_assignments: Assignments read from an export file.
+        merge: If *True*, merge with existing data (new groups are
+               appended, existing institution assignments are
+               overwritten by the imported values).  If *False*,
+               replace entirely.
+
+    Returns:
+        ``(new_group_names, new_assignments, summary)`` where *summary*
+        is a dict with keys *groups_added*, *institutions_added* and
+        *institutions_updated*.  The inputs are never mutated; fresh
+        list/dict copies are returned in both modes.
+    """
+    summary = {
+        "groups_added": 0,
+        "institutions_added": 0,
+        "institutions_updated": 0,
+    }
+
+    if merge:
+        new_group_names = list(group_names)
+        new_assignments = dict(assignments)
+        for g in imported_groups:
+            if g not in new_group_names:
+                new_group_names.append(g)
+                summary["groups_added"] += 1
+        for inst, grp in imported_assignments.items():
+            if inst in new_assignments:
+                if new_assignments[inst] != grp:
+                    new_assignments[inst] = grp
+                    summary["institutions_updated"] += 1
+            else:
+                new_assignments[inst] = grp
+                summary["institutions_added"] += 1
+    else:
+        # Replace mode: everything imported counts as "added".
+        summary["groups_added"] = len(imported_groups)
+        summary["institutions_added"] = len(imported_assignments)
+        new_group_names = list(imported_groups)
+        new_assignments = dict(imported_assignments)
+
+    return new_group_names, new_assignments, summary
 
 
 class AppConfig:
@@ -286,18 +371,30 @@ class AppConfig:
                        f"{list(self.remote_nodes.keys())}")
 
             return True
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError, OSError,
+                UnicodeDecodeError) as e:
+            # OSError: unreadable file (permissions, stale network
+            # mount) — must not crash the app at startup.
+            # UnicodeDecodeError: corrupt / binary file content.
+            # Same contract as the parse-error path: log and report
+            # failure so the caller falls back to defaults.
             logger.error(f"Config load error: {e}")
             return False
 
-    def save(self):
+    def save(self) -> bool:
         """Save configuration to file atomically.
 
         Writes to a sibling ``.tmp`` file and ``os.replace``s it onto the
         real path so a crash mid-write cannot leave the user with a
         truncated config (which would otherwise re-trigger the
-        initial-setup wizard on next launch)."""
-        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        initial-setup wizard on next launch).
+
+        Returns *True* on success, *False* if the file could not be
+        written (``OSError``: permissions, full disk, stale mount …).
+        A failure is logged rather than raised — one caller is a
+        debounced-save QTimer slot, where an exception would propagate
+        into the Qt event loop instead of anything that could handle it.
+        """
         # Start from the raw on-disk dict so unknown keys (e.g. settings
         # added by a future build) round-trip instead of being silently
         # dropped on save.
@@ -320,11 +417,17 @@ class AppConfig:
             "sync_interval": self.sync_interval,
         })
         tmp_path = self.config_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, self.config_path)
+        try:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.config_path)
+            return True
+        except OSError as e:
+            logger.error(f"Config save error ({self.config_path}): {e}")
+            return False
 
     def get_remote_names(self) -> List[str]:
         return list(self.remote_nodes.keys())
@@ -398,12 +501,8 @@ class AppConfig:
 
     def export_filter_groups(self, path: str):
         """Export filter group names and institution assignments to a JSON file."""
-        data = {
-            "filter_group_names": list(self.filter_group_names),
-            "institution_assignments": dict(self.institution_assignments),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        write_filter_groups_json(
+            path, self.filter_group_names, self.institution_assignments)
 
     def import_filter_groups(self, path: str, merge: bool = False) -> dict:
         """Import filter groups and institution assignments from a JSON file.
@@ -425,29 +524,12 @@ class AppConfig:
         imported_assignments: Dict[str, str] = data.get(
             "institution_assignments", {})
 
-        summary = {
-            "groups_added": 0,
-            "institutions_added": 0,
-            "institutions_updated": 0,
-        }
-
-        if merge:
-            for g in imported_groups:
-                if g not in self.filter_group_names:
-                    self.filter_group_names.append(g)
-                    summary["groups_added"] += 1
-            for inst, grp in imported_assignments.items():
-                if inst in self.institution_assignments:
-                    if self.institution_assignments[inst] != grp:
-                        self.institution_assignments[inst] = grp
-                        summary["institutions_updated"] += 1
-                else:
-                    self.institution_assignments[inst] = grp
-                    summary["institutions_added"] += 1
-        else:
-            summary["groups_added"] = len(imported_groups)
-            summary["institutions_added"] = len(imported_assignments)
-            self.filter_group_names = imported_groups
-            self.institution_assignments = imported_assignments
+        # Shared pure helper — the same logic the FilterGroupsDialog
+        # applies to its unsaved working copies.
+        (self.filter_group_names,
+         self.institution_assignments,
+         summary) = merge_filter_group_data(
+            self.filter_group_names, self.institution_assignments,
+            imported_groups, imported_assignments, merge)
 
         return summary

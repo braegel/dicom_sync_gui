@@ -8,6 +8,8 @@ focuses on list management + dialog flow.  Currently used by
 dialog if one ever needs it.
 """
 
+from typing import Optional
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -16,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.config import (
-    PacsNode, RETRIEVE_METHODS, TRANSFER_SYNTAXES_NAMES, get_local_ip,
+    PacsNode, TRANSFER_SYNTAXES_NAMES, get_local_ip,
 )
 
 
@@ -57,7 +59,9 @@ class PacsNodeEditor(QWidget):
             btn.clicked.connect(self._auto_detect_ip)
             layout.addRow("", btn)
 
-        # Retrieve method (only for remote nodes)
+        # Retrieve-method combo removed: C-GET was offered but never
+        # implemented (the engine always issues C-MOVE).  The attribute
+        # stays so existing callers/tests can still check for it.
         self.retrieve_combo = None
         self.hours_spin = None
         self.max_images_spin = None
@@ -70,10 +74,6 @@ class PacsNodeEditor(QWidget):
         self.notification_sound_edit = None
 
         if not is_local:
-            self.retrieve_combo = QComboBox()
-            self.retrieve_combo.addItems(RETRIEVE_METHODS)
-            layout.addRow("Retrieve Method:", self.retrieve_combo)
-
             # ── Per-source service parameters ──
             self._add_separator(layout, "Service Parameters")
 
@@ -189,7 +189,6 @@ class PacsNodeEditor(QWidget):
         self.ip_edit.setText(node.ip_address)
         self.port_spin.setValue(node.port)
         self._select_combo_text(self.syntax_combo, node.transfer_syntax)
-        self._select_combo_text(self.retrieve_combo, node.retrieve_method)
         self._select_combo_text(self.local_syntax_combo, node.local_syntax)
         if self.hours_spin:
             self.hours_spin.setValue(node.hours)
@@ -206,15 +205,25 @@ class PacsNodeEditor(QWidget):
         if self.notification_sound_edit:
             self.notification_sound_edit.setText(node.notification_sound_path)
 
-    def get_node(self) -> PacsNode:
+    def get_node(self, base: Optional[PacsNode] = None) -> PacsNode:
+        """Build a ``PacsNode`` from the editor fields.
+
+        *base* is the node being edited, if any.  The editor has no
+        widgets for ``notification_sound_enabled`` (dashboard checkbox)
+        or ``priority_series_terms`` (Priority Series dialog), so those
+        are carried over from *base* — otherwise saving an edit would
+        silently reset them to the defaults.
+        """
         return PacsNode(
             name=self.name_edit.text().strip(),
             ae_title=self.ae_title_edit.text().strip(),
             ip_address=self.ip_edit.text().strip(),
             port=self.port_spin.value(),
             transfer_syntax=self.syntax_combo.currentText(),
-            retrieve_method=(self.retrieve_combo.currentText()
-                             if self.retrieve_combo else "C-MOVE"),
+            # Always C-MOVE — the only implemented retrieve path.  A
+            # stale "C-GET" from an old config is normalized here so
+            # the saved value matches what the engine actually does.
+            retrieve_method="C-MOVE",
             hours=(self.hours_spin.value()
                    if self.hours_spin else 3),
             max_images=(self.max_images_spin.value()
@@ -231,6 +240,12 @@ class PacsNodeEditor(QWidget):
                              if self.fallback_edit else ""),
             notification_sound_path=(self.notification_sound_edit.text().strip()
                                      if self.notification_sound_edit else ""),
+            notification_sound_enabled=(base.notification_sound_enabled
+                                        if base is not None else True),
+            # ``None`` lets PacsNode seed the bundled defaults (new
+            # node); an existing list is deep-copied by PacsNode.
+            priority_series_terms=(base.priority_series_terms
+                                   if base is not None else None),
         )
 
     def clear_fields(self):
@@ -239,8 +254,6 @@ class PacsNodeEditor(QWidget):
         self.ip_edit.clear()
         self.port_spin.setValue(104 if not self.is_local else 11112)
         self.syntax_combo.setCurrentIndex(0)
-        if self.retrieve_combo:
-            self.retrieve_combo.setCurrentIndex(0)
         if self.hours_spin:
             self.hours_spin.setValue(3)
         if self.max_images_spin:

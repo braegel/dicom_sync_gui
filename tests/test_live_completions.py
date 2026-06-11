@@ -285,6 +285,28 @@ class TestExtendedColumns:
         delay_text = _get_delay_text(window, 0)
         assert ":" in delay_text  # formatted with colon
 
+    def test_delay_wraps_across_midnight(self, window):
+        """Acquired 23:55:00, completed 00:05:00 → the raw time-of-day
+        diff is −85,800 s, but a completion can only come AFTER
+        acquisition, so the delay must wrap forward by 24 h to the
+        true 600 s (10:00).  Regression guard for the cross-midnight
+        bug where abs() masked the sign and showed a bogus ~23 h
+        delay while the negative raw value skewed the stats."""
+        window.add_completion(
+            patient_name="Night^Owl",
+            study_description="CT",
+            study_time="23:55:00",
+            completed_time="00:05:00",
+            institution_name="X",
+        )
+        delay_col = _find_delay_column(window)
+        item = window.completions_table.item(0, delay_col)
+        assert item is not None
+        assert item.text() == "10:00"
+        # The raw value stored for the median/σ statistics must be
+        # the normalized, non-negative delay.
+        assert item.data(Qt.UserRole) == 600
+
 
 class TestMedianLabel:
 

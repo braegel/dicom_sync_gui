@@ -78,6 +78,9 @@ def _time_to_seconds(h, m, s):
 
 
 def _format_delay(total_seconds: int) -> str:
+    # Callers pass non-negative values (cross-midnight delays are
+    # normalized into [0, 24h) in add_completion); abs() stays as a
+    # defensive guard against any future negative input.
     m, s = divmod(abs(total_seconds), 60)
     return f"{m}:{s:02d}"
 
@@ -250,6 +253,17 @@ class LiveCompletionsWindow(QWidget):
         delay_seconds: Optional[float] = None
         if acq and comp:
             delay_seconds = _time_to_seconds(*comp) - _time_to_seconds(*acq)
+            # Both timestamps are time-of-day only (no date).  A
+            # download completion can only happen AFTER acquisition,
+            # so a negative diff means midnight was crossed (e.g.
+            # acquired 23:55, completed 00:05) — wrap it forward by
+            # 24 h to get the true delay.  acq == comp stays 0.
+            # Limitation: with time-of-day-only inputs a genuine
+            # >24 h delay cannot be represented; it aliases into
+            # [0, 24h).  Acceptable — same-day (or overnight)
+            # completions are the only realistic case here.
+            if delay_seconds < 0:
+                delay_seconds += 24 * 3600
 
         if study_uid is not None:
             existing_row = self._find_row_by_study_uid(study_uid)

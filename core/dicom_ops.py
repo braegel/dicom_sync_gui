@@ -12,7 +12,7 @@ from pydicom.uid import (
     ExplicitVRLittleEndian, ImplicitVRLittleEndian, JPEG2000Lossless,
     JPEGLosslessSV1, JPEGLossless, DeflatedExplicitVRLittleEndian,
 )
-from pynetdicom import AE, evt, StoragePresentationContexts
+from pynetdicom import AE
 from pynetdicom.sop_class import (
     PatientRootQueryRetrieveInformationModelFind,
     PatientRootQueryRetrieveInformationModelMove,
@@ -32,24 +32,31 @@ TRANSFER_SYNTAXES = {
     "DeflatedExplicitVRLittleEndian": DeflatedExplicitVRLittleEndian,
 }
 
+# Association timeouts (seconds).  pynetdicom's default dimse_timeout
+# is ``None`` — wait forever — so a wedged PACS would block the
+# engine's service loop indefinitely (stop() only sets a flag the
+# loop never reaches).  DIMSE gets 5 minutes because some C-MOVE SCPs
+# send pending responses only sporadically during a large series;
+# the network timeout sits above it so the DIMSE layer times out
+# first with a clean error instead of the socket dropping mid-message.
+ACSE_TIMEOUT_S = 30
+DIMSE_TIMEOUT_S = 300
+NETWORK_TIMEOUT_S = DIMSE_TIMEOUT_S + 30
+
 
 def parse_dicom_time(time_str: str) -> str:
     if not time_str:
         return ""
+    # Strip the fractional part and pad to HHMMSS; slicing a too-short
+    # string just yields a shorter string, so no error handling needed.
     time_str = time_str.split('.')[0].ljust(6, '0')
-    try:
-        return f"{time_str[0:2]}:{time_str[2:4]}"
-    except (IndexError, ValueError):
-        return time_str
+    return f"{time_str[0:2]}:{time_str[2:4]}"
 
 
 def parse_dicom_date(date_str: str) -> str:
     if not date_str or len(date_str) != 8:
         return date_str or ""
-    try:
-        return f"{date_str[6:8]}.{date_str[4:6]}.{date_str[0:4]}"
-    except (IndexError, ValueError):
-        return date_str
+    return f"{date_str[6:8]}.{date_str[4:6]}.{date_str[0:4]}"
 
 
 class DicomOperations:
@@ -67,11 +74,50 @@ class DicomOperations:
         self.move_dest_config = local_config
 
         self.ae = AE(ae_title=local_config.get('ae_title', 'LOCAL_AE'))
+        self.ae.acse_timeout = ACSE_TIMEOUT_S
+        self.ae.dimse_timeout = DIMSE_TIMEOUT_S
+        self.ae.network_timeout = NETWORK_TIMEOUT_S
+        # Offer the configured per-node transfer syntax as the
+        # *preferred* syntax on the query/retrieve contexts.  This only
+        # affects negotiation of this query association (C-FIND/C-MOVE
+        # requests carry identifier datasets, never pixel data); the
+        # transfer syntax of the actual image transfer during a C-MOVE
+        # is negotiated between the source PACS and the destination
+        # Store SCP on a separate association this AE does not control.
+        # Explicit VR LE and Implicit VR LE stay in the list as
+        # fallbacks — Implicit VR LE is the DICOM baseline every SCP
+        # must support — so interoperability cannot regress.  Skip
+        # duplicates in case the configured syntax already is one of
+        # the two fallbacks.
+        query_syntaxes = [self.transfer_syntax]
+        for fallback in (ExplicitVRLittleEndian, ImplicitVRLittleEndian):
+            if fallback not in query_syntaxes:
+                query_syntaxes.append(fallback)
         for ctx in [PatientRootQueryRetrieveInformationModelFind,
                     PatientRootQueryRetrieveInformationModelMove,
                     StudyRootQueryRetrieveInformationModelFind,
-                    StudyRootQueryRetrieveInformationModelMove, Verification]:
-            self.ae.add_requested_context(ctx)
+                    StudyRootQueryRetrieveInformationModelMove]:
+            self.ae.add_requested_context(ctx, query_syntaxes)
+        # Verification (C-ECHO) keeps pynetdicom's default syntaxes.
+        self.ae.add_requested_context(Verification)
+
+    def close(self):
+        """Shut down the AE so any association threads exit before the
+        object is dropped.
+
+        Letting an AE be garbage-collected while its threads are still
+        alive is the SIGSEGV the ``gc.freeze()`` workaround in main.py
+        masks — every owner of a DicomOperations must call this when
+        done with it (the engine does so in its service-loop teardown;
+        short-lived owners should use ``try/finally``).
+        """
+        if self.ae is None:
+            return
+        try:
+            self.ae.shutdown()
+        except Exception as e:
+            logger.warning(
+                f"[{self.remote_name}] AE shutdown failed: {e}")
 
     def c_echo(self, target: str = 'remote') -> bool:
         config = self.local_config if target == 'local' else self.remote_config

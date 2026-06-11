@@ -24,6 +24,24 @@ from core.config import AppConfig, PacsNode
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.fixture(autouse=True)
+def _inline_background_threads():
+    """Run ``run_in_background`` jobs synchronously.
+
+    The stats window queries the log on a worker thread; tests assert
+    table contents immediately after a click, so the job must complete
+    inline.  Same pattern as the filter-groups dialog tests.
+    """
+    def fake_thread(*args, **kwargs):
+        t = MagicMock()
+        t.start = lambda: kwargs["target"]()
+        return t
+
+    with patch("gui.async_helpers.threading.Thread",
+               side_effect=fake_thread):
+        yield
+
+
 def _populate_log(log: TransferLog):
     """Insert a realistic set of transfer records."""
     # Study 1: CT with 3 series, fast transfer

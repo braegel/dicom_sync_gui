@@ -10,6 +10,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QFont
 
+# Maximum number of log lines retained in the viewer.  The GUI can run as a
+# 24/7 service, so an unbounded QTextEdit would grow without limit and make
+# every repaint/line-count more expensive over time.  With a maximum block
+# count set on the underlying QTextDocument, Qt automatically drops the
+# oldest lines as new ones scroll in, capping both memory and CPU cost.
+MAX_LOG_LINES = 5000
+
 
 class LogWindow(QWidget):
     """Floating window that shows the application log in real time."""
@@ -31,6 +38,10 @@ class LogWindow(QWidget):
         font.setFamilies(["Menlo", "Consolas", "Courier New"])
         font.setPointSize(10)
         self.log_text.setFont(font)
+        # Cap retention: Qt silently discards the oldest blocks (lines) once
+        # the limit is reached, so a long-running service cannot exhaust
+        # memory through the log viewer.
+        self.log_text.document().setMaximumBlockCount(MAX_LOG_LINES)
         layout.addWidget(self.log_text, 1)
 
         # Bottom bar
@@ -75,6 +86,16 @@ class LogWindow(QWidget):
                 f"Could not save log to {path}:\n{e}")
 
     def _update_line_count(self):
-        text = self.log_text.toPlainText()
-        count = text.count("\n") + (1 if text else 0)
+        # Use the document's block count (O(1)) instead of scanning the full
+        # text with toPlainText() (O(document size)), which made appending N
+        # lines quadratic overall.  Each block corresponds to one displayed
+        # line, so the value matches the old newline-based count.
+        #
+        # Once MAX_LOG_LINES is exceeded the oldest blocks are dropped, so
+        # this is the number of lines *retained* (it plateaus at
+        # MAX_LOG_LINES), not a lifetime total.
+        doc = self.log_text.document()
+        # An empty QTextDocument still reports blockCount() == 1; keep
+        # showing "0 lines" for an empty viewer as before.
+        count = 0 if doc.isEmpty() else doc.blockCount()
         self.lbl_lines.setText(f"{count} lines")

@@ -272,7 +272,10 @@ class SettingsDialog(QDialog):
             return
 
         old_key = self._remote_keys[row]
-        node = self.remote_editor.get_node()
+        # Pass the node being edited so fields without editor widgets
+        # (sound on/off, priority series terms) survive the save.
+        node = self.remote_editor.get_node(
+            base=self._remote_nodes.get(old_key))
 
         # Check for duplicate key (only if key changed)
         if new_key != old_key and new_key in self._remote_nodes:

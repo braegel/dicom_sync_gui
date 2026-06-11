@@ -5,6 +5,7 @@ Displays statistical analysis of the SQLite transfer performance log,
 accessible via the View menu.
 """
 
+import logging
 from collections import defaultdict
 from datetime import datetime
 
@@ -18,6 +19,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont, QPainter
 
 from core.transfer_log import TransferLog
+from gui.async_helpers import run_in_background
+
+logger = logging.getLogger("dicom_sync")
 
 
 def _quartiles(vals):
@@ -44,6 +48,9 @@ class TransferStatsWindow(QWidget):
         # re-creating (with the three CREATE TABLE IF NOT EXISTS round
         # trips) on every filter change.
         self._log = TransferLog(db_path)
+        # Monotonic refresh counter: queries run on a worker thread,
+        # so a slow result must not overwrite a newer one.
+        self._refresh_seq = 0
         self.setWindowTitle("Transfer Performance Statistics")
         self.setWindowFlags(Qt.Window)
         self.setMinimumSize(800, 500)
@@ -166,12 +173,25 @@ class TransferStatsWindow(QWidget):
         return source, modality
 
     def _on_refresh_clicked(self):
-        self._rebuild_filters()
-        self._refresh()
+        """Re-enumerate the filter combos from the full log on a
+        worker thread, then refresh the views."""
+        def job():
+            try:
+                return self._log.query_series()
+            except Exception:
+                logger.exception(
+                    "TransferStatsWindow: filter rebuild query failed")
+                return []
 
-    def _rebuild_filters(self):
-        all_series = self._log.query_series()
+        def apply(all_series):
+            self._populate_filter_combos(all_series)
+            self._refresh()
 
+        run_in_background(self, job, apply, label="stats_filters")
+
+    def _populate_filter_combos(self, all_series):
+        """Rebuild the Source/Modality combos from *all_series* rows,
+        preserving the current selection where still valid."""
         sources = sorted({r["source_pacs"] for r in all_series})
         modalities = sorted({r["modality"] for r in all_series})
 
@@ -201,36 +221,54 @@ class TransferStatsWindow(QWidget):
         self.filter_modality.blockSignals(False)
 
     def _refresh(self):
-        # Build filter lists on first load or refresh
-        if self.filter_source.count() == 0:
-            all_series = self._log.query_series()
-            sources = sorted({r["source_pacs"] for r in all_series})
-            modalities = sorted({r["modality"] for r in all_series})
-            self.filter_source.blockSignals(True)
-            self.filter_modality.blockSignals(True)
-            self.filter_source.addItem("All")
-            self.filter_source.addItems(sources)
-            self.filter_modality.addItem("All")
-            self.filter_modality.addItems(modalities)
-            self.filter_source.blockSignals(False)
-            self.filter_modality.blockSignals(False)
+        """Query the log on a worker thread and update all views.
 
+        The full-history ``SELECT *`` used to run synchronously on
+        the GUI thread; with months of 24/7 logging that freezes the
+        window on every filter change.  ``TransferLog`` is safe to
+        call from the worker: its connection is created with
+        ``check_same_thread=False`` and every access goes through the
+        instance lock, and WAL mode keeps the engine's writers
+        unblocked while we read.
+        """
         source, modality = self._get_filters()
         kw = {}
         if source:
             kw["source_pacs"] = source
         if modality:
             kw["modality"] = modality
+        # First load: combos are still empty, which also means no
+        # filter was active — *series* below then covers the full
+        # table and can seed the combos without an extra query.
+        need_filters = self.filter_source.count() == 0
 
-        series = self._log.query_series(**kw)
-        studies = self._log.query_studies(**kw)
+        self._refresh_seq += 1
+        seq = self._refresh_seq
 
-        self._update_summary(series, studies)
-        self._update_boxplot(series)
-        self._update_source_table(series, studies)
-        self._update_modality_table(series)
-        self._update_study_table(studies)
-        self._update_series_table(series)
+        def job():
+            try:
+                series = self._log.query_series(**kw)
+                studies = self._log.query_studies(**kw)
+                return series, studies
+            except Exception:
+                logger.exception(
+                    "TransferStatsWindow: refresh query failed")
+                return [], []
+
+        def apply(payload):
+            if seq != self._refresh_seq:
+                return  # superseded by a newer refresh
+            series, studies = payload
+            if need_filters:
+                self._populate_filter_combos(series)
+            self._update_summary(series, studies)
+            self._update_boxplot(series)
+            self._update_source_table(series, studies)
+            self._update_modality_table(series)
+            self._update_study_table(studies)
+            self._update_series_table(series)
+
+        run_in_background(self, job, apply, label="stats_refresh")
 
     # ── Summary ──────────────────────────────────────────────────────
 

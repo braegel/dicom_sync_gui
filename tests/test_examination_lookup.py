@@ -24,6 +24,24 @@ from gui.main_window import MainWindow
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.fixture(autouse=True)
+def _inline_background_threads():
+    """Run ``run_in_background`` jobs synchronously.
+
+    The lookup dialog queries the log on a worker thread; tests
+    assert table contents immediately after a click, so the job must
+    complete inline.  Same pattern as the filter-groups dialog tests.
+    """
+    def fake_thread(*args, **kwargs):
+        t = MagicMock()
+        t.start = lambda: kwargs["target"]()
+        return t
+
+    with patch("gui.async_helpers.threading.Thread",
+               side_effect=fake_thread):
+        yield
+
+
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 

@@ -98,6 +98,15 @@ class TransferStats:
     included in the speed statistics.  Smaller series are still counted
     towards ``total_images`` but their transfer speed is too noisy to
     be meaningful.
+
+    Thread safety: instances are mutated on the engine's service-loop
+    thread (``start_session``, ``record_series``) while the GUI thread
+    reads them concurrently — the ``stats_updated`` signal emits the
+    LIVE object and the dashboard polls it from a QTimer.  All public
+    methods therefore take ``_lock`` so ``_completed_series`` cannot
+    grow mid-iteration under a reader.  Locked public methods must NOT
+    call each other (plain ``Lock``, not ``RLock``); shared logic lives
+    in ``_*_unlocked`` helpers that assume the lock is already held.
     """
     MIN_IMAGES_FOR_STATS: ClassVar[int] = 10
 
@@ -105,11 +114,18 @@ class TransferStats:
     start_time: float = 0.0
     _completed_series: List["SeriesCompletionRecord"] = field(
         default_factory=list)
+    # Guards every access to total_images / start_time /
+    # _completed_series.  Excluded from repr/compare so the dataclass
+    # niceties keep working (locks are neither printable state nor
+    # comparable).
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False)
 
     def start_session(self):
-        self.start_time = time.time()
-        self.total_images = 0
-        self._completed_series = []
+        with self._lock:
+            self.start_time = time.time()
+            self.total_images = 0
+            self._completed_series = []
 
     def record_series(self, series_uid: str, image_count: int,
                       duration_seconds: float):
@@ -120,32 +136,47 @@ class TransferStats:
         ``MIN_IMAGES_FOR_STATS`` images are flagged so the statistics
         methods can skip them.
         """
-        self.total_images += image_count
         ipm = (image_count / duration_seconds) * 60 if duration_seconds > 0 else 0.0
-        self._completed_series.append(SeriesCompletionRecord(
+        record = SeriesCompletionRecord(
             series_uid=series_uid,
             image_count=image_count,
             duration_seconds=duration_seconds,
             images_per_minute=ipm,
-        ))
+        )
+        with self._lock:
+            self.total_images += image_count
+            self._completed_series.append(record)
 
     @property
     def completed_count(self) -> int:
-        return len(self._completed_series)
+        with self._lock:
+            return len(self._completed_series)
+
+    def _stats_series_unlocked(self) -> List["SeriesCompletionRecord"]:
+        """Completed series that qualify for speed statistics.
+
+        Caller must hold ``_lock`` — this iterates
+        ``_completed_series``, which the service-loop thread appends to.
+        Returns a fresh list, so the snapshot stays consistent after the
+        lock is released."""
+        return [r for r in self._completed_series
+                if r.image_count >= self.MIN_IMAGES_FOR_STATS]
 
     @property
     def _stats_series(self) -> List["SeriesCompletionRecord"]:
-        """Completed series that qualify for speed statistics."""
-        return [r for r in self._completed_series
-                if r.image_count >= self.MIN_IMAGES_FOR_STATS]
+        """Locked public view of the qualifying series (kept for tests
+        and introspection; internal code uses the unlocked helper)."""
+        with self._lock:
+            return self._stats_series_unlocked()
 
     def raw_images_per_minute(self) -> float:
         """Overall images/minute since session start.
 
-        Reads ``start_time`` and ``total_images`` in a single snapshot
-        so callers on another thread get a consistent rate."""
-        total = self.total_images
-        start = self.start_time
+        Reads ``start_time`` and ``total_images`` in a single locked
+        snapshot so callers on another thread get a consistent rate."""
+        with self._lock:
+            total = self.total_images
+            start = self.start_time
         if not start or total <= 0:
             return 0.0
         elapsed = time.time() - start
@@ -155,7 +186,8 @@ class TransferStats:
 
     def last_series_ipm(self) -> float:
         """Images/minute for the most recently completed qualifying series."""
-        qualifying = self._stats_series
+        with self._lock:
+            qualifying = self._stats_series_unlocked()
         if not qualifying:
             return 0.0
         return qualifying[-1].images_per_minute
@@ -173,7 +205,8 @@ class TransferStats:
 
     def median_n_ipm(self, n: int) -> float:
         """Median images/minute over the last *n* qualifying series."""
-        qualifying = self._stats_series
+        with self._lock:
+            qualifying = self._stats_series_unlocked()
         if not qualifying:
             return 0.0
         recent = qualifying[-n:]
@@ -181,8 +214,10 @@ class TransferStats:
 
     def median_all_ipm(self) -> float:
         """Median images/minute across all qualifying series."""
+        with self._lock:
+            qualifying = self._stats_series_unlocked()
         return self._median(
-            [r.images_per_minute for r in self._stats_series])
+            [r.images_per_minute for r in qualifying])
 
     def overall_images_per_minute(self) -> float:
         """Overall images/minute (used for ETE calculation).
@@ -384,12 +419,8 @@ class TransferEngine:
             # while its reactor threads are still alive is what the
             # ``gc.freeze()`` workaround in main.py exists to mask.
             ops = self._dicom_ops
-            if ops is not None and ops.ae is not None:
-                try:
-                    ops.ae.shutdown()
-                except Exception as e:
-                    logger.warning(
-                        f"[{self.remote_key}] AE shutdown failed: {e}")
+            if ops is not None:
+                ops.close()
             self._dicom_ops = None
             self._running = False
             self._log(f"[{self.remote_key}] Service stopped.")
@@ -429,8 +460,13 @@ class TransferEngine:
         """Run the C-FIND pass and produce the list of series to transfer."""
         now = datetime.now()
         cutoff = now - timedelta(hours=hours)
-        yesterday = now - timedelta(days=1)
-        date_range = f"{yesterday.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
+        # The C-FIND date range must reach back at least to the cutoff,
+        # otherwise hours > ~24-48 silently finds nothing: the time
+        # filter below would keep studies the query never returned.
+        # Keep the historical yesterday-start as the minimum span so
+        # short windows still tolerate around-midnight studies.
+        range_start = min(now - timedelta(days=1), cutoff)
+        date_range = f"{range_start.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
         seen_series: Set[str] = set()
 
         try:

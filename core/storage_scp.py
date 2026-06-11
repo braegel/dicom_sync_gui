@@ -3,6 +3,7 @@ Built-in Storage SCP for receiving DICOM images.
 Used as fallback when no external DICOM server is available.
 """
 
+import inspect
 import logging
 import os
 import threading
@@ -15,6 +16,20 @@ from pynetdicom import AE, evt, StoragePresentationContexts
 from pynetdicom.sop_class import Verification
 
 logger = logging.getLogger("dicom_sync")
+
+# pydicom 3.x renamed Dataset.save_as(write_like_original=False) to
+# save_as(enforce_file_format=True); the old keyword is deprecated and
+# slated for removal.  Both spellings mean the same thing here: write a
+# standards-conformant Part 10 file (128-byte preamble + "DICM" magic +
+# File Meta Information).  Detect which keyword the installed pydicom
+# accepts ONCE at import time -- handle_store runs on the pynetdicom
+# reactor thread for every received image, so a per-call try/except
+# would add avoidable overhead to the hot path.
+_SAVE_AS_KWARGS = (
+    {"enforce_file_format": True}
+    if "enforce_file_format" in inspect.signature(Dataset.save_as).parameters
+    else {"write_like_original": False}
+)
 
 
 class StorageSCP(QObject):
@@ -69,7 +84,10 @@ class StorageSCP(QObject):
         ds.file_meta = event.file_meta
         try:
             filepath = os.path.join(self.storage_path, f"{ds.SOPInstanceUID}.dcm")
-            ds.save_as(filepath, write_like_original=False)
+            # Conformant Part 10 write; keyword chosen at import time
+            # (see _SAVE_AS_KWARGS) to stay compatible with pydicom 2.x
+            # ("write_like_original") and 3.x ("enforce_file_format").
+            ds.save_as(filepath, **_SAVE_AS_KWARGS)
             with self._lock:
                 self._images_received += 1
             self.image_received.emit(ds)

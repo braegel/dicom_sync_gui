@@ -154,6 +154,56 @@ class TestDicomOperationsInit:
         assert ops.ae.ae_title == "ARZT_4"
         assert ops.move_dest_config.get('ae_title') == 'ARZT_4'
 
+    # ── requested presentation contexts: preferred transfer syntax ──────
+
+    def _qr_contexts(self, ops):
+        """The four Q/R contexts (everything except Verification)."""
+        from pynetdicom.sop_class import Verification
+        return [cx for cx in ops.ae.requested_contexts
+                if cx.abstract_syntax != Verification]
+
+    def test_qr_contexts_prefer_configured_syntax(self, local_config,
+                                                  remote_config):
+        """Configured syntax is offered first; Implicit VR LE (the DICOM
+        baseline) must remain as fallback so interop cannot regress."""
+        from pydicom.uid import (
+            JPEG2000Lossless, ExplicitVRLittleEndian, ImplicitVRLittleEndian,
+        )
+        ops = DicomOperations(local_config, remote_config)
+        qr = self._qr_contexts(ops)
+        assert len(qr) == 4
+        for cx in qr:
+            assert cx.transfer_syntax[0] == JPEG2000Lossless
+            assert ExplicitVRLittleEndian in cx.transfer_syntax
+            assert ImplicitVRLittleEndian in cx.transfer_syntax
+
+    def test_qr_contexts_no_duplicate_when_syntax_is_fallback(
+            self, local_config, remote_config):
+        """A configured syntax that already is a fallback (e.g. Explicit
+        VR LE) must not appear twice in the offered list."""
+        from pydicom.uid import ExplicitVRLittleEndian, ImplicitVRLittleEndian
+        remote_config["transfer_syntax"] = "ExplicitVRLittleEndian"
+        ops = DicomOperations(local_config, remote_config)
+        for cx in self._qr_contexts(ops):
+            assert list(cx.transfer_syntax) == [
+                ExplicitVRLittleEndian, ImplicitVRLittleEndian]
+
+    def test_qr_contexts_implicit_first_when_configured(
+            self, local_config, remote_config):
+        from pydicom.uid import ExplicitVRLittleEndian, ImplicitVRLittleEndian
+        remote_config["transfer_syntax"] = "ImplicitVRLittleEndian"
+        ops = DicomOperations(local_config, remote_config)
+        for cx in self._qr_contexts(ops):
+            assert list(cx.transfer_syntax) == [
+                ImplicitVRLittleEndian, ExplicitVRLittleEndian]
+
+    def test_verification_context_present(self, local_config, remote_config):
+        """C-ECHO context still requested (with pynetdicom defaults)."""
+        from pynetdicom.sop_class import Verification
+        ops = DicomOperations(local_config, remote_config)
+        assert any(cx.abstract_syntax == Verification
+                   for cx in ops.ae.requested_contexts)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DicomOperations — C-ECHO with mocked network

@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtCore import Qt
 
 from gui.settings_dialog import SettingsDialog, PacsNodeEditor
-from core.config import AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES, RETRIEVE_METHODS
+from core.config import AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -110,11 +110,10 @@ class TestPacsNodeEditorRemote:
     def test_default_port_remote(self):
         assert self.editor.port_spin.value() == 104
 
-    def test_has_retrieve_combo(self):
-        assert self.editor.retrieve_combo is not None
-        items = [self.editor.retrieve_combo.itemText(i)
-                 for i in range(self.editor.retrieve_combo.count())]
-        assert items == RETRIEVE_METHODS
+    def test_no_retrieve_combo(self):
+        # The retrieve-method combo was removed together with the
+        # never-implemented C-GET option; C-MOVE is the only path.
+        assert self.editor.retrieve_combo is None
 
     def test_has_service_param_spinboxes(self):
         assert self.editor.hours_spin is not None
@@ -139,14 +138,17 @@ class TestPacsNodeEditorRemote:
                  for i in range(self.editor.local_syntax_combo.count())]
         assert "JPEG2000Lossless" in items
 
-    def test_set_node_with_retrieve_method(self):
+    def test_set_node_with_legacy_c_get_does_not_crash(self):
+        # Old config files may still carry retrieve_method="C-GET";
+        # loading such a node into the editor must work without the
+        # (removed) retrieve combo.
         node = PacsNode(
             name="CT", ae_title="CT_AE",
             ip_address="10.0.0.1", port=104,
             retrieve_method="C-GET",
         )
         self.editor.set_node(node)
-        assert self.editor.retrieve_combo.currentText() == "C-GET"
+        assert self.editor.name_edit.text() == "CT"
 
     def test_set_node_with_service_params(self):
         node = PacsNode(
@@ -173,12 +175,15 @@ class TestPacsNodeEditorRemote:
         assert self.editor.local_syntax_combo.currentText() == "ExplicitVRLittleEndian"
         assert self.editor.fallback_edit.text() == "/my/fallback"
 
-    def test_get_node_includes_retrieve_method(self):
+    def test_get_node_normalizes_retrieve_method(self):
+        # get_node always emits "C-MOVE" — the only implemented path —
+        # even when editing a node that carried a legacy "C-GET".
         self.editor.name_edit.setText("MRI")
         self.editor.ae_title_edit.setText("MRI_AE")
-        self.editor.retrieve_combo.setCurrentText("C-GET")
-        node = self.editor.get_node()
-        assert node.retrieve_method == "C-GET"
+        legacy = PacsNode(
+            name="MRI", ae_title="MRI_AE", retrieve_method="C-GET")
+        node = self.editor.get_node(base=legacy)
+        assert node.retrieve_method == "C-MOVE"
 
     def test_get_node_includes_service_params(self):
         self.editor.name_edit.setText("MRI")
@@ -204,10 +209,9 @@ class TestPacsNodeEditorRemote:
         assert node.local_syntax == "JPEGLossless"
         assert node.fallback_folder == "/data/incoming"
 
-    def test_clear_resets_to_first_retrieve(self):
-        self.editor.retrieve_combo.setCurrentText("C-GET")
+    def test_clear_resets_port(self):
+        self.editor.port_spin.setValue(5000)
         self.editor.clear_fields()
-        assert self.editor.retrieve_combo.currentText() == "C-MOVE"
         assert self.editor.port_spin.value() == 104
 
     def test_clear_resets_service_params(self):
@@ -405,6 +409,31 @@ class TestSettingsDialogWorkflow:
         node = self.dialog._remote_nodes["ct"]
         assert node.local_ae_title == "ARZT_5"
         assert node.local_port == 22222
+
+    def test_save_changes_preserves_fields_without_editor_widgets(self):
+        # Regression: the editor has no widgets for the sound on/off
+        # flag and the priority series terms — saving an edit must not
+        # reset them to the PacsNode defaults.
+        self.dialog.key_edit.setText("ct")
+        self.dialog.remote_editor.name_edit.setText("CT")
+        self.dialog.remote_editor.ae_title_edit.setText("CT_AE")
+        self.dialog._add_remote()
+
+        # Customize the hidden fields directly on the stored node
+        # (in the app these are set via the dashboard checkbox and
+        # the Priority Series dialog).
+        custom_terms = [{"term": "stroke", "is_regex": False}]
+        node = self.dialog._remote_nodes["ct"]
+        node.priority_series_terms = custom_terms
+        node.notification_sound_enabled = False
+
+        self.dialog.remote_editor.name_edit.setText("CT Updated")
+        self.dialog._save_changes_to_selected()
+
+        node = self.dialog._remote_nodes["ct"]
+        assert node.name == "CT Updated"
+        assert node.priority_series_terms == custom_terms
+        assert node.notification_sound_enabled is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════

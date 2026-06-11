@@ -355,6 +355,57 @@ class TestTransferStatsThreshold:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TransferStats — thread safety
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTransferStatsThreadSafety:
+    """TransferStats is mutated on the engine's service-loop thread and
+    read concurrently from the GUI thread (the ``stats_updated`` signal
+    emits the live object).  The internal lock must keep concurrent
+    writers and readers from crashing or corrupting state."""
+
+    def test_concurrent_record_and_read(self):
+        stats = TransferStats()
+        stats.start_session()
+        errors = []
+        n_writes = 500
+
+        def writer():
+            # Hammer record_series so _completed_series grows while the
+            # reader thread iterates/sorts it.
+            try:
+                for i in range(n_writes):
+                    stats.record_series(f"1.{i}", 60, 30.0)
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        def reader():
+            # Mirror what the dashboard QTimer does every tick.
+            try:
+                for _ in range(n_writes):
+                    stats.median_all_ipm()
+                    stats.median_n_ipm(5)
+                    stats.last_series_ipm()
+                    stats.raw_images_per_minute()
+                    _ = stats.completed_count
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer),
+                   threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors, f"concurrent access raised: {errors}"
+        # No lost updates: every write must be reflected in the totals.
+        assert stats.completed_count == n_writes
+        assert stats.total_images == n_writes * 60
+        # All series identical (60 img / 30 s = 120 ipm) → median exact.
+        assert stats.median_all_ipm() == 120.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TransferSignals
 # ═══════════════════════════════════════════════════════════════════════════
 

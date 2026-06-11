@@ -5,6 +5,7 @@ The user enters cleartext identifiers which are hashed to query the
 SQLite transfer log. Warns if series were likely resent (Mbit/s outlier).
 """
 
+import logging
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import Qt
@@ -14,6 +15,9 @@ from PySide6.QtWidgets import (
 )
 
 from core.transfer_log import TransferLog
+from gui.async_helpers import run_in_background
+
+logger = logging.getLogger("dicom_sync")
 
 
 class ExaminationLookupDialog(QDialog):
@@ -76,17 +80,35 @@ class ExaminationLookupDialog(QDialog):
             self._populate_table([])
             return
 
-        log = TransferLog(self._db_path)
-        try:
-            results = log.query_series(**kw)
-            # Compute baseline mbps stats in SQL (one round trip) instead
-            # of dragging the full series table into Python.
-            baseline = log.mbps_stats() if results else None
-        finally:
-            # ``try/finally`` so a query-side error doesn't leak the
-            # SQLite connection (and its WAL files).
-            log.close()
+        # Query on a worker thread — the log can hold months of
+        # history and used to block the GUI thread for the duration
+        # of the scan.  The button is disabled until the result
+        # lands so a double-click can't start overlapping searches.
+        self.btn_search.setEnabled(False)
 
+        def job():
+            log = TransferLog(self._db_path)
+            try:
+                results = log.query_series(**kw)
+                # Compute baseline mbps stats in SQL (one round trip)
+                # instead of dragging the full series table into Python.
+                baseline = log.mbps_stats() if results else None
+                return results, baseline
+            except Exception:
+                # Tagged empty result instead of raising: on_done is
+                # only called on success, and a dropped callback would
+                # leave the Search button disabled forever.
+                logger.exception("Examination lookup query failed")
+                return [], None
+            finally:
+                log.close()
+
+        run_in_background(self, job, self._on_search_results,
+                          label="exam_lookup")
+
+    def _on_search_results(self, payload):
+        results, baseline = payload
+        self.btn_search.setEnabled(True)
         self._populate_table(results)
         self._check_resend(results, baseline)
 

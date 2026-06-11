@@ -12,19 +12,21 @@ Workflow:
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
-    QPushButton, QGroupBox, QListWidget, QListWidgetItem, QComboBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QGroupBox, QListWidget, QComboBox,
     QSpinBox, QMessageBox, QSplitter, QInputDialog, QHeaderView,
-    QTreeWidget, QTreeWidgetItem, QAbstractItemView, QApplication,
-    QProgressDialog, QFileDialog,
+    QTreeWidget, QTreeWidgetItem, QAbstractItemView,
+    QFileDialog,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 
-from core.config import AppConfig
+from core.config import (
+    AppConfig, merge_filter_group_data, write_filter_groups_json,
+)
 from core.dicom_ops import DicomOperations
 from gui.async_helpers import run_in_background
 from gui.styles import BTN_GREEN, BTN_GREEN_LARGE, BTN_RED, BTN_BLUE, BTN_BLUE_LARGE
@@ -395,8 +397,14 @@ class FilterGroupsDialog(QDialog):
             for remote_key, (local_cfg, remote_cfg, name) in remotes.items():
                 try:
                     ops = DicomOperations(local_cfg, remote_cfg, name)
-                    names = ops.c_find_institution_names(
-                        study_date=date_range)
+                    # ``finally`` so the AE's threads are shut down
+                    # before the object is dropped — see
+                    # DicomOperations.close().
+                    try:
+                        names = ops.c_find_institution_names(
+                            study_date=date_range)
+                    finally:
+                        ops.close()
                     discovered.update(names)
                 except Exception as e:
                     logger.error(f"Query failed for {remote_key}: {e}")
@@ -434,12 +442,11 @@ class FilterGroupsDialog(QDialog):
         if not path:
             return
         try:
-            data = {
-                "filter_group_names": list(self._group_names),
-                "institution_assignments": dict(self._assignments),
-            }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            # Shared helper — writes the same JSON shape as
+            # AppConfig.export_filter_groups, but from the dialog's
+            # unsaved working copies.
+            write_filter_groups_json(path, self._group_names,
+                                     self._assignments)
 
             QMessageBox.information(
                 self, "Export Complete",
@@ -492,27 +499,13 @@ class FilterGroupsDialog(QDialog):
 
         merge = (reply == QMessageBox.Yes)
 
-        summary = {"groups_added": 0, "institutions_added": 0,
-                    "institutions_updated": 0}
-
-        if merge:
-            for g in imported_groups:
-                if g not in self._group_names:
-                    self._group_names.append(g)
-                    summary["groups_added"] += 1
-            for inst, grp in imported_assignments.items():
-                if inst in self._assignments:
-                    if self._assignments[inst] != grp:
-                        self._assignments[inst] = grp
-                        summary["institutions_updated"] += 1
-                else:
-                    self._assignments[inst] = grp
-                    summary["institutions_added"] += 1
-        else:
-            summary["groups_added"] = len(imported_groups)
-            summary["institutions_added"] = len(imported_assignments)
-            self._group_names = list(imported_groups)
-            self._assignments = dict(imported_assignments)
+        # Shared pure helper — same merge/replace semantics as
+        # AppConfig.import_filter_groups, applied to the dialog's
+        # unsaved working copies (committed only on Save).
+        self._group_names, self._assignments, summary = \
+            merge_filter_group_data(
+                self._group_names, self._assignments,
+                imported_groups, imported_assignments, merge)
 
         if merge:
             QMessageBox.information(

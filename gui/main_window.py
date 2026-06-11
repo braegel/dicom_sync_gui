@@ -88,6 +88,12 @@ class MainWindow(QMainWindow):
         # carry their own lock and could interleave commits).
         self._transfer_log = TransferLog(default_db_path())
         self._stats_window: Optional[TransferStatsWindow] = None
+        # One open (non-modal) unknown-institution popup per institution
+        # name.  Two sources can emit the same institution; the dict
+        # dedupes them — the second emit raises the existing popup
+        # instead of stacking a duplicate.  Entries are removed in the
+        # popup's ``finished`` handler.
+        self._open_institution_popups: Dict[str, UnknownInstitutionPopup] = {}
 
         self.setWindowTitle("DICOM Sync")
         self.setMinimumSize(1000, 750)
@@ -265,7 +271,12 @@ class MainWindow(QMainWindow):
         def echo_one(key: str, node, target: str) -> bool:
             local_config = self.config.get_local_dict_for(key)
             ops = DicomOperations(local_config, node.to_dict(), key)
-            return ops.c_echo(target=target)
+            # ``finally`` so the AE's threads are shut down before the
+            # object is dropped — see DicomOperations.close().
+            try:
+                return ops.c_echo(target=target)
+            finally:
+                ops.close()
 
         def run_echo():
             results = []
@@ -425,8 +436,34 @@ class MainWindow(QMainWindow):
             engine.stop()
             self._log(f"Stopping service: {remote_key}...")
 
-    def _on_service_stopped(self, remote_key: str):
-        """Called when an engine thread has actually stopped."""
+    def _on_service_stopped(self, remote_key: str,
+                            engine: Optional[TransferEngine] = None):
+        """Called when an engine thread has actually stopped.
+
+        Prunes the stopped engine from ``self.engines`` so stale
+        ``TransferEngine`` objects (with their connected signal
+        lambdas) don't accumulate over start/stop/restart cycles.
+
+        The prune must happen BEFORE ``dashboard.set_service_running(False)``:
+        the dashboard's restart flow re-emits ``start_requested`` from
+        inside that call, which (re-)registers a fresh engine under the
+        same key — popping afterwards could evict the new engine.
+
+        Pruning is safe for the rest of the file: a pruned engine is by
+        definition not running, so ``closeEvent``'s ``any_running``
+        check and its join loop never needed it, and
+        ``_update_completions_progress`` skips non-running engines
+        anyway.
+        """
+        current = self.engines.get(remote_key)
+        # Remove IF AND ONLY IF the registered engine is the one that
+        # stopped and it has actually wound down.  ``engine is None``
+        # (no emitter known — e.g. direct calls) falls back to pruning
+        # whatever non-running engine is registered.
+        if current is not None and not current.is_running and (
+                engine is None or engine is current):
+            self.engines.pop(remote_key, None)
+
         dashboard = self.dashboards.get(remote_key)
         if dashboard:
             dashboard.set_service_running(False)
@@ -458,7 +495,10 @@ class MainWindow(QMainWindow):
         def check_local():
             local_config = self.config.get_local_dict_for(remote_key)
             ops = DicomOperations(local_config, node.to_dict(), remote_key)
-            reachable = ops.c_echo(target='local')
+            try:
+                reachable = ops.c_echo(target='local')
+            finally:
+                ops.close()
             self._scp_check_done.emit(
                 remote_key, reachable, node.to_dict())
 
@@ -535,9 +575,13 @@ class MainWindow(QMainWindow):
             lambda _s: self._update_completions_progress())
         e.signals.cycle_started.connect(dashboard.on_cycle_started)
         e.signals.cycle_finished.connect(dashboard.on_cycle_finished)
-        # Service lifecycle — use a lambda to pass the remote_key
+        # Service lifecycle — use a lambda to pass the remote_key AND
+        # the emitting engine, so the stopped-handler can prune exactly
+        # the engine that stopped (a stale engine's late signal must
+        # never evict a newer engine registered under the same key).
         e.signals.service_stopped.connect(
-            lambda rk=remote_key: self._on_service_stopped(rk))
+            lambda rk=remote_key, eng=engine:
+                self._on_service_stopped(rk, eng))
         # Manual series selection
         e.signals.queue_ready_for_selection.connect(
             dashboard.on_queue_ready_for_selection)
@@ -551,13 +595,52 @@ class MainWindow(QMainWindow):
     # ── Unknown institution handling ──────────────────────────────────────
 
     def _on_unknown_institution(self, institution_name: str):
-        """Show popup when an unknown institution is encountered."""
+        """Show a NON-modal popup when an unknown institution is
+        encountered.
+
+        Non-modal on purpose: this slot runs on the GUI thread while
+        engines keep emitting.  A modal ``exec()`` would spin a nested
+        event loop inside the slot, and several unknown institutions in
+        one cycle would stack nested modal dialogs.  ``show()`` returns
+        immediately; the assignment is applied in the ``finished``
+        handler instead.
+
+        Each engine emits at most once per institution per run (it
+        keeps a notified set), but two sources can emit the same name —
+        ``_open_institution_popups`` dedupes: re-emits for an already
+        open popup just bring it to the front."""
+        existing = self._open_institution_popups.get(institution_name)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+
         popup = UnknownInstitutionPopup(
             institution_name,
             self.config.filter_group_names,
             self,
         )
-        if popup.exec() == UnknownInstitutionPopup.Accepted:
+        self._open_institution_popups[institution_name] = popup
+        # Capture name + popup in the closure so the finished handler
+        # can read ``popup.assigned_group`` BEFORE the dialog object is
+        # deleted (deletion happens via deleteLater in the handler, not
+        # WA_DeleteOnClose, exactly so this read stays valid).
+        popup.finished.connect(
+            lambda result, name=institution_name, dlg=popup:
+                self._on_institution_popup_finished(name, dlg, result))
+        popup.show()
+
+    def _on_institution_popup_finished(self, institution_name: str,
+                                       popup: UnknownInstitutionPopup,
+                                       result: int):
+        """Apply the unknown-institution popup's outcome once the user
+        dismisses it (OK or window close).  Runs on the GUI thread via
+        the dialog's ``finished`` signal."""
+        # Free the dedupe slot first so a later emit for the same name
+        # can open a fresh popup.
+        self._open_institution_popups.pop(institution_name, None)
+
+        if result == UnknownInstitutionPopup.Accepted:
             if popup.assigned_group:
                 self.config.institution_assignments[
                     institution_name] = popup.assigned_group
@@ -571,6 +654,9 @@ class MainWindow(QMainWindow):
                     self.config.institution_assignments[
                         institution_name] = ""
                     self.config.save()
+
+        # Deletion only AFTER assigned_group has been read above.
+        popup.deleteLater()
 
     # ── Window close ──────────────────────────────────────────────────────
 
@@ -615,9 +701,13 @@ class MainWindow(QMainWindow):
         pending Qt events between slices instead of a single 30-second
         blocking join per engine.  Uses the engine's public ``join``
         instead of reaching into its private ``_thread`` so the
-        thread-lifecycle is owned in one place."""
+        thread-lifecycle is owned in one place.
+
+        Iterates over a snapshot: ``processEvents`` can deliver a
+        queued ``service_stopped`` whose handler prunes the engine from
+        ``self.engines`` — mutating the dict mid-iteration otherwise."""
         import time
-        for engine in self.engines.values():
+        for engine in list(self.engines.values()):
             end = time.monotonic() + total_timeout
             while time.monotonic() < end:
                 remaining = max(0.0, end - time.monotonic())

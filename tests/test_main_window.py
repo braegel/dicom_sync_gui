@@ -410,6 +410,55 @@ class TestMainWindowService:
         assert self.win.dashboards["ct"].btn_start.isEnabled()
         assert "stopped" in self.win.statusBar().currentMessage().lower()
 
+    def test_on_service_stopped_prunes_engine(self):
+        """A stopped engine must be removed from window.engines so
+        stale TransferEngine objects (with connected signal lambdas)
+        don't accumulate over restart cycles."""
+        mock_engine = MagicMock()
+        mock_engine.is_running = False  # engine has wound down
+        self.win.engines["ct"] = mock_engine
+
+        self.win._on_service_stopped("ct", mock_engine)
+
+        assert "ct" not in self.win.engines
+
+    def test_on_service_stopped_prunes_without_emitter(self):
+        """Direct calls without an emitter reference (engine=None)
+        still prune whatever non-running engine is registered."""
+        mock_engine = MagicMock()
+        mock_engine.is_running = False
+        self.win.engines["ct"] = mock_engine
+
+        self.win._on_service_stopped("ct")
+
+        assert "ct" not in self.win.engines
+
+    def test_on_service_stopped_keeps_running_engine(self):
+        """A late stopped-signal from a STALE engine must not evict a
+        newer engine already registered (and running) under the same
+        key — e.g. after a quick stop/start cycle."""
+        old_engine = MagicMock()
+        old_engine.is_running = False
+        new_engine = MagicMock()
+        new_engine.is_running = True
+        self.win.engines["ct"] = new_engine
+
+        self.win._on_service_stopped("ct", old_engine)
+
+        assert self.win.engines["ct"] is new_engine
+
+    def test_on_service_stopped_keeps_engine_still_running(self):
+        """If the registered engine still reports is_running (signal
+        raced ahead of the flag), it must not be pruned — closeEvent's
+        any_running/join logic still needs it."""
+        mock_engine = MagicMock()
+        mock_engine.is_running = True
+        self.win.engines["ct"] = mock_engine
+
+        self.win._on_service_stopped("ct", mock_engine)
+
+        assert self.win.engines["ct"] is mock_engine
+
     def test_start_invalid_key_does_nothing(self):
         # Should not crash
         self.win._on_start_service(
@@ -476,10 +525,15 @@ class TestMainWindowUnknownInstitution:
     def _create(self, populated_config, qapp):
         self.win = MainWindow(populated_config)
 
+    @staticmethod
+    def _finished_handler(mock_popup):
+        """Return the slot that ``_on_unknown_institution`` connected
+        to the popup's ``finished`` signal."""
+        return mock_popup.finished.connect.call_args[0][0]
+
     @patch("gui.main_window.UnknownInstitutionPopup")
     def test_popup_created_with_correct_args(self, MockPopup):
         mock_popup = MagicMock()
-        mock_popup.exec.return_value = 0  # Rejected
         MockPopup.return_value = mock_popup
 
         self.win._on_unknown_institution("New Hospital")
@@ -490,17 +544,106 @@ class TestMainWindowUnknownInstitution:
         )
 
     @patch("gui.main_window.UnknownInstitutionPopup")
-    def test_assignment_saved_on_accept(self, MockPopup):
-        from PySide6.QtWidgets import QDialog
+    def test_popup_is_non_modal(self, MockPopup):
+        """The popup must be shown with show(), never exec() — a modal
+        exec() spins a nested event loop inside an engine signal slot
+        while engines keep emitting."""
         mock_popup = MagicMock()
-        mock_popup.exec.return_value = MockPopup.Accepted
+        MockPopup.return_value = mock_popup
+
+        self.win._on_unknown_institution("New Hospital")
+
+        mock_popup.show.assert_called_once()
+        mock_popup.exec.assert_not_called()
+        # The assignment is deferred to the finished handler.
+        mock_popup.finished.connect.assert_called_once()
+
+    @patch("gui.main_window.UnknownInstitutionPopup")
+    def test_assignment_saved_on_accept(self, MockPopup):
+        mock_popup = MagicMock()
         mock_popup.assigned_group = "Group A"
         MockPopup.return_value = mock_popup
 
         self.win._on_unknown_institution("Brand New Hospital")
+        # Simulate the user clicking OK: the dialog emits
+        # finished(Accepted), which runs the connected handler.
+        self._finished_handler(mock_popup)(MockPopup.Accepted)
 
         assert self.win.config.institution_assignments[
             "Brand New Hospital"] == "Group A"
+
+    @patch("gui.main_window.UnknownInstitutionPopup")
+    def test_accept_without_group_registers_unassigned(self, MockPopup):
+        """OK with '(do not assign)' selected still registers the
+        institution as known-but-unassigned (empty group)."""
+        mock_popup = MagicMock()
+        mock_popup.assigned_group = None
+        MockPopup.return_value = mock_popup
+
+        self.win._on_unknown_institution("Lone Hospital")
+        self._finished_handler(mock_popup)(MockPopup.Accepted)
+
+        assert self.win.config.institution_assignments[
+            "Lone Hospital"] == ""
+
+    @patch("gui.main_window.UnknownInstitutionPopup")
+    def test_rejected_popup_saves_nothing(self, MockPopup):
+        """Closing the dialog (Rejected) must not register the
+        institution — same outcome as the old modal flow."""
+        mock_popup = MagicMock()
+        mock_popup.assigned_group = None
+        MockPopup.return_value = mock_popup
+
+        self.win._on_unknown_institution("Closed Hospital")
+        self._finished_handler(mock_popup)(0)  # QDialog.Rejected
+
+        assert "Closed Hospital" not in (
+            self.win.config.institution_assignments)
+        # Popup must still be deleted and the dedupe slot freed.
+        mock_popup.deleteLater.assert_called_once()
+        assert "Closed Hospital" not in self.win._open_institution_popups
+
+    @patch("gui.main_window.UnknownInstitutionPopup")
+    def test_second_emit_same_name_reuses_open_popup(self, MockPopup):
+        """A second unknown_institution emit for the same name (e.g.
+        from a second source) must NOT create a second popup — the
+        existing one is raised instead."""
+        mock_popup = MagicMock()
+        MockPopup.return_value = mock_popup
+
+        self.win._on_unknown_institution("Dup Hospital")
+        self.win._on_unknown_institution("Dup Hospital")
+
+        MockPopup.assert_called_once()
+        mock_popup.raise_.assert_called_once()
+        mock_popup.activateWindow.assert_called_once()
+
+    @patch("gui.main_window.UnknownInstitutionPopup")
+    def test_new_popup_allowed_after_previous_finished(self, MockPopup):
+        """Once the popup for a name has finished, a later emit for
+        the same name opens a fresh popup (the dedupe entry is
+        cleared in the finished handler)."""
+        mock_popup = MagicMock()
+        MockPopup.return_value = mock_popup
+
+        self.win._on_unknown_institution("Repeat Hospital")
+        self._finished_handler(mock_popup)(0)  # dismissed
+        assert "Repeat Hospital" not in self.win._open_institution_popups
+
+        self.win._on_unknown_institution("Repeat Hospital")
+        assert MockPopup.call_count == 2
+
+    @patch("gui.main_window.UnknownInstitutionPopup")
+    def test_distinct_names_get_distinct_popups(self, MockPopup):
+        """Different institution names each get their own popup."""
+        MockPopup.side_effect = lambda *a, **k: MagicMock()
+
+        self.win._on_unknown_institution("Hospital A")
+        self.win._on_unknown_institution("Hospital B")
+
+        assert MockPopup.call_count == 2
+        assert set(self.win._open_institution_popups) == {
+            "Hospital A", "Hospital B"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
