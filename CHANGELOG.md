@@ -2,6 +2,94 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.2.0] — 2026-06-11
+
+Full-project code review: 5 critical, 14 medium and 14 low findings
+resolved across three passes.
+
+### Fixed
+- **Query window honors the configured hours**: the C-FIND date range
+  was hardcoded to yesterday–today, so "Download last" values beyond
+  ~24–48 h silently found nothing older than yesterday.  The range now
+  reaches back to the cutoff date.
+- **Editing a source in Settings no longer wipes its priority series
+  terms and notification-sound preference** — the editor carries over
+  fields it has no widgets for instead of resetting them to defaults.
+- **A hung PACS can no longer wedge the service forever**: explicit
+  ACSE (30 s) / DIMSE (300 s) / network (330 s) timeouts on every
+  association (pynetdicom's default DIMSE timeout is *wait forever*).
+- **Cross-midnight delay** in Download Completions: a study acquired
+  at 23:55 and completed at 00:05 showed a bogus ~23 h delay (and
+  skewed the colour bands); the delay now wraps correctly.
+- **`mbps_stats` median** for even row counts now averages the middle
+  pair (was: upper element), consistent with every other median.
+
+### Changed
+- **C-GET option removed** from Settings: it was never implemented
+  (the engine always issues C-MOVE).  The stored config field
+  round-trips, so old configs load unchanged.
+- **Configured transfer syntax** is now offered as the *preferred*
+  syntax on the Q/R presentation contexts (LE fallbacks kept, so
+  interoperability cannot regress).
+- **Statistics window and Examination Lookup query SQLite on a worker
+  thread** — no more GUI freeze on large transfer logs; the Search
+  button disables during an in-flight query.
+- **Unknown-institution popup is non-modal** and deduplicated per
+  institution; multiple alerts no longer stack modal dialogs.
+- **Series queue table updates in place** during downloads (row
+  selection survives, much less flicker); a full rebuild happens only
+  when the queue composition changes.
+- **Fallback mode logs receive progress** (first image, then every
+  25th) so the built-in Storage SCP is no longer silent.
+- **Log window** caps retention at 5 000 lines and counts lines in
+  O(1) — previously unbounded memory and quadratic cost over a 24/7
+  run.  The app's file log now rotates (2 MB × 3 backups).
+
+### Internal
+- Every `DicomOperations` owner shuts its pynetdicom AE down via the
+  new `close()`; config load/save no longer raise into the Qt event
+  loop; `TransferStats` is lock-protected for cross-thread reads;
+  `StorageSCP.save_as` is pydicom 2.x/3.x compatible.
+- `SourceDashboard` slimmed: WAV synthesis → `gui/notification_sound`,
+  studies-per-hour logic → `gui/study_rate` (pure functions),
+  `_setup_ui` split into seven per-section builders.
+- Six hand-rolled median/stddev implementations consolidated into
+  `core/stats_utils` (stdlib `statistics` underneath).
+- `PacsNode` is a dataclass; dead `is_local` editor mode removed;
+  filter-group export/import logic deduplicated into shared helpers;
+  ~170 GUI method signatures gained type hints.
+
+### Tests
+- 799 → 875 (engine query window, settings round-trip, timeouts,
+  thread-safety hammer, midnight wrap, log retention, incremental
+  table updates, pure study-rate/stats helpers, and more)
+
+## [1.1.0] — 2026-06-04
+
+### Added
+- **Per-source priority series loading** (Settings → Manage Priority
+  Series…): studies with at least one series matching a configured
+  term/regex float to the top of the download queue.  Each entry is a
+  case-insensitive substring or full regex; list order = priority;
+  pre-populated with typical neuro/vascular terms (cct, cta, ct-a,
+  angio, nevas, perf, perfusion, ctp, ct-p).  A source-PACS picker in
+  the dialog keeps a separate list per remote.
+
+### Fixed
+- `StorageSCP.start()` raises `RuntimeError` when the bind fails
+  instead of silently reporting success; the engine launch is skipped
+  so C-MOVEs never fire at a dead local SCP.
+- C-FIND / C-MOVE associations are released via try/finally — a DIMSE
+  failure mid-stream no longer leaves the TCP association dangling.
+- FilterGroupsDialog institution discovery uses each remote's own
+  local AE (was broken on multi-source setups with different AEs).
+- Assorted smaller fixes: TransferLog bool/int guard, study-rate
+  label leak, log-save OSError handling, editor-delegate commit on
+  source switch.
+
+### Tests
+- 785 → 799
+
 ## [1.0.11] — 2026-05-22
 
 ### Added
