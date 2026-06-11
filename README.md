@@ -328,6 +328,13 @@ rm -rf _dmg
 
 > The DMG is not code-signed; first launch on another Mac needs
 > right-click → **Open** to bypass Gatekeeper.
+>
+> DMGs are **not committed to the repository** — they are published
+> exclusively as assets on the
+> [GitHub Releases](https://github.com/braegel/dicom_sync_gui/releases)
+> page (`gh release create vX.Y.Z --title … --notes-file … *.dmg`).
+> The local `releases/` folder is just the build output directory and
+> is git-ignored.
 
 ---
 
@@ -349,12 +356,9 @@ dicom_sync_gui/
 ├── assets/
 │   └── AppIcon.icns                # macOS application icon
 │
-├── releases/
-│   └── DICOM_Sync_1.2.0_macOS_*.dmg   # Standalone macOS app (arm64 + x86_64)
-│
 ├── core/
 │   ├── config.py                   # AppConfig, PacsNode, load/save
-│   ├── dicom_ops.py                # C-ECHO, C-FIND, C-MOVE/C-GET operations
+│   ├── dicom_ops.py                # C-ECHO, C-FIND, C-MOVE operations
 │   ├── i18n.py                     # UI translations (en/de/fr/es)
 │   ├── storage_scp.py              # Built-in DICOM Storage SCP
 │   ├── transfer_engine.py          # Service loop, queue, stats, Qt signals

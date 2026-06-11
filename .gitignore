@@ -57,3 +57,14 @@ Desktop.ini
 # ─── Claude Code local tool state ────────────────────────
 # Per-session permission allowlist; machine-specific.
 .claude/
+
+# ─── Release-Artefakte ───────────────────────────────────
+# DMGs werden ausschließlich als GitHub-Release-Assets
+# veröffentlicht (gh release create … *.dmg) und nicht mehr
+# committet; releases/ dient nur als lokales Build-Ausgabe-
+# verzeichnis.
+releases/
+build_arm64/
+build_x86_64/
+dist_arm64/
+dist_x86_64/
