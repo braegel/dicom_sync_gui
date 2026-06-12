@@ -37,6 +37,12 @@ _FONT_MIN_PT = 8
 # columns.  ±2σ keeps only the strong outliers visible.
 _STDDEV_BAND_MULTIPLIER = 2.0
 
+# Source-PACS tag stored on the Delay and Download Duration items.
+# The stat colouring and the median-delay label group by this value so
+# a slow source PACS doesn't paint a fast one's rows red (and vice
+# versa).  Qt.UserRole itself holds the raw numeric cell value.
+_ROLE_SOURCE = Qt.UserRole + 1
+
 # Column layout — kept here so add_completion, _update_existing_row,
 # and the stat-colour helpers all agree on which cell is which.
 _COL_COPY = 0
@@ -221,8 +227,14 @@ class LiveCompletionsWindow(QWidget):
                        institution_name: str = "",
                        download_duration_seconds: Optional[float] = None,
                        image_count: Optional[int] = None,
-                       min_images_threshold: Optional[int] = None) -> None:
+                       min_images_threshold: Optional[int] = None,
+                       source: str = "") -> None:
         """Add (or aggregate) a completed-study entry.
+
+        *source* names the source PACS the study came from.  Delay /
+        duration colour bands and the median-delay readout are computed
+        per source, so entries from different PACS never share
+        statistics.
 
         When *study_uid* is supplied and a row with the same UID
         already exists in the table, the new values fold into that
@@ -268,7 +280,7 @@ class LiveCompletionsWindow(QWidget):
                 delay_seconds += 24 * 3600
 
         if study_uid is not None:
-            existing_row = self._find_row_by_study_uid(study_uid)
+            existing_row = self._find_row_by_study_uid(study_uid, source)
             if existing_row >= 0:
                 # Cumulative cutoff: skip the update if the running
                 # total would still be below the threshold (rare —
@@ -322,6 +334,7 @@ class LiveCompletionsWindow(QWidget):
 
         dur_item = QTableWidgetItem(texts["duration"])
         dur_item.setData(Qt.UserRole, download_duration_seconds)
+        dur_item.setData(_ROLE_SOURCE, source)
         self.completions_table.setItem(row, _COL_DURATION, dur_item)
 
         img_item = QTableWidgetItem(texts["images"])
@@ -333,6 +346,7 @@ class LiveCompletionsWindow(QWidget):
 
         delay_item = QTableWidgetItem(texts["delay"])
         delay_item.setData(Qt.UserRole, delay_seconds)
+        delay_item.setData(_ROLE_SOURCE, source)
         self.completions_table.setItem(row, _COL_DELAY, delay_item)
 
         self._install_copy_button(row=row, formatted_comp=formatted_comp)
@@ -342,14 +356,24 @@ class LiveCompletionsWindow(QWidget):
 
         self._update_stats()
 
-    def _find_row_by_study_uid(self, study_uid: str) -> int:
+    def _find_row_by_study_uid(self, study_uid: str,
+                               source: str = "") -> int:
         """Return the table row that carries *study_uid* in its
-        Patient-cell UserRole, or ``-1`` if no row matches.  Sort-
-        stable: scans the table directly, no parallel list."""
+        Patient-cell UserRole AND was added by *source*, or ``-1`` if
+        no row matches.  Matching on the source too keeps repeat emits
+        from a second source PACS (same study on two PACS) out of the
+        first source's row — they get their own row, so the per-source
+        statistics stay clean.  Sort-stable: scans the table directly,
+        no parallel list."""
         t = self.completions_table
         for row in range(t.rowCount()):
             item = t.item(row, _COL_PATIENT)
-            if item is not None and item.data(Qt.UserRole) == study_uid:
+            if item is None or item.data(Qt.UserRole) != study_uid:
+                continue
+            delay_item = t.item(row, _COL_DELAY)
+            row_source = (delay_item.data(_ROLE_SOURCE) or ""
+                          if delay_item else "")
+            if row_source == (source or ""):
                 return row
         return -1
 
@@ -393,6 +417,9 @@ class LiveCompletionsWindow(QWidget):
         # ahead of the read.
         pat_item = t.item(row, _COL_PATIENT)
         study_uid = pat_item.data(Qt.UserRole) if pat_item else None
+        delay_for_source = t.item(row, _COL_DELAY)
+        row_source = (delay_for_source.data(_ROLE_SOURCE) or ""
+                      if delay_for_source else "")
 
         was_sorting = t.isSortingEnabled()
         t.setSortingEnabled(False)
@@ -432,7 +459,7 @@ class LiveCompletionsWindow(QWidget):
         # Re-resolve the row via study_uid AFTER the resort so the
         # Copy button always lands on the right study, regardless of
         # which column the user has sorted by.
-        target_row = (self._find_row_by_study_uid(study_uid)
+        target_row = (self._find_row_by_study_uid(study_uid, row_source)
                       if study_uid is not None else row)
         if target_row < 0:
             target_row = row
@@ -441,72 +468,73 @@ class LiveCompletionsWindow(QWidget):
 
         self._update_stats()
 
-    def _collect_column_values(self, col: int) -> list:
-        """Return all non-None ``Qt.UserRole`` values stored in *col*."""
+    def _collect_column_items_by_source(self, col: int) -> Dict[str, list]:
+        """Return ``{source: [(item, value), …]}`` for all cells in
+        *col* whose ``Qt.UserRole`` value is non-None.  Rows added
+        without a source (legacy callers, unit tests) group under
+        ``""``."""
         t = self.completions_table
-        out = []
+        groups: Dict[str, list] = {}
         for row in range(t.rowCount()):
             item = t.item(row, col)
             if item is None:
                 continue
             v = item.data(Qt.UserRole)
-            if v is not None:
-                out.append(v)
-        return out
+            if v is None:
+                continue
+            src = item.data(_ROLE_SOURCE) or ""
+            groups.setdefault(src, []).append((item, v))
+        return groups
 
     def _update_stats(self) -> None:
         # Colour both stat columns: red if > median + 2σ, green if
         # < median − 2σ (±2σ keeps only the strong outliers visible;
         # since 1.0.12 Delay and Download Duration share the same
-        # threshold).
+        # threshold).  Bands and medians are computed per source PACS
+        # so one slow source doesn't skew another's statistics.
         self._colour_column_by_stat_bands(_COL_DURATION)
 
-        delays = self._collect_column_values(_COL_DELAY)
-        if not delays:
+        by_source = self._collect_column_items_by_source(_COL_DELAY)
+        if not by_source:
             self.lbl_median_delay.setText(_DASH)
             return
-        self.lbl_median_delay.setText(_format_delay(int(median(delays))))
+        medians = {src: median([v for _, v in items])
+                   for src, items in by_source.items()}
+        if len(medians) == 1:
+            # Single source (or untagged rows): plain value, no prefix.
+            med = next(iter(medians.values()))
+            self.lbl_median_delay.setText(_format_delay(int(med)))
+        else:
+            self.lbl_median_delay.setText("   ".join(
+                f"{src or _DASH}: {_format_delay(int(med))}"
+                for src, med in sorted(medians.items())))
 
         self._colour_column_by_stat_bands(_COL_DELAY)
 
     def _colour_column_by_stat_bands(self, col: int) -> None:
-        """Compute median ± 2σ over the raw (``Qt.UserRole``) values
-        of *col* and paint outliers via ``_colour_column_by_bands``.
+        """Per source PACS, compute median ± 2σ over the raw
+        (``Qt.UserRole``) values of *col* and paint that source's
+        cells red above the band, green below it, white otherwise.
+        Reads raw values straight from the cells, so it's sort-stable.
 
-        No-op when fewer than two values are present or when the
-        spread is (near) zero — identical values get no colouring.
-        Shared by the Delay and Download Duration columns."""
-        values = self._collect_column_values(col)
-        if len(values) < 2:
-            return
-        med, stddev = median_and_pstdev(values)
-        if stddev < 0.001:
-            return
-        self._colour_column_by_bands(
-            col,
-            high=med + _STDDEV_BAND_MULTIPLIER * stddev,
-            low=med - _STDDEV_BAND_MULTIPLIER * stddev,
-        )
-
-    def _colour_column_by_bands(self, col: int, *,
-                                high: float, low: float) -> None:
-        """Paint the cells in *col* red above *high*, green below
-        *low*, white otherwise.  Reads the raw value from each cell's
-        ``Qt.UserRole``, so this is sort-stable."""
-        t = self.completions_table
-        for row in range(t.rowCount()):
-            item = t.item(row, col)
-            if item is None:
+        A source with fewer than two values or (near) zero spread is
+        skipped — identical values get no colouring.  Shared by the
+        Delay and Download Duration columns."""
+        for items in self._collect_column_items_by_source(col).values():
+            if len(items) < 2:
                 continue
-            d = item.data(Qt.UserRole)
-            if d is None:
+            med, stddev = median_and_pstdev([v for _, v in items])
+            if stddev < 0.001:
                 continue
-            if d > high:
-                item.setForeground(QBrush(_RED))
-            elif d < low:
-                item.setForeground(QBrush(_GREEN))
-            else:
-                item.setForeground(QBrush(QColor("white")))
+            high = med + _STDDEV_BAND_MULTIPLIER * stddev
+            low = med - _STDDEV_BAND_MULTIPLIER * stddev
+            for item, v in items:
+                if v > high:
+                    item.setForeground(QBrush(_RED))
+                elif v < low:
+                    item.setForeground(QBrush(_GREEN))
+                else:
+                    item.setForeground(QBrush(QColor("white")))
 
     def update_transfer_progress(self, pending_images: int,
                                  images_per_minute: float) -> None:

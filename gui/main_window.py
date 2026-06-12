@@ -349,8 +349,13 @@ class MainWindow(QMainWindow):
             total_pending, total_ipm)
 
     def _on_study_completed_live(self, engine: TransferEngine, study_uid: str,
-                                   fully_complete: bool) -> None:
+                                   fully_complete: bool,
+                                   source: str = "") -> None:
         """Add a completion entry to the live completions window.
+
+        *source* is the remote_key of the source PACS the engine
+        serves; the completions window separates its delay / duration
+        statistics (colour bands, median readout) by it.
 
         Threshold filtering (``MIN_IMAGES_FOR_COMPLETIONS_ENTRY``) is
         applied inside ``add_completion`` against the *cumulative*
@@ -377,6 +382,7 @@ class MainWindow(QMainWindow):
             download_duration_seconds=wall_clock,
             image_count=total_images,
             min_images_threshold=MIN_IMAGES_FOR_COMPLETIONS_ENTRY,
+            source=source,
         )
 
     def _log(self, msg: str) -> None:
@@ -586,8 +592,8 @@ class MainWindow(QMainWindow):
         e.signals.study_completed.connect(
             dashboard.on_study_completed)
         e.signals.study_completed.connect(
-            lambda uid, inst, full, images, eng=engine:
-                self._on_study_completed_live(eng, uid, full))
+            lambda uid, inst, full, images, eng=engine, rk=remote_key:
+                self._on_study_completed_live(eng, uid, full, source=rk))
         e.signals.series_started.connect(dashboard.on_series_started)
         e.signals.stats_updated.connect(dashboard.on_stats_updated)
         # Forward queue/stats to the completions-window ETE countdown

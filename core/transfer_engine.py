@@ -48,6 +48,10 @@ class SeriesJob:
     duration_seconds: float = 0.0
     study_date: str = ""
     study_time: str = ""
+    # True for series of a prior study (Voruntersuchung).  Priors are
+    # always transferred AFTER all current studies — even when one of
+    # their series matches a configured priority term.
+    is_prior: bool = False
 
     @property
     def to_transfer(self) -> int:
@@ -71,6 +75,7 @@ class SeriesJob:
             "images_per_minute": self.images_per_minute,
             "study_date": self.study_date,
             "study_time": self.study_time,
+            "is_prior": self.is_prior,
         }
 
 
@@ -89,6 +94,14 @@ class SeriesCompletionRecord:
 # silently suppress the Download Completions entry for everything else
 # that did arrive.
 SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION = 6
+
+# Series whose description matches this pattern (case-insensitive,
+# "ax" at a word start: "Axial", "ax 3mm", "T2 ax" — but NOT "Thorax")
+# are transferred before all other series of the same priority tier —
+# across studies and patients.  Axial reconstructions are the primary
+# reading series; pulling them first means every study becomes readable
+# as early as possible while reformats backfill afterwards.
+AXIAL_PRIORITY_PATTERN = re.compile(r"\bax", re.IGNORECASE)
 
 
 @dataclass
@@ -296,7 +309,12 @@ class TransferEngine:
         self._completed_studies: Set[str] = set()
         self._transfer_log = (transfer_log if transfer_log is not None
                               else TransferLog(default_db_path()))
-        self._series_start_times: Dict[str, float] = {}  # study_uid → first series start
+        # study_uid → accumulated transfer seconds of the study's OWN
+        # series (incl. failed attempts).  Used as the study's wall
+        # clock: since the axial fast-lane interleaves series of
+        # different studies in the queue, first-start-to-last-end
+        # would include other studies' downloads.
+        self._study_active_seconds: Dict[str, float] = {}
         self._study_wall_clock: Dict[str, float] = {}  # study_uid → wall-clock seconds, populated at completion
         self._study_wall_clock_lock = threading.Lock()
         self._dicom_ops: Optional[DicomOperations] = None
@@ -585,7 +603,9 @@ class TransferEngine:
         # Reorder so studies whose series descriptions match a
         # configured priority term float to the top of the queue,
         # in the order the terms appear in the source's
-        # ``priority_series_terms`` list.  Done BEFORE the
+        # ``priority_series_terms`` list; within each tier, axial
+        # ("ax") series come first across studies and patients, and
+        # priors always sink below current studies.  Done BEFORE the
         # ``studies_queried`` emit so the engine's announced
         # work-list and the queue it actually downloads are in the
         # same order (future consumers of ``studies_queried`` won't
@@ -619,11 +639,11 @@ class TransferEngine:
         # that — fall back to "no reorder" instead of crashing the
         # cycle.
         node = self._active_node_or_none
-        if node is None:
-            return jobs
-        terms = list(getattr(node, "priority_series_terms", []))
-        if not terms:
-            return jobs
+        terms = (list(getattr(node, "priority_series_terms", []))
+                 if node is not None else [])
+        # No early-out on empty terms: the sort also enforces the
+        # axial-first and priors-last tiers, which apply regardless
+        # of the configured term list.
         return self._sort_jobs_by_priority(
             jobs, terms, log_label=self.remote_key)
 
@@ -633,26 +653,50 @@ class TransferEngine:
                                log_label: str = "") -> List[SeriesJob]:
         """Pure stable-sort: studies that contain at least one
         priority-matching series float to the top, in the order the
-        terms appear.  Empty *terms* short-circuits.
+        terms appear.
+
+        Prior studies (``is_prior``) always sort BELOW every current
+        study, even when one of their series matches a priority term —
+        a Voruntersuchung must never delay a fresh study.  Within the
+        prior block the term order applies again.
+
+        Within each (is_prior, study-priority) tier, axial series
+        (description matches ``AXIAL_PRIORITY_PATTERN``, case-
+        insensitive) come first — across studies and patients, so
+        every study's primary reading series arrives before any
+        study's reformats.  This is the one rule that deliberately
+        breaks study grouping.
 
         Composed of three small helpers, each independently testable:
         ``_compile_matchers`` → ``_compute_study_priorities`` →
         stable-sort.
         """
-        if not terms:
-            return jobs
         matchers = TransferEngine._compile_matchers(terms, log_label)
         study_prio = TransferEngine._compute_study_priorities(
             jobs, matchers)
-        # Stable sort by (study_priority, original_position) so:
+        # Stable sort by (is_prior, study_priority, non-axial,
+        # original_position):
+        #   - current studies always precede priors,
         #   - priority studies float to the top in priority order,
-        #   - within the same priority slot, original order is kept,
-        #   - all series of a study stay grouped together (they
-        #     share the same study_prio key).
+        #   - axial series lead within their tier, across patients,
+        #   - within the same slot, original order is kept.
         indexed = list(enumerate(jobs))
         indexed.sort(
-            key=lambda pair: (study_prio[pair[1].study_uid], pair[0]))
+            key=lambda pair: (pair[1].is_prior,
+                              study_prio[pair[1].study_uid],
+                              not TransferEngine._is_axial(
+                                  pair[1].series_description),
+                              pair[0]))
         return [j for _, j in indexed]
+
+    @staticmethod
+    def _is_axial(series_description: str) -> bool:
+        """True when *series_description* contains "ax" at a word
+        start (case-insensitive): "Axial", "T2 ax 3mm", "AX T2".
+        Words merely containing/ending in "ax" ("Thorax", "max") do
+        not count."""
+        return bool(AXIAL_PRIORITY_PATTERN.search(
+            series_description or ""))
 
     @staticmethod
     def _compile_matchers(terms: List[Dict[str, Any]],
@@ -809,26 +853,34 @@ class TransferEngine:
 
         dicom_ops = self._ensure_dicom_ops(dicom_ops)
 
-        success, images, t_elapsed, t_start = self._do_move(dicom_ops, job)
+        success, images, t_elapsed = self._do_move(dicom_ops, job)
         if success:
-            return self._record_success(job, images, t_elapsed, t_start,
+            return self._record_success(job, images, t_elapsed,
                                         to_transfer)
-        return self._record_failure(job)
+        return self._record_failure(job, t_elapsed)
 
     def _do_move(self, dicom_ops: DicomOperations,
-                 job: SeriesJob) -> Tuple[bool, int, float, float]:
-        """Run the C-MOVE.  Returns (success, images, elapsed, t_start)."""
+                 job: SeriesJob) -> Tuple[bool, int, float]:
+        """Run the C-MOVE.  Returns (success, images, elapsed)."""
         t_start = time.time()
         try:
             success, images = dicom_ops.c_move_series(
                 job.study_uid, job.series_uid)
         except Exception as e:
             self._log(f"  [{self.remote_key}] C-MOVE failed: {e}")
-            return False, 0, time.time() - t_start, t_start
-        return success, images, time.time() - t_start, t_start
+            return False, 0, time.time() - t_start
+        return success, images, time.time() - t_start
+
+    def _add_study_active_time(self, study_uid: str,
+                               seconds: float) -> None:
+        """Accumulate transfer time spent on one of *study_uid*'s own
+        series.  Queue order interleaves studies (axial fast-lane), so
+        the study wall clock must count only its own series' time."""
+        self._study_active_seconds[study_uid] = (
+            self._study_active_seconds.get(study_uid, 0.0) + seconds)
 
     def _record_success(self, job: SeriesJob, images: int,
-                        t_elapsed: float, t_start: float,
+                        t_elapsed: float,
                         to_transfer: int) -> int:
         """Update stats, persist, and emit completion signals."""
         images = max(images, to_transfer)
@@ -838,8 +890,7 @@ class TransferEngine:
         job.transferred_images = images
         job.duration_seconds = t_elapsed
         job.status = "done"
-        if job.study_uid not in self._series_start_times:
-            self._series_start_times[job.study_uid] = t_start
+        self._add_study_active_time(job.study_uid, t_elapsed)
         try:
             self._transfer_log.record_series(
                 source_pacs=self.remote_key,
@@ -871,9 +922,15 @@ class TransferEngine:
         self._check_patient_complete(job.patient_id)
         return images
 
-    def _record_failure(self, job: SeriesJob) -> int:
-        """Mark the job as errored, persist the failure, and emit."""
+    def _record_failure(self, job: SeriesJob,
+                        t_elapsed: float = 0.0) -> int:
+        """Mark the job as errored, persist the failure, and emit.
+
+        *t_elapsed* (time spent on the failed attempt) still counts
+        toward the study's wall clock — the engine was busy with this
+        study for that long."""
         job.status = "error"
+        self._add_study_active_time(job.study_uid, t_elapsed)
         try:
             self._transfer_log.record_series_failure(
                 source_pacs=self.remote_key,
@@ -903,9 +960,13 @@ class TransferEngine:
             if done_series:
                 first = done_series[0]
                 total_duration = sum(j.duration_seconds for j in done_series)
-                wall_start = self._series_start_times.get(
-                    study_uid, time.time())
-                wall_clock = time.time() - wall_start
+                # Accumulated time spent on this study's own series
+                # (incl. failed attempts).  NOT first-start-to-last-
+                # end: the axial fast-lane interleaves studies in the
+                # queue, so that span would include other studies'
+                # downloads.
+                wall_clock = self._study_active_seconds.pop(
+                    study_uid, total_duration)
                 try:
                     self._transfer_log.record_study(
                         source_pacs=self.remote_key,
@@ -923,7 +984,6 @@ class TransferEngine:
                     )
                 except sqlite3.Error as e:
                     logger.warning(f"TransferLog.record_study failed: {e}")
-                self._series_start_times.pop(study_uid, None)
                 with self._study_wall_clock_lock:
                     self._study_wall_clock[study_uid] = wall_clock
             # fully_complete: every queued series of this study must be
@@ -1101,6 +1161,7 @@ class TransferEngine:
                 local_count=local_count,
                 study_date=ps_date,
                 study_time=ps_time,
+                is_prior=True,
             ))
         return jobs
 

@@ -461,6 +461,152 @@ class TestDelayColorCoding:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Per-source statistics — colour bands and medians separated by source PACS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPerSourceStats:
+    """Delay colour bands and the median readout must be computed per
+    source PACS: a PACS that syncs hourly would otherwise paint every
+    row of a real-time PACS green (and its own rows red)."""
+
+    @staticmethod
+    def _add(window, *, patient, delay_seconds, source):
+        comp_h = 8 + delay_seconds // 3600
+        comp_m = (delay_seconds % 3600) // 60
+        comp_s = delay_seconds % 60
+        window.add_completion(
+            patient_name=patient, study_description="CT",
+            study_time="080000",
+            completed_time=f"{comp_h:02d}:{comp_m:02d}:{comp_s:02d}",
+            institution_name="X", source=source,
+        )
+
+    @staticmethod
+    def _delay_fg(window, patient):
+        t = window.completions_table
+        delay_col = _find_delay_column(window)
+        for row in range(t.rowCount()):
+            item = t.item(row, 1)  # Patient column
+            if item is not None and item.text() == patient:
+                return t.item(row, delay_col).foreground().color().name()
+        raise ValueError(f"row for patient {patient!r} not found")
+
+    def test_slow_source_not_red_against_fast_source(self, window):
+        """A consistently slow PACS must not be flagged red just
+        because another PACS is fast.  Old (global) stats: median=300s,
+        the 1800s entries are way past +2σ → red.  Per-source stats:
+        each group is internally uniform → no colouring at all."""
+        for i in range(8):
+            self._add(window, patient=f"F{i}", delay_seconds=300,
+                      source="FastPACS")
+        for i in range(2):
+            self._add(window, patient=f"S{i}", delay_seconds=1800,
+                      source="SlowPACS")
+        fg = self._delay_fg(window, "S0")
+        assert "#e74c3c" not in fg, (
+            "SlowPACS rows must be judged against SlowPACS's own "
+            "median, not the global one")
+
+    def test_outlier_within_its_own_source_is_red(self, window):
+        """Per-source banding still flags a genuine outlier inside one
+        source: [300]×8 + [1800] → median=300, 2σ≈943 → 1800 is red."""
+        for i in range(8):
+            self._add(window, patient=f"P{i}", delay_seconds=300,
+                      source="PACS-A")
+        self._add(window, patient="OUT", delay_seconds=1800,
+                  source="PACS-A")
+        # A second source must not dilute PACS-A's statistics.
+        self._add(window, patient="B0", delay_seconds=60, source="PACS-B")
+        self._add(window, patient="B1", delay_seconds=60, source="PACS-B")
+        assert "#e74c3c" in self._delay_fg(window, "OUT")
+
+    def test_median_label_shows_one_value_per_source(self, window):
+        """With two sources, the median readout lists each source with
+        its own median instead of one mixed value."""
+        for d in (180, 300, 420):       # median 5:00
+            self._add(window, patient=f"A{d}", delay_seconds=d,
+                      source="Alpha")
+        for d in (660, 780, 900):       # median 13:00
+            self._add(window, patient=f"B{d}", delay_seconds=d,
+                      source="Beta")
+        text = window.lbl_median_delay.text()
+        assert "Alpha" in text and "Beta" in text
+        assert "5:00" in text and "13:00" in text
+
+    def test_median_label_plain_for_single_source(self, window):
+        """One source only → keep the plain un-prefixed value."""
+        for d in (180, 300, 420):
+            self._add(window, patient=f"A{d}", delay_seconds=d,
+                      source="Alpha")
+        text = window.lbl_median_delay.text()
+        assert text == "5:00"
+
+    def test_same_study_from_second_source_gets_own_row(self, window):
+        """The same StudyInstanceUID arriving via a second source PACS
+        must NOT fold into the first source's row — otherwise the
+        second source's numbers pollute the first's statistics."""
+        for src in ("PACS1", "PACS2"):
+            window.add_completion(
+                study_uid="U1", patient_name="A", study_description="CT",
+                study_time="080000", completed_time="08:05:00",
+                institution_name="X", image_count=50,
+                download_duration_seconds=30.0, source=src,
+            )
+        assert window.completions_table.rowCount() == 2
+
+    def test_source_tag_survives_row_aggregation(self, window):
+        """A repeat emit for the same study and source folds into the
+        existing row — and the row keeps its source tag, so it stays
+        in its source's statistics group."""
+        from gui.live_completions import (
+            _ROLE_SOURCE, _COL_DELAY, _COL_IMAGES)
+        for img in (50, 20):
+            window.add_completion(
+                study_uid="U1", patient_name="A", study_description="CT",
+                study_time="080000", completed_time="08:05:00",
+                institution_name="X", image_count=img,
+                download_duration_seconds=30.0, source="PACS1",
+            )
+        t = window.completions_table
+        assert t.rowCount() == 1
+        assert t.item(0, _COL_DELAY).data(_ROLE_SOURCE) == "PACS1"
+        assert t.item(0, _COL_IMAGES).data(Qt.UserRole) == 70
+
+    def test_duration_banding_separated_per_source(self, window):
+        """The Download Duration column gets the same per-source
+        treatment as Delay: a slow PACS's uniform durations must not
+        be painted red against a fast PACS's."""
+        from gui.live_completions import _COL_DURATION
+        for i in range(8):
+            window.add_completion(
+                study_uid=f"F{i}", patient_name=f"F{i}",
+                study_description="CT", study_time="080000",
+                completed_time="08:05:00", institution_name="X",
+                image_count=100, download_duration_seconds=300.0,
+                source="FastPACS",
+            )
+        for i in range(2):
+            window.add_completion(
+                study_uid=f"S{i}", patient_name=f"S{i}",
+                study_description="CT", study_time="080000",
+                completed_time="08:05:00", institution_name="X",
+                image_count=100, download_duration_seconds=1800.0,
+                source="SlowPACS",
+            )
+        t = window.completions_table
+        for row in range(t.rowCount()):
+            if t.item(row, 1).text() == "S0":
+                fg = t.item(row, _COL_DURATION) \
+                    .foreground().color().name()
+                assert "#e74c3c" not in fg, (
+                    "SlowPACS durations must be judged against "
+                    "SlowPACS's own median, not the global one")
+                break
+        else:
+            pytest.fail("row S0 not found")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Column resizing — user can drag column borders (Excel / LibreOffice style)
 # ═══════════════════════════════════════════════════════════════════════════
 

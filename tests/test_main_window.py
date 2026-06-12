@@ -184,6 +184,45 @@ class TestMainWindowInit:
         mock_add.assert_called_once()
         assert mock_add.call_args.kwargs["study_uid"] == "S1"
 
+    def test_study_completed_live_passes_source(self):
+        """_on_study_completed_live must forward the source-PACS key to
+        add_completion so the completions window can separate delay /
+        duration statistics per source."""
+        engine = MagicMock()
+        engine.queue_snapshot.return_value = [
+            MagicMock(study_uid="S1", status="done",
+                      transferred_images=100, patient_name="A",
+                      study_description="CT", study_time="080000",
+                      institution_name="H"),
+        ]
+        engine.pop_study_wall_clock.return_value = 12.0
+
+        with patch.object(
+                self.win.completions_window, "add_completion") as mock_add:
+            self.win._on_study_completed_live(
+                engine, "S1", fully_complete=True, source="PACS-Nord")
+
+        mock_add.assert_called_once()
+        assert mock_add.call_args.kwargs["source"] == "PACS-Nord"
+
+    def test_connect_engine_signals_forwards_remote_key_as_source(self):
+        """The study_completed lambda wired in _connect_engine_signals
+        is the single point where the source-PACS key reaches the
+        completions window — pin that it actually passes
+        ``source=remote_key`` (the parameter defaults to "", so losing
+        it would regress silently)."""
+        engine = MagicMock()
+        dashboard = MagicMock()
+        self.win._connect_engine_signals("PACS-Nord", engine, dashboard)
+
+        with patch.object(self.win, "_on_study_completed_live") as live:
+            for call in engine.signals.study_completed.connect \
+                    .call_args_list:
+                call.args[0]("UID1", "Inst", True, 42)
+
+        live.assert_called_once_with(engine, "UID1", True,
+                                     source="PACS-Nord")
+
     def test_min_images_for_completions_entry_is_ten(self):
         """The threshold constant for Download Completions filtering
         must be exposed and equal 10.  Pinning it here so the value

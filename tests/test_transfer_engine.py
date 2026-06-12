@@ -94,6 +94,7 @@ class TestSeriesJob:
             "study_uid", "series_uid", "remote_count", "local_count",
             "status", "institution_name", "accession_number",
             "images_per_minute", "study_date", "study_time",
+            "is_prior",
         }
         assert set(d.keys()) == expected
 
@@ -107,6 +108,12 @@ class TestSeriesJob:
         d = job.to_dict()
         assert d["study_date"] == "20260401"
         assert d["study_time"] == "143000"
+
+    def test_is_prior_defaults_false(self):
+        assert SeriesJob().is_prior is False
+
+    def test_is_prior_in_to_dict(self):
+        assert SeriesJob(is_prior=True).to_dict()["is_prior"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -984,6 +991,28 @@ class TestPriorsInstitutionFilter:
         assert len(jobs) == 1
         assert jobs[0].series_uid == "2.1.1"
 
+    def test_prior_jobs_are_marked_is_prior(self):
+        """Every job built for a prior study must carry ``is_prior``
+        so the queue ordering can keep priors behind current
+        studies."""
+        current = [self._make_study_ds(
+            "1.1", institution_name="Hospital Alpha")]
+        prior_ds = self._make_study_ds(
+            "2.1", study_date="20260301",
+            institution_name="Hospital Alpha")
+        prior_series = self._make_series_ds(
+            "2.1.1", institution_name="Hospital Alpha")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [current[0], prior_ds]
+        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_local_series.return_value = []
+
+        jobs = self.engine._resolve_priors(
+            mock_ops, current, seen_series=set(), max_images=0)
+
+        assert jobs and all(j.is_prior for j in jobs)
+
     def test_priors_from_unknown_institution_are_downloaded(self):
         """A prior study from an unknown (unassigned) institution should
         still be downloaded — same rule as current studies."""
@@ -1362,6 +1391,76 @@ class TestSingleAEPerCycle:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — per-study wall clock under interleaved queue order
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStudyWallClock:
+    """The study wall clock must count only the study's OWN series'
+    transfer time.  The axial fast-lane interleaves series of
+    different studies in the queue, so a first-start-to-last-end span
+    would include other studies' downloads and corrupt the Download
+    Duration column, img/min, and the SQLite study log."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.log = MagicMock()
+        self.engine = TransferEngine(
+            populated_config, "ct", transfer_log=self.log)
+
+    def _job(self, study_uid, series_uid, patient_id="P1"):
+        return SeriesJob(
+            study_uid=study_uid, series_uid=series_uid,
+            patient_id=patient_id, patient_name="X", remote_count=10)
+
+    def test_wall_clock_excludes_interleaved_foreign_series(self):
+        """Queue order A.1, B.1, A.2 (axial tier interleaving): A's
+        wall clock is 10s + 5s, NOT the span that includes B's 99s."""
+        a1 = self._job("A", "A.1", "P1")
+        b1 = self._job("B", "B.1", "P2")
+        a2 = self._job("A", "A.2", "P1")
+        self.engine._queue = [a1, b1, a2]
+
+        self.engine._record_success(
+            a1, images=10, t_elapsed=10.0, to_transfer=10)
+        self.engine._record_success(
+            b1, images=10, t_elapsed=99.0, to_transfer=10)
+        self.engine._record_success(
+            a2, images=10, t_elapsed=5.0, to_transfer=10)
+
+        assert self.engine.pop_study_wall_clock("A") == pytest.approx(15.0)
+        assert self.engine.pop_study_wall_clock("B") == pytest.approx(99.0)
+
+    def test_wall_clock_persisted_to_study_log(self):
+        a1 = self._job("A", "A.1")
+        b1 = self._job("B", "B.1", "P2")
+        a2 = self._job("A", "A.2")
+        self.engine._queue = [a1, b1, a2]
+        self.engine._record_success(
+            a1, images=10, t_elapsed=10.0, to_transfer=10)
+        self.engine._record_success(
+            b1, images=10, t_elapsed=99.0, to_transfer=10)
+        self.engine._record_success(
+            a2, images=10, t_elapsed=5.0, to_transfer=10)
+
+        study_calls = {c.kwargs["study_uid"]: c.kwargs
+                       for c in self.log.record_study.call_args_list}
+        assert study_calls["A"]["wall_clock_seconds"] == pytest.approx(15.0)
+
+    def test_failed_attempt_time_counts_toward_wall_clock(self):
+        """Time spent on a failed C-MOVE of the study's own series
+        still counts — the engine was busy with this study."""
+        a1 = self._job("A", "A.1")
+        a2 = self._job("A", "A.2")
+        self.engine._queue = [a1, a2]
+
+        self.engine._record_failure(a2, t_elapsed=7.0)
+        self.engine._record_success(
+            a1, images=10, t_elapsed=10.0, to_transfer=10)
+
+        assert self.engine.pop_study_wall_clock("A") == pytest.approx(17.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TransferEngine — priority series ordering
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1380,23 +1479,24 @@ class TestPrioritySeriesOrdering:
         self.config.remote_nodes["ct"].priority_series_terms = []
 
     def _make_job(self, study_uid, series_uid, series_description,
-                  remote_count=100):
+                  remote_count=100, is_prior=False, patient_id="PID"):
         return SeriesJob(
             study_uid=study_uid,
             series_uid=series_uid,
             series_description=series_description,
             patient_name="P",
-            patient_id="PID",
+            patient_id=patient_id,
             modality="CT",
             remote_count=remote_count,
+            is_prior=is_prior,
         )
 
     def test_empty_priority_list_keeps_original_order(self):
-        """Regression sentinel: with no terms configured, ordering is
-        a no-op (pre-1.0.12 behaviour)."""
+        """Regression sentinel: with no terms configured and no axial
+        series in the queue, ordering is a no-op."""
         self.config.remote_nodes["ct"].priority_series_terms = []
         jobs = [
-            self._make_job("S1", "S1.1", "Axial"),
+            self._make_job("S1", "S1.1", "Coronal"),
             self._make_job("S2", "S2.1", "CCT brain"),
             self._make_job("S3", "S3.1", "Sagittal"),
         ]
@@ -1489,6 +1589,109 @@ class TestPrioritySeriesOrdering:
             "SX.1", "SX.2", "SX.3"]
         # Unmatched studies follow in original order.
         assert [j.study_uid for j in out[3:]] == ["S0", "SY"]
+
+    def test_prior_with_matching_term_stays_below_current_studies(self):
+        """A Voruntersuchung whose series matches a priority term must
+        NOT float above current studies — priors always download with
+        lower priority than every current study."""
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("PR1", "PR1.1", "CCT brain",
+                           is_prior=True),               # prior, MATCH
+            self._make_job("S1", "S1.1", "Axial"),       # current, no match
+            self._make_job("S2", "S2.1", "CCT brain"),   # current, MATCH
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.study_uid for j in out] == ["S2", "S1", "PR1"], (
+            "current studies must always precede priors; within the "
+            "current block the priority term decides")
+
+    def test_priority_terms_still_order_priors_among_themselves(self):
+        """Within the prior block the configured term order applies
+        again — the lowered priority only ranks priors as a group
+        below current studies."""
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("PR1", "PR1.1", "Axial", is_prior=True),
+            self._make_job("PR2", "PR2.1", "CCT brain", is_prior=True),
+            self._make_job("S1", "S1.1", "Sagittal"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.study_uid for j in out] == ["S1", "PR2", "PR1"]
+
+    def test_axial_series_float_to_front_across_patients(self):
+        """Series whose description contains "ax" (case-insensitive)
+        lead the queue across studies AND patients — even with no
+        priority terms configured."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Topogramm", patient_id="P1"),
+            self._make_job("S1", "S1.2", "Axial 3mm", patient_id="P1"),
+            self._make_job("S2", "S2.1", "Sagittal", patient_id="P2"),
+            self._make_job("S2", "S2.2", "AX T2", patient_id="P2"),
+            self._make_job("S3", "S3.1", "Coronal", patient_id="P3"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.series_uid for j in out] == [
+            "S1.2", "S2.2", "S1.1", "S2.1", "S3.1"], (
+            "both patients' axial series must precede every "
+            "non-axial series; remaining order stays stable")
+
+    def test_axial_match_is_case_insensitive(self):
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Coronal"),
+            self._make_job("S2", "S2.1", "t2 AX kontrast"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert out[0].series_uid == "S2.1"
+
+    def test_word_merely_containing_ax_is_not_prioritized(self):
+        """"ax" only counts at a word start — "Thorax" (and e.g.
+        "max") must NOT jump the queue."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Coronal"),
+            self._make_job("S2", "S2.1", "Thorax nativ"),
+            self._make_job("S3", "S3.1", "Axial 3mm"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.series_uid for j in out] == ["S3.1", "S1.1", "S2.1"], (
+            "only the true axial series floats; Thorax keeps its "
+            "original position")
+
+    def test_axial_tier_is_subordinate_to_priority_terms(self):
+        """A priority-term study (e.g. stroke CCT) keeps its whole
+        block ahead of other patients' axial series; within that block
+        its own axial series lead."""
+        self.config.remote_nodes["ct"].priority_series_terms = [
+            {"term": "cct", "is_regex": False},
+        ]
+        jobs = [
+            self._make_job("S1", "S1.1", "Axial 3mm", patient_id="P1"),
+            self._make_job("SX", "SX.1", "CCT brain", patient_id="P2"),
+            self._make_job("SX", "SX.2", "CCT ax weich", patient_id="P2"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.series_uid for j in out] == ["SX.2", "SX.1", "S1.1"], (
+            "the priority study's axial series first, then its other "
+            "series, then the routine patient's axial series")
+
+    def test_axial_priors_stay_behind_current_studies(self):
+        """The axial fast-lane must not override the priors-last rule:
+        an axial Voruntersuchung still waits for all current series."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("PR1", "PR1.1", "Axial alt", is_prior=True),
+            self._make_job("S1", "S1.1", "Coronal"),
+            self._make_job("S1", "S1.2", "Axial neu"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.series_uid for j in out] == ["S1.2", "S1.1", "PR1.1"]
 
     def test_engine_reads_from_its_own_remote_node(self):
         """The ``mri`` engine must NOT honour the ``ct`` engine's
