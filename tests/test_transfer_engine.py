@@ -14,6 +14,7 @@ from core.transfer_engine import (
     SeriesJob, TransferStats, TransferEngine, TransferSignals,
     SeriesCompletionRecord,
 )
+from core.dicom_ops import PacsConnectionError
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1393,6 +1394,86 @@ class TestSingleAEPerCycle:
 # ═══════════════════════════════════════════════════════════════════════════
 # TransferEngine — per-study wall clock under interleaved queue order
 # ═══════════════════════════════════════════════════════════════════════════
+
+class TestConnectionLost:
+    """When the PACS becomes unreachable mid-query or mid-download the
+    engine must surface it once (connection_lost), keep the cycle from
+    hammering a dead host, and recover (connection_restored) on the
+    next successful association."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        # No priors so a successful query touches only c_find_studies.
+        self.config.prior_studies_count = 0
+        self.engine = TransferEngine(
+            self.config, "ct", transfer_log=MagicMock())
+        self.lost = []
+        self.restored = []
+        self.engine.signals.connection_lost.connect(
+            lambda rk, d: self.lost.append((rk, d)))
+        self.engine.signals.connection_restored.connect(
+            self.restored.append)
+
+    def _job(self, series_uid):
+        return SeriesJob(
+            study_uid="S1", series_uid=series_uid, patient_id="P1",
+            patient_name="X", remote_count=10)
+
+    def test_query_connection_loss_emits_once_and_returns_empty(self):
+        ops = MagicMock()
+        ops.c_find_studies.side_effect = PacsConnectionError("down")
+
+        jobs = self.engine._query_and_build_queue(3, 0, ops)
+
+        assert jobs == []
+        assert self.lost == [("ct", "down")]
+        assert self.engine._connection_lost_notified is True
+
+    def test_repeated_query_loss_does_not_spam(self):
+        ops = MagicMock()
+        ops.c_find_studies.side_effect = PacsConnectionError("down")
+
+        self.engine._query_and_build_queue(3, 0, ops)
+        self.engine._query_and_build_queue(3, 0, ops)
+
+        assert len(self.lost) == 1, (
+            "only one popup per outage, not one per failed cycle")
+
+    def test_successful_query_after_loss_emits_restored(self):
+        ops = MagicMock()
+        ops.c_find_studies.side_effect = PacsConnectionError("down")
+        self.engine._query_and_build_queue(3, 0, ops)
+
+        # PACS recovers: the query now succeeds (no studies).
+        ops.c_find_studies.side_effect = None
+        ops.c_find_studies.return_value = []
+        self.engine._query_and_build_queue(3, 0, ops)
+
+        assert self.restored == ["ct"]
+        assert self.engine._connection_lost_notified is False
+
+        # A later outage must notify again.
+        ops.c_find_studies.side_effect = PacsConnectionError("down again")
+        self.engine._query_and_build_queue(3, 0, ops)
+        assert len(self.lost) == 2
+
+    def test_transfer_queue_aborts_remaining_on_connection_loss(self):
+        ops = MagicMock()
+        ops.c_move_series.side_effect = PacsConnectionError("down")
+        jobs = [self._job("S1.1"), self._job("S1.2"), self._job("S1.3")]
+
+        moved = self.engine._transfer_queue(jobs, ops)
+
+        assert moved == 0
+        # Only the first series was attempted; the rest stay queued for
+        # the next cycle instead of each burning the connect timeout.
+        assert ops.c_move_series.call_count == 1
+        assert jobs[0].status == "error"
+        assert jobs[1].status == "queued"
+        assert jobs[2].status == "queued"
+        assert self.lost == [("ct", "down")]
+
 
 class TestStudyWallClock:
     """The study wall clock must count only the study's OWN series'

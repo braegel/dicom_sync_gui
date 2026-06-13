@@ -23,6 +23,20 @@ from pynetdicom.sop_class import (
 
 logger = logging.getLogger("dicom_sync")
 
+
+class PacsConnectionError(Exception):
+    """Raised when an association with a PACS cannot be established —
+    the host refused the connection, the TCP connect timed out, or the
+    association was rejected.
+
+    Distinct from a successful association that simply returns no
+    results (a normal empty C-FIND) or a per-image C-MOVE sub-failure:
+    those leave the connection intact.  The engine uses this type to
+    tell "the PACS went away" apart from "nothing to do" / "one bad
+    series", so it can surface an unreachable-PACS popup and stop
+    hammering a dead host for the rest of the cycle.
+    """
+
 TRANSFER_SYNTAXES = {
     "JPEG2000Lossless": JPEG2000Lossless,
     "ExplicitVRLittleEndian": ExplicitVRLittleEndian,
@@ -42,6 +56,13 @@ TRANSFER_SYNTAXES = {
 ACSE_TIMEOUT_S = 30
 DIMSE_TIMEOUT_S = 300
 NETWORK_TIMEOUT_S = DIMSE_TIMEOUT_S + 30
+# TCP connect timeout for ``AE.associate``.  pynetdicom's default is
+# ``None`` (rely on the OS connect timeout, which is ~75 s on Linux
+# and can be effectively unbounded when a firewall silently drops
+# SYN packets).  Without it an unreachable PACS hangs the service
+# loop and the C-ECHO reachability check.  10 s is well above any
+# healthy LAN/VPN round-trip while still failing fast on a dead host.
+CONNECTION_TIMEOUT_S = 10
 
 
 def parse_dicom_time(time_str: str) -> str:
@@ -77,6 +98,7 @@ class DicomOperations:
         self.ae.acse_timeout = ACSE_TIMEOUT_S
         self.ae.dimse_timeout = DIMSE_TIMEOUT_S
         self.ae.network_timeout = NETWORK_TIMEOUT_S
+        self.ae.connection_timeout = CONNECTION_TIMEOUT_S
         # Offer the configured per-node transfer syntax as the
         # *preferred* syntax on the query/retrieve contexts.  This only
         # affects negotiation of this query association (C-FIND/C-MOVE
@@ -119,22 +141,49 @@ class DicomOperations:
             logger.warning(
                 f"[{self.remote_name}] AE shutdown failed: {e}")
 
+    def _associate(self, config: Dict):
+        """Open an association to *config*, raising
+        :class:`PacsConnectionError` if it cannot be established.
+
+        Centralizes the "is the PACS actually reachable" decision so
+        ``c_echo`` (boolean probe), ``_execute_find`` and
+        ``_execute_move`` all agree on what counts as unreachable.
+        Returns an established ``Association``; the caller owns the
+        ``release()``.
+        """
+        target = (f"{config.get('ae_title')}@{config.get('ip_address')}:"
+                  f"{config.get('port')}")
+        try:
+            assoc = self.ae.associate(
+                config['ip_address'], config['port'],
+                ae_title=config['ae_title'])
+        except Exception as e:
+            raise PacsConnectionError(
+                f"Could not connect to {target}: {e}") from e
+        if not assoc.is_established:
+            # Nothing to release on a non-established association.
+            raise PacsConnectionError(
+                f"Association with {target} was not established "
+                f"(rejected or timed out)")
+        return assoc
+
     def c_echo(self, target: str = 'remote') -> bool:
         config = self.local_config if target == 'local' else self.remote_config
         try:
-            assoc = self.ae.associate(config['ip_address'], config['port'],
-                                     ae_title=config['ae_title'])
-            if assoc.is_established:
-                try:
-                    status = assoc.send_c_echo()
-                    if status is None:
-                        return False
-                    return getattr(status, "Status", 0xFFFF) == 0x0000
-                finally:
-                    assoc.release()
+            assoc = self._associate(config)
+        except PacsConnectionError as e:
+            logger.debug(f"C-ECHO failed: {e}")
+            return False
+        try:
+            status = assoc.send_c_echo()
+            if status is None:
+                return False
+            return getattr(status, "Status", 0xFFFF) == 0x0000
         except Exception as e:
             logger.debug(f"C-ECHO failed: {e}")
-        return False
+            return False
+        finally:
+            assoc.release()
 
     def c_find_studies(self,
                        study_date: Optional[str] = None,
@@ -233,31 +282,30 @@ class DicomOperations:
     def _execute_find(self, query_ds: Dataset, target: str = 'remote') -> List[Dataset]:
         config = self.local_config if target == 'local' else self.remote_config
         results = []
+        # ``_associate`` raises PacsConnectionError when the PACS is
+        # unreachable; that propagates to the engine (which surfaces
+        # the "not reachable" popup).  A DIMSE error mid-iteration is a
+        # different beast — the association WAS established — so it's
+        # caught below and yields whatever partial results arrived.
+        assoc = self._associate(config)
         try:
-            assoc = self.ae.associate(config['ip_address'], config['port'],
-                                     ae_title=config['ae_title'])
-            if assoc.is_established:
-                # ``try/finally`` so a DIMSE-level error mid-iteration
-                # doesn't leave the TCP association dangling until the
-                # OS socket timeout.
-                try:
-                    # Suppress pydicom's "VR UI value length exceeds
-                    # maximum" warning that some PACS implementations
-                    # trigger; scoped to the call site, not process-wide.
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings(
-                            'ignore',
-                            message='.*value length.*exceeds the maximum length.*VR UI.*')
-                        for status, dataset in assoc.send_c_find(
-                                query_ds, StudyRootQueryRetrieveInformationModelFind):
-                            if status is None or dataset is None:
-                                continue
-                            if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
-                                results.append(dataset)
-                finally:
-                    assoc.release()
+            # Suppress pydicom's "VR UI value length exceeds maximum"
+            # warning that some PACS implementations trigger; scoped to
+            # the call site, not process-wide.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore',
+                    message='.*value length.*exceeds the maximum length.*VR UI.*')
+                for status, dataset in assoc.send_c_find(
+                        query_ds, StudyRootQueryRetrieveInformationModelFind):
+                    if status is None or dataset is None:
+                        continue
+                    if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
+                        results.append(dataset)
         except Exception as e:
             logger.error(f"C-FIND error: {e}")
+        finally:
+            assoc.release()
         return results
 
     def c_move_series(self, study_uid: str, series_uid: str) -> Tuple[bool, int]:
@@ -278,26 +326,23 @@ class DicomOperations:
     def _execute_move(self, query_ds: Dataset) -> Tuple[bool, int]:
         move_dest = self.move_dest_config.get('ae_title', self.local_config.get('ae_title'))
         success, images = False, 0
+        # See _execute_find: PacsConnectionError (PACS unreachable)
+        # propagates to the engine; a mid-stream DIMSE error is caught
+        # below and reported as a normal (False, images) failure.
+        assoc = self._associate(self.remote_config)
         try:
-            assoc = self.ae.associate(
-                self.remote_config['ip_address'], self.remote_config['port'],
-                ae_title=self.remote_config['ae_title'])
-            if assoc.is_established:
-                # ``try/finally`` so a mid-stream DIMSE failure does not
-                # leak the established TCP association.
-                try:
-                    for status, _ in assoc.send_c_move(
-                            query_ds, move_dest, StudyRootQueryRetrieveInformationModelMove):
-                        if status is None:
-                            continue
-                        if getattr(status, "Status", None) == 0x0000:
-                            success = True
-                        completed = getattr(
-                            status, 'NumberOfCompletedSuboperations', None)
-                        if completed is not None:
-                            images = completed
-                finally:
-                    assoc.release()
+            for status, _ in assoc.send_c_move(
+                    query_ds, move_dest, StudyRootQueryRetrieveInformationModelMove):
+                if status is None:
+                    continue
+                if getattr(status, "Status", None) == 0x0000:
+                    success = True
+                completed = getattr(
+                    status, 'NumberOfCompletedSuboperations', None)
+                if completed is not None:
+                    images = completed
         except Exception as e:
             logger.error(f"C-MOVE error: {e}")
+        finally:
+            assoc.release()
         return success, images

@@ -34,7 +34,7 @@ import logging
 import os
 import threading
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox,
@@ -57,6 +57,7 @@ from gui.unknown_institution_popup import UnknownInstitutionPopup
 from gui.transfer_stats_window import TransferStatsWindow
 from gui.examination_lookup import ExaminationLookupDialog
 from gui.live_completions import LiveCompletionsWindow
+from core.i18n import tr
 
 logger = logging.getLogger("dicom_sync")
 
@@ -70,7 +71,8 @@ class MainWindow(QMainWindow):
     """Main application window — per-source tabs, fully automatic."""
 
     _echo_results_ready = Signal(list)
-    _scp_check_done = Signal(str, bool, dict)
+    # remote_key, remote_reachable, local_reachable, node_dict
+    _scp_check_done = Signal(str, bool, bool, dict)
     _log_message = Signal(str)
 
     def __init__(self, config: AppConfig) -> None:
@@ -94,6 +96,10 @@ class MainWindow(QMainWindow):
         # instead of stacking a duplicate.  Entries are removed in the
         # popup's ``finished`` handler.
         self._open_institution_popups: Dict[str, UnknownInstitutionPopup] = {}
+        # remote_keys whose connection-lost popup is currently on screen,
+        # so a second queued signal for the same source can't stack a
+        # duplicate modal dialog behind the first.
+        self._connection_lost_open: Set[str] = set()
 
         self.setWindowTitle("DICOM Sync")
         self.setMinimumSize(1000, 750)
@@ -476,6 +482,36 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Service stopped: {remote_key}")
         self._update_completions_progress()
 
+    def _on_connection_lost(self, remote_key: str, detail: str) -> None:
+        """A running engine reported the PACS became unreachable during
+        a query or download.  Tell the user once per outage; the engine
+        keeps retrying and recovers on its own when the PACS returns.
+
+        The engine already latches one emit per outage; the
+        ``_connection_lost_open`` guard additionally prevents a modal
+        from stacking if a second source drops while this dialog is up
+        for the same key."""
+        node = self.config.remote_nodes.get(remote_key)
+        name = node.name if node and node.name else remote_key
+        self._log(
+            f"Connection to PACS lost for {remote_key}: {detail}")
+        if remote_key in self._connection_lost_open:
+            return
+        self._connection_lost_open.add(remote_key)
+        lang = getattr(self.config, "language", "en")
+        try:
+            QMessageBox.warning(
+                self,
+                tr("pacs_connection_lost_title", lang),
+                tr("pacs_connection_lost_msg", lang, name=name))
+        finally:
+            self._connection_lost_open.discard(remote_key)
+
+    def _on_connection_restored(self, remote_key: str) -> None:
+        """The engine re-established contact after a connection_lost.
+        Just log it — the service kept running throughout."""
+        self._log(f"Connection to PACS restored for {remote_key}.")
+
     # ── Per-source Storage SCP ────────────────────────────────────────────
 
     def _ensure_storage_scp_for(self, remote_key: str) -> None:
@@ -497,28 +533,56 @@ class MainWindow(QMainWindow):
             return
 
         # Run echo test in background thread to avoid blocking the UI
-        # and causing GC/threading conflicts with PySide6.
-        def check_local():
+        # and causing GC/threading conflicts with PySide6.  Probe the
+        # source PACS first: if it's down there's no point starting the
+        # engine (and with the connection timeout this check itself now
+        # fails fast instead of hanging).  Only bother with the local
+        # probe when the remote is up, since we abort either way if it
+        # isn't.
+        def check_reachability():
             local_config = self.config.get_local_dict_for(remote_key)
             ops = DicomOperations(local_config, node.to_dict(), remote_key)
             try:
-                reachable = ops.c_echo(target='local')
+                remote_reachable = ops.c_echo(target='remote')
+                local_reachable = (ops.c_echo(target='local')
+                                   if remote_reachable else False)
             finally:
                 ops.close()
             self._scp_check_done.emit(
-                remote_key, reachable, node.to_dict())
+                remote_key, remote_reachable, local_reachable,
+                node.to_dict())
 
-        threading.Thread(target=check_local, daemon=True).start()
+        threading.Thread(target=check_reachability, daemon=True).start()
 
-    def _on_scp_check_done(self, remote_key: str, local_reachable: bool,
-                           node_dict: dict) -> None:
-        """Handle SCP check result on the main thread."""
+    def _on_scp_check_done(self, remote_key: str, remote_reachable: bool,
+                           local_reachable: bool, node_dict: dict) -> None:
+        """Handle reachability check result on the main thread."""
         node = self.config.remote_nodes.get(remote_key)
         if not node:
             # Source removed mid-flight — drop the queued start params
             # so they don't leak (and don't get accidentally consumed by
             # a future same-keyed re-add).
             self._pending_start_params.pop(remote_key, None)
+            return
+
+        if not remote_reachable:
+            # Source PACS down — abort the start, tell the user, and
+            # leave the dashboard back in its idle ("Stopped") state.
+            self._pending_start_params.pop(remote_key, None)
+            self._log(
+                f"Source PACS [{node.ae_title}@{node.ip_address}:"
+                f"{node.port}] not reachable for {remote_key}. "
+                f"Service not started.")
+            lang = getattr(self.config, "language", "en")
+            QMessageBox.warning(
+                self,
+                tr("pacs_unreachable_title", lang),
+                tr("pacs_unreachable_msg", lang,
+                   name=node.name or remote_key,
+                   ip=node.ip_address, port=node.port))
+            dashboard = self.dashboards.get(remote_key)
+            if dashboard:
+                dashboard.set_service_running(False)
             return
 
         if not local_reachable:
@@ -619,6 +683,10 @@ class MainWindow(QMainWindow):
         e.signals.log_message.connect(self._log)
         e.signals.unknown_institution.connect(
             self._on_unknown_institution)
+        # Connection lost / restored during a running service
+        e.signals.connection_lost.connect(self._on_connection_lost)
+        e.signals.connection_restored.connect(
+            self._on_connection_restored)
 
     # ── Unknown institution handling ──────────────────────────────────────
 

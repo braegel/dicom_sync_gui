@@ -750,7 +750,7 @@ class TestMainWindowSCP:
         node = self.win.config.remote_nodes["ct"]
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
         self.win._pending_start_params = {"ct": params}
-        self.win._on_scp_check_done("ct", False, node.to_dict())
+        self.win._on_scp_check_done("ct", True, False, node.to_dict())
 
         MockSCP.assert_called_once()
         mock_scp.start.assert_called_once()
@@ -760,7 +760,7 @@ class TestMainWindowSCP:
         node = self.win.config.remote_nodes["ct"]
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
         self.win._pending_start_params = {"ct": params}
-        self.win._on_scp_check_done("ct", True, node.to_dict())
+        self.win._on_scp_check_done("ct", True, True, node.to_dict())
 
         assert len(self.win.storage_scps) == 0
 
@@ -793,7 +793,7 @@ class TestMainWindowSCP:
         node_dict = self.win.config.remote_nodes["ct"].to_dict()
         del self.win.config.remote_nodes["ct"]
 
-        self.win._on_scp_check_done("ct", True, node_dict)
+        self.win._on_scp_check_done("ct", True, True, node_dict)
 
         assert "ct" not in self.win._pending_start_params
 
@@ -813,7 +813,7 @@ class TestMainWindowSCP:
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
         self.win._pending_start_params = {"ct": params}
         # Must not raise out to the Qt event loop.
-        self.win._on_scp_check_done("ct", False, node.to_dict())
+        self.win._on_scp_check_done("ct", True, False, node.to_dict())
 
         mock_start_engine.assert_not_called()
         assert "ct" not in self.win._pending_start_params
@@ -821,6 +821,52 @@ class TestMainWindowSCP:
         # a half-built SCP — otherwise the next start would skip the
         # init path on a dead instance.
         assert ("LOCAL_AE", 11112) not in self.win.storage_scps
+
+    @patch("gui.main_window.QMessageBox.warning")
+    @patch.object(MainWindow, "_start_engine")
+    def test_remote_unreachable_aborts_start_and_warns(
+            self, mock_start_engine, mock_warning):
+        """When the source PACS does not answer the C-ECHO probe, the
+        engine must NOT start, the user must get a warning popup, and
+        the pending-start params must be dropped."""
+        node = self.win.config.remote_nodes["ct"]
+        params = {"hours": 3, "max_images": 0, "sync_interval": 60}
+        self.win._pending_start_params = {"ct": params}
+
+        self.win._on_scp_check_done("ct", False, False, node.to_dict())
+
+        mock_start_engine.assert_not_called()
+        mock_warning.assert_called_once()
+        assert "ct" not in self.win._pending_start_params
+
+    @patch("gui.main_window.QMessageBox.warning")
+    @patch("gui.main_window.StorageSCP")
+    def test_remote_unreachable_does_not_start_fallback_scp(
+            self, MockSCP, mock_warning):
+        """A down source PACS must abort before any fallback SCP is
+        created, even if the local side is also unreachable."""
+        node = self.win.config.remote_nodes["ct"]
+        params = {"hours": 3, "max_images": 0, "sync_interval": 60}
+        self.win._pending_start_params = {"ct": params}
+
+        self.win._on_scp_check_done("ct", False, False, node.to_dict())
+
+        MockSCP.assert_not_called()
+        assert len(self.win.storage_scps) == 0
+
+    @patch("gui.main_window.QMessageBox.warning")
+    def test_remote_unreachable_resets_dashboard(self, mock_warning):
+        """The dashboard must fall back to its stopped state so the
+        user can retry, rather than staying on 'Starting service…'."""
+        node = self.win.config.remote_nodes["ct"]
+        self.win._pending_start_params = {"ct": {"hours": 3}}
+        dashboard = self.win.dashboards["ct"]
+
+        with patch.object(dashboard, "set_service_running") as mock_set:
+            self.win._on_scp_check_done(
+                "ct", False, False, node.to_dict())
+
+        mock_set.assert_called_once_with(False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

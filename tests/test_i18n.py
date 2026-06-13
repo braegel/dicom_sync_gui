@@ -101,3 +101,47 @@ class TestTranslationCoverage:
                 f"language {lang!r} is missing the "
                 f"'image_transfer_completed' translation")
             assert len(result) > 0
+
+    def test_every_language_has_pacs_unreachable_strings(self):
+        for lang in SUPPORTED_LANGUAGES:
+            for key in ("pacs_unreachable_title", "pacs_unreachable_msg"):
+                result = tr(key, lang)
+                assert result != key and len(result) > 0, (
+                    f"language {lang!r} is missing the {key!r} "
+                    f"translation")
+
+    def test_every_language_has_pacs_connection_lost_strings(self):
+        for lang in SUPPORTED_LANGUAGES:
+            for key in ("pacs_connection_lost_title",
+                        "pacs_connection_lost_msg"):
+                result = tr(key, lang)
+                assert result != key and len(result) > 0, (
+                    f"language {lang!r} is missing the {key!r} "
+                    f"translation")
+
+
+class TestTranslationFormatting:
+    """``tr`` substitutes keyword placeholders so the PACS-unreachable
+    message can name the offending source."""
+
+    def test_placeholders_substituted(self):
+        msg = tr("pacs_unreachable_msg", "de",
+                 name="CT", ip="10.0.0.5", port=104)
+        assert "CT" in msg and "10.0.0.5" in msg and "104" in msg
+        assert "{" not in msg
+
+    def test_english_placeholders_substituted(self):
+        msg = tr("pacs_unreachable_msg", "en",
+                 name="MRI", ip="1.2.3.4", port=11112)
+        assert "MRI" in msg and "1.2.3.4" in msg and "11112" in msg
+
+    def test_missing_placeholder_does_not_raise(self):
+        # No kwargs supplied for a template with placeholders → return
+        # the template unformatted rather than raising.
+        msg = tr("pacs_unreachable_msg", "en")
+        assert "{name}" in msg
+
+    def test_formatting_ignored_for_plain_keys(self):
+        # Extra kwargs on a placeholder-free string are harmless.
+        assert tr("image_transfer_completed", "en",
+                  unused="x") == "Image transfer completed"

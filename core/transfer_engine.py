@@ -16,7 +16,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, Signal
 
-from core.dicom_ops import DicomOperations
+from core.dicom_ops import DicomOperations, PacsConnectionError
 from core.stats_utils import median
 from core.transfer_log import TransferLog, default_db_path
 
@@ -274,6 +274,11 @@ class TransferSignals(QObject):
     patient_studies_completed = Signal(str, str)  # patient_id, institution_name
     # All series of a single study finished downloading
     study_completed = Signal(str, str, bool, int)  # study_uid, institution_name, fully_complete, total_images_done
+    # Source (or local) PACS became unreachable during a query/download.
+    # Emitted once per outage; the GUI shows an unreachable popup.
+    connection_lost = Signal(str, str)  # remote_key, detail message
+    # Connection recovered after a previous connection_lost.
+    connection_restored = Signal(str)   # remote_key
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +323,10 @@ class TransferEngine:
         self._study_wall_clock: Dict[str, float] = {}  # study_uid → wall-clock seconds, populated at completion
         self._study_wall_clock_lock = threading.Lock()
         self._dicom_ops: Optional[DicomOperations] = None
+        # True between a connection_lost emit and the next successful
+        # association, so the GUI gets exactly one popup per outage
+        # instead of one per failed series/cycle.
+        self._connection_lost_notified = False
 
     @property
     def is_running(self) -> bool:
@@ -495,15 +504,57 @@ class TransferEngine:
         try:
             jobs = self._query_source(
                 date_range, cutoff, max_images, seen_series, dicom_ops)
+        except PacsConnectionError as e:
+            # The source (or local) PACS went away during the query.
+            # Surface it once and treat the cycle as empty; the service
+            # loop sleeps and retries, recovering automatically when the
+            # PACS comes back.
+            self._handle_connection_lost(str(e))
+            jobs = []
         except Exception as e:
             self._log(f"  [{self.remote_key}] Error querying: {e}")
             jobs = []
+        else:
+            # A query that completed (even with zero studies) proves the
+            # connection is alive again.
+            self._handle_connection_restored()
 
         if not jobs:
             with self._queue_lock:
                 self._queue = []
             self.signals.queue_updated.emit([])
         return jobs
+
+    def _handle_connection_lost(self, detail: str) -> None:
+        """Emit ``connection_lost`` once per outage and log it.
+
+        Called from the query and download paths when an association
+        cannot be established mid-operation.  The latched flag is
+        cleared by :py:meth:`_handle_connection_restored` on the next
+        successful association, so each distinct outage produces exactly
+        one popup."""
+        self._log(f"[{self.remote_key}] PACS connection lost: {detail}")
+        if self._connection_lost_notified:
+            return
+        self._connection_lost_notified = True
+        try:
+            self.signals.connection_lost.emit(self.remote_key, detail)
+        except RuntimeError:
+            # Signals QObject torn down during shutdown — see _log.
+            pass
+
+    def _handle_connection_restored(self) -> None:
+        """Clear the connection-lost latch after a successful
+        association and tell the GUI, so a later outage notifies
+        again."""
+        if not self._connection_lost_notified:
+            return
+        self._connection_lost_notified = False
+        self._log(f"[{self.remote_key}] PACS connection restored.")
+        try:
+            self.signals.connection_restored.emit(self.remote_key)
+        except RuntimeError:
+            pass
 
     def _await_user_selection(
             self, jobs: List[SeriesJob]) -> List[SeriesJob]:
@@ -525,12 +576,26 @@ class TransferEngine:
 
     def _transfer_queue(self, jobs: List[SeriesJob],
                         dicom_ops: DicomOperations) -> int:
-        """Transfer every job in the queue; return total images moved."""
+        """Transfer every job in the queue; return total images moved.
+
+        If the PACS becomes unreachable mid-queue, abort the rest of
+        the cycle instead of letting every remaining series burn the
+        full connect timeout — the service loop will retry next cycle
+        and recover automatically once the PACS is back."""
         total_images = 0
         for job in jobs:
             if self._cancel.is_set():
                 break
-            total_images += self._transfer_series(job, dicom_ops)
+            try:
+                total_images += self._transfer_series(job, dicom_ops)
+            except PacsConnectionError as e:
+                job.status = "error"
+                self.signals.series_error.emit(
+                    job.series_uid, "PACS not reachable")
+                self.signals.queue_updated.emit(
+                    [j.to_dict() for j in jobs])
+                self._handle_connection_lost(str(e))
+                break
             self.signals.queue_updated.emit([j.to_dict() for j in jobs])
         return total_images
 
@@ -866,6 +931,10 @@ class TransferEngine:
         try:
             success, images = dicom_ops.c_move_series(
                 job.study_uid, job.series_uid)
+        except PacsConnectionError:
+            # PACS unreachable — let _transfer_queue abort the cycle
+            # and raise the one-per-outage connection_lost popup.
+            raise
         except Exception as e:
             self._log(f"  [{self.remote_key}] C-MOVE failed: {e}")
             return False, 0, time.time() - t_start

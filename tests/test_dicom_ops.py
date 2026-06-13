@@ -139,6 +139,23 @@ class TestDicomOperationsInit:
         ops = DicomOperations(local_config, remote_config)
         assert ops.ae.ae_title == "LOCAL_AE"
 
+    def test_connection_timeout_set(self, local_config, remote_config):
+        """A finite TCP connect timeout must be configured so an
+        unreachable PACS fails fast instead of hanging the service
+        loop / reachability check on the OS connect timeout."""
+        from core.dicom_ops import CONNECTION_TIMEOUT_S
+        ops = DicomOperations(local_config, remote_config)
+        assert ops.ae.connection_timeout == CONNECTION_TIMEOUT_S
+        assert 0 < CONNECTION_TIMEOUT_S <= 30
+
+    def test_association_timeouts_set(self, local_config, remote_config):
+        from core.dicom_ops import (
+            ACSE_TIMEOUT_S, DIMSE_TIMEOUT_S, NETWORK_TIMEOUT_S)
+        ops = DicomOperations(local_config, remote_config)
+        assert ops.ae.acse_timeout == ACSE_TIMEOUT_S
+        assert ops.ae.dimse_timeout == DIMSE_TIMEOUT_S
+        assert ops.ae.network_timeout == NETWORK_TIMEOUT_S
+
     def test_move_dest_uses_local_config(self, local_config, remote_config):
         """C-MOVE destination should be the local_config (per-source)."""
         ops = DicomOperations(local_config, remote_config)
@@ -308,11 +325,15 @@ class TestCFind:
             results = ops.c_find_studies()
             assert results == []
 
-    def test_c_find_studies_connection_failure(self, ops):
+    def test_c_find_studies_connection_failure_raises(self, ops):
+        """A failed association must raise PacsConnectionError (so the
+        engine can tell "PACS down" from "no studies"), not silently
+        return an empty list."""
+        from core.dicom_ops import PacsConnectionError
         with patch.object(ops.ae, 'associate',
                           side_effect=Exception("Connection refused")):
-            results = ops.c_find_studies()
-            assert results == []
+            with pytest.raises(PacsConnectionError):
+                ops.c_find_studies()
 
     def test_c_find_series_returns_results(self, ops, mock_series_dataset):
         s1 = mock_series_dataset(series_uid="1.1.1.1")
@@ -377,12 +398,15 @@ class TestCMove:
             assert success is True
             assert images == 50
 
-    def test_c_move_series_failure(self, ops):
+    def test_c_move_series_connection_failure_raises(self, ops):
+        """A failed association during C-MOVE must raise
+        PacsConnectionError so the engine aborts the cycle and pops the
+        unreachable warning, rather than reporting a plain failure."""
+        from core.dicom_ops import PacsConnectionError
         with patch.object(ops.ae, 'associate',
                           side_effect=Exception("Connection refused")):
-            success, images = ops.c_move_series("1.1.1", "1.1.1.1")
-            assert success is False
-            assert images == 0
+            with pytest.raises(PacsConnectionError):
+                ops.c_move_series("1.1.1", "1.1.1.1")
 
     def test_c_move_image(self, ops):
         mock_assoc = MagicMock()
@@ -499,11 +523,12 @@ class TestAssociationReleaseOnException:
             mock_assoc.release.assert_called_once()
 
     def test_find_does_not_release_when_assoc_not_established(self, ops):
+        from core.dicom_ops import PacsConnectionError
         mock_assoc = MagicMock()
         mock_assoc.is_established = False
 
         with patch.object(ops.ae, 'associate', return_value=mock_assoc):
-            results = ops.c_find_studies()
-            assert results == []
-            # Nothing to release.
+            with pytest.raises(PacsConnectionError):
+                ops.c_find_studies()
+            # Nothing to release on a non-established association.
             mock_assoc.release.assert_not_called()
