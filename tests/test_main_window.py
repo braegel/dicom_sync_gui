@@ -822,6 +822,78 @@ class TestMainWindowSCP:
         # init path on a dead instance.
         assert ("LOCAL_AE", 11112) not in self.win.storage_scps
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MainWindow — auto-restart retry loop on an unreachable PACS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAutoRestartRetry:
+    """A watchdog-triggered auto-restart must keep retrying (with the
+    siren) when the source PACS is unreachable, instead of aborting like
+    a manual start does."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.win = MainWindow(populated_config)
+
+    def test_unreachable_manual_start_aborts(self):
+        """A normal (non-auto) start to a down PACS aborts: no retry
+        timer, params dropped."""
+        node = self.win.config.remote_nodes["ct"]
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60,
+                   "auto_restart": False}}
+        with patch.object(MainWindow, "_play_siren"), \
+                patch("gui.main_window.QMessageBox"):
+            self.win._on_scp_check_done("ct", False, False, node.to_dict())
+        assert "ct" not in self.win._auto_restart_retry_timers
+        assert "ct" not in self.win._pending_start_params
+
+    def test_unreachable_auto_restart_schedules_retry(self):
+        """An auto-restart to a down PACS sounds the siren, keeps the
+        params, and arms a retry timer instead of aborting."""
+        node = self.win.config.remote_nodes["ct"]
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60,
+                   "auto_restart": True}}
+        with patch.object(MainWindow, "_play_siren") as mock_siren:
+            self.win._on_scp_check_done("ct", False, False, node.to_dict())
+        mock_siren.assert_called_once()
+        assert "ct" in self.win._auto_restart_retry_timers
+        assert "ct" in self.win._pending_start_params
+
+    def test_retry_stops_when_pacs_recovers(self):
+        """Once the PACS answers, the retry loop is cancelled and the
+        engine starts."""
+        node = self.win.config.remote_nodes["ct"]
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60,
+                   "auto_restart": True}}
+        with patch.object(MainWindow, "_play_siren"):
+            self.win._on_scp_check_done("ct", False, False, node.to_dict())
+        assert "ct" in self.win._auto_restart_retry_timers
+
+        # PACS now reachable (local too) → engine starts, loop ends.
+        with patch.object(MainWindow, "_start_engine") as mock_start:
+            self.win._on_scp_check_done("ct", True, True, node.to_dict())
+        assert "ct" not in self.win._auto_restart_retry_timers
+        mock_start.assert_called_once()
+
+    def test_user_stop_cancels_retry(self):
+        """Stopping the service during the retry loop ends it and clears
+        the queued params."""
+        node = self.win.config.remote_nodes["ct"]
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60,
+                   "auto_restart": True}}
+        with patch.object(MainWindow, "_play_siren"):
+            self.win._on_scp_check_done("ct", False, False, node.to_dict())
+        assert "ct" in self.win._auto_restart_retry_timers
+
+        self.win._on_stop_service("ct")
+        assert "ct" not in self.win._auto_restart_retry_timers
+        assert "ct" not in self.win._pending_start_params
+
     @patch("gui.main_window.QMessageBox.warning")
     @patch.object(MainWindow, "_start_engine")
     def test_remote_unreachable_aborts_start_and_warns(

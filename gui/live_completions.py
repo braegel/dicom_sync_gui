@@ -92,6 +92,45 @@ def _format_delay(total_seconds: int) -> str:
     return f"{m}:{s:02d}"
 
 
+def _datetime_sort_key(date_digits: str,
+                       parsed_time: Optional[tuple]) -> str:
+    """Build a lexically-sortable ``YYYYMMDDHHMMSS`` key from a DICOM
+    date (``YYYYMMDD``; may be empty) and a parsed ``(h, m, s)`` tuple.
+
+    The Time Acquired / Download Completed cells only *display* the
+    time of day, so sorting on their text alone would interleave
+    studies from different days.  Sorting on this key instead orders
+    them chronologically.  A missing date sorts before any dated row;
+    a missing time sorts before any timed row within the same date —
+    both edge cases only arise for legacy/test rows that omit a date.
+    """
+    date_part = (date_digits or "").strip()
+    if parsed_time is not None:
+        time_part = (f"{parsed_time[0]:02d}{parsed_time[1]:02d}"
+                     f"{parsed_time[2]:02d}")
+    else:
+        time_part = ""
+    return f"{date_part}{time_part}"
+
+
+class _DateTimeItem(QTableWidgetItem):
+    """Table item whose sort order follows a comparable key stored in
+    ``Qt.UserRole`` rather than its displayed text.
+
+    Used for the Time Acquired / Download Completed columns so they
+    sort by the full ``YYYYMMDDHHMMSS`` timestamp (date + time) while
+    still showing only ``HH:MM:SS``.  Falls back to the default
+    text comparison when either item lacks a key (e.g. an empty
+    placeholder cell)."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        own = self.data(Qt.UserRole)
+        their = other.data(Qt.UserRole)
+        if own is not None and their is not None:
+            return own < their
+        return super().__lt__(other)
+
+
 class LiveCompletionsWindow(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None,
@@ -108,6 +147,12 @@ class LiveCompletionsWindow(QWidget):
         #   2. Stat-colour helpers read the raw values straight from the
         #      cells they're colouring, which is also sort-stable.
         self._setup_ui()
+
+    def set_language(self, language: str) -> None:
+        """Update the window's UI language.  The per-row Copy buttons
+        resolve their localized prefix at click time, so existing rows
+        pick up the new language without rebuilding."""
+        self._language = language
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -224,12 +269,19 @@ class LiveCompletionsWindow(QWidget):
                        study_uid: Optional[str] = None,
                        patient_name: str, study_description: str,
                        study_time: str, completed_time: str,
+                       study_date: str = "", completed_date: str = "",
                        institution_name: str = "",
                        download_duration_seconds: Optional[float] = None,
                        image_count: Optional[int] = None,
                        min_images_threshold: Optional[int] = None,
                        source: str = "") -> None:
         """Add (or aggregate) a completed-study entry.
+
+        *study_date* / *completed_date* (DICOM ``YYYYMMDD``) make the
+        Time Acquired / Download Completed columns sort chronologically
+        across days: the cells show only the time of day, but sorting
+        keys on the full date+time so an exam acquired late yesterday
+        does not sort ahead of one acquired this morning.
 
         *source* names the source PACS the study came from.  Delay /
         duration colour bands and the median-delay readout are computed
@@ -264,6 +316,9 @@ class LiveCompletionsWindow(QWidget):
             if comp is not None else completed_time
         )
 
+        acq_sort = _datetime_sort_key(study_date, acq)
+        comp_sort = _datetime_sort_key(completed_date, comp)
+
         delay_seconds: Optional[float] = None
         if acq and comp:
             delay_seconds = _time_to_seconds(*comp) - _time_to_seconds(*acq)
@@ -297,6 +352,7 @@ class LiveCompletionsWindow(QWidget):
                 self._update_existing_row(
                     existing_row,
                     formatted_comp=formatted_comp,
+                    comp_sort=comp_sort,
                     new_image_count=image_count,
                     new_duration=download_duration_seconds,
                     delay_seconds=delay_seconds,
@@ -327,10 +383,13 @@ class LiveCompletionsWindow(QWidget):
             row, _COL_STUDY_DESC, QTableWidgetItem(study_description))
         self.completions_table.setItem(
             row, _COL_INSTITUTION, QTableWidgetItem(institution_name))
-        self.completions_table.setItem(
-            row, _COL_ACQ, QTableWidgetItem(formatted_acq))
-        self.completions_table.setItem(
-            row, _COL_COMPLETED, QTableWidgetItem(formatted_comp))
+        acq_item = _DateTimeItem(formatted_acq)
+        acq_item.setData(Qt.UserRole, acq_sort)
+        self.completions_table.setItem(row, _COL_ACQ, acq_item)
+
+        comp_item = _DateTimeItem(formatted_comp)
+        comp_item.setData(Qt.UserRole, comp_sort)
+        self.completions_table.setItem(row, _COL_COMPLETED, comp_item)
 
         dur_item = QTableWidgetItem(texts["duration"])
         dur_item.setData(Qt.UserRole, download_duration_seconds)
@@ -388,14 +447,19 @@ class LiveCompletionsWindow(QWidget):
         # so the button fits comfortably inside a table row.
         copy_btn.setStyleSheet(
             "QPushButton { padding: 2px 8px; min-height: 0; }")
-        prefix = tr("image_transfer_completed", self._language)
+        # Resolve the localized prefix at CLICK time (not button-build
+        # time) by reading ``self._language`` inside the slot — so a
+        # language change after the row was added still copies the right
+        # wording, and the window's current language always wins.
         copy_btn.clicked.connect(
-            lambda checked=False, t=formatted_comp, p=prefix:
-                QApplication.clipboard().setText(f"{p}: {t}"))
+            lambda checked=False, t=formatted_comp:
+                QApplication.clipboard().setText(
+                    f"{tr('image_transfer_completed', self._language)}: {t}"))
         self.completions_table.setCellWidget(row, 0, copy_btn)
 
     def _update_existing_row(self, row: int, *,
                              formatted_comp: str,
+                             comp_sort: str,
                              new_image_count: Optional[int],
                              new_duration: Optional[float],
                              delay_seconds: Optional[float]) -> None:
@@ -438,7 +502,12 @@ class LiveCompletionsWindow(QWidget):
             delay_seconds,
         )
 
-        t.item(row, _COL_COMPLETED).setText(formatted_comp)
+        comp_item = t.item(row, _COL_COMPLETED)
+        comp_item.setText(formatted_comp)
+        # Keep the chronological sort key in step with the advanced
+        # completion time (the row may now be a later day than at
+        # insert).
+        comp_item.setData(Qt.UserRole, comp_sort)
 
         dur_item.setText(texts["duration"])
         dur_item.setData(Qt.UserRole,

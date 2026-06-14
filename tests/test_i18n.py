@@ -60,9 +60,9 @@ class TestTranslationLookup:
         assert tr(self.KEY, "en") == "Image transfer completed"
 
     def test_german(self):
-        """German clipboard text must be 'Abschluss Bildübertragung'
+        """German clipboard text must be 'Abschluss Bildeingang'
         (the user pastes this into the 'Befund')."""
-        assert tr(self.KEY, "de") == "Abschluss Bildübertragung"
+        assert tr(self.KEY, "de") == "Abschluss Bildeingang"
 
     def test_french(self):
         assert tr(self.KEY, "fr") == "Transfert d'images terminé"

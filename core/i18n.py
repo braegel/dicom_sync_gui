@@ -30,7 +30,7 @@ _TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "automatically once the PACS is reachable again."),
     },
     "de": {
-        "image_transfer_completed": "Abschluss Bildübertragung",
+        "image_transfer_completed": "Abschluss Bildeingang",
         "pacs_unreachable_title": "PACS nicht erreichbar",
         "pacs_unreachable_msg": (
             "Das Quell-PACS '{name}' ({ip}:{port}) hat nicht auf den "

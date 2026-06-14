@@ -1069,9 +1069,10 @@ class TestPriorsInstitutionFilter:
 
 class TestRetryBlacklist:
     """Small series (1-5 images) sometimes can't be retrieved from the
-    source PACS. The engine currently re-queues them every sync cycle
-    forever. After 2 failed C-MOVE attempts a series must be
-    blacklisted and never re-queried for download."""
+    source PACS. The engine re-queues them every sync cycle forever
+    otherwise. After MAX_SERIES_TRANSFER_ATTEMPTS (3) failed C-MOVE
+    attempts a series must be marked "unavailable": kept in the queue
+    for visibility but never re-attempted."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, populated_config, qapp, tmp_path):
@@ -1147,10 +1148,10 @@ class TestRetryBlacklist:
         assert self.engine._transfer_log.get_series_failure_count(
             source_pacs="ct", series_uid="1.2.3.1") == 2
 
-    def test_blacklisted_series_is_not_queued_on_third_cycle(self):
-        """After 2 failures, a 3rd cycle must NOT build a SeriesJob
-        for the same series — it should be filtered out during
-        _build_study_jobs / _query_source."""
+    def test_blacklisted_series_is_not_retried_on_fourth_cycle(self):
+        """After 3 failures, a 4th cycle must NOT C-MOVE the same
+        series — but it stays in the queue with status 'unavailable'
+        so the user can see it could not be retrieved."""
         study = self._make_study_ds("1.2.3")
         series = self._make_series_ds("1.2.3.1")
         ops = self._mock_ops(study, series, c_move_success=False)
@@ -1159,17 +1160,21 @@ class TestRetryBlacklist:
                           return_value=ops):
             self.engine._run_one_cycle(hours=24, max_images=0)
             self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
             ops.c_move_series.reset_mock()
             self.engine._run_one_cycle(hours=24, max_images=0)
 
         assert ops.c_move_series.call_count == 0, (
             "blacklisted series must not be retried")
-        assert all(j.series_uid != "1.2.3.1"
-                   for j in self.engine._queue)
+        # Still present, but flagged unavailable (not silently dropped).
+        unavailable = [j for j in self.engine._queue
+                       if j.series_uid == "1.2.3.1"]
+        assert len(unavailable) == 1
+        assert unavailable[0].status == "unavailable"
 
     def test_blacklist_does_not_affect_other_series(self):
         """A blacklisted series must not prevent healthy siblings in
-        the same study from being queued."""
+        the same study from being transferred."""
         study = self._make_study_ds("1.2.3")
         bad = self._make_series_ds("1.2.3.bad", num_instances=3)
         good = self._make_series_ds("1.2.3.good", num_instances=300)
@@ -1179,7 +1184,7 @@ class TestRetryBlacklist:
         ops.c_find_series.return_value = [bad, good]
         ops.c_find_local_series.return_value = []
 
-        def c_move_side_effect(study_uid, series_uid):
+        def c_move_side_effect(study_uid, series_uid, progress_cb=None):
             if series_uid == "1.2.3.bad":
                 return (False, 0)
             return (True, 300)
@@ -1189,14 +1194,19 @@ class TestRetryBlacklist:
                           return_value=ops):
             self.engine._run_one_cycle(hours=24, max_images=0)
             self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
             ops.c_move_series.reset_mock()
             self.engine._run_one_cycle(hours=24, max_images=0)
 
         attempted = [call.args[1]
                      for call in ops.c_move_series.call_args_list]
         assert "1.2.3.bad" not in attempted
-        assert all(j.series_uid != "1.2.3.bad"
-                   for j in self.engine._queue)
+        # The bad series stays visible as unavailable; the good one is
+        # done.
+        bad_jobs = [j for j in self.engine._queue
+                    if j.series_uid == "1.2.3.bad"]
+        assert len(bad_jobs) == 1
+        assert bad_jobs[0].status == "unavailable"
 
     def test_successful_transfer_clears_prior_failures(self):
         """If a series previously failed once and then succeeds, the
@@ -1218,13 +1228,12 @@ class TestRetryBlacklist:
             source_pacs="ct", series_uid="1.2.3.1") == 0
 
     def test_preseeded_blacklist_skips_first_cycle(self):
-        """If the DB already says this series has 2 failures from a
+        """If the DB already says this series has 3 failures from a
         previous app session, the very first cycle after restart must
-        not re-query it for transfer."""
-        self.engine._transfer_log.record_series_failure(
-            source_pacs="ct", series_uid="1.2.3.1")
-        self.engine._transfer_log.record_series_failure(
-            source_pacs="ct", series_uid="1.2.3.1")
+        not re-transfer it — it shows up as 'unavailable' instead."""
+        for _ in range(3):
+            self.engine._transfer_log.record_series_failure(
+                source_pacs="ct", series_uid="1.2.3.1")
 
         study = self._make_study_ds("1.2.3")
         series = self._make_series_ds("1.2.3.1")
@@ -1235,8 +1244,10 @@ class TestRetryBlacklist:
             self.engine._run_one_cycle(hours=24, max_images=0)
 
         assert ops.c_move_series.call_count == 0
-        assert all(j.series_uid != "1.2.3.1"
-                   for j in self.engine._queue)
+        jobs = [j for j in self.engine._queue
+                if j.series_uid == "1.2.3.1"]
+        assert len(jobs) == 1
+        assert jobs[0].status == "unavailable"
 
     def test_study_with_blacklisted_series_still_reaches_fully_complete(self):
         """A study with one blacklisted and one healthy series must
@@ -1249,11 +1260,10 @@ class TestRetryBlacklist:
         good = self._make_series_ds("1.2.3.good", num_instances=300)
 
         # Pre-blacklist "bad" so we can test the positive path in a
-        # single cycle rather than orchestrating 3 cycles.
-        self.engine._transfer_log.record_series_failure(
-            source_pacs="ct", series_uid="1.2.3.bad")
-        self.engine._transfer_log.record_series_failure(
-            source_pacs="ct", series_uid="1.2.3.bad")
+        # single cycle rather than orchestrating several cycles.
+        for _ in range(3):
+            self.engine._transfer_log.record_series_failure(
+                source_pacs="ct", series_uid="1.2.3.bad")
 
         ops = MagicMock()
         ops.c_find_studies.return_value = [study]
@@ -1263,7 +1273,7 @@ class TestRetryBlacklist:
 
         received = []
         self.engine.signals.study_completed.connect(
-            lambda uid, inst, full: received.append((uid, full)))
+            lambda uid, inst, full, images: received.append((uid, full)))
 
         with patch.object(self.engine, '_make_dicom_ops',
                           return_value=ops):

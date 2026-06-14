@@ -308,12 +308,13 @@ class DicomOperations:
             assoc.release()
         return results
 
-    def c_move_series(self, study_uid: str, series_uid: str) -> Tuple[bool, int]:
+    def c_move_series(self, study_uid: str, series_uid: str,
+                      progress_cb=None) -> Tuple[bool, int]:
         ds = Dataset()
         ds.QueryRetrieveLevel = 'SERIES'
         ds.StudyInstanceUID = study_uid
         ds.SeriesInstanceUID = series_uid
-        return self._execute_move(ds)
+        return self._execute_move(ds, progress_cb=progress_cb)
 
     def c_move_image(self, study_uid: str, series_uid: str, sop_uid: str) -> Tuple[bool, int]:
         ds = Dataset()
@@ -323,7 +324,13 @@ class DicomOperations:
         ds.SOPInstanceUID = sop_uid
         return self._execute_move(ds)
 
-    def _execute_move(self, query_ds: Dataset) -> Tuple[bool, int]:
+    def _execute_move(self, query_ds: Dataset,
+                      progress_cb=None) -> Tuple[bool, int]:
+        """Run a C-MOVE.  *progress_cb*, if given, is called with the
+        running ``(completed, total)`` image counts each time the remote
+        sends a sub-operation status update — used by the engine's
+        per-image stall watchdog so a slow-but-alive transfer is not
+        mistaken for a wedged one."""
         move_dest = self.move_dest_config.get('ae_title', self.local_config.get('ae_title'))
         success, images = False, 0
         # See _execute_find: PacsConnectionError (PACS unreachable)
@@ -341,6 +348,16 @@ class DicomOperations:
                     status, 'NumberOfCompletedSuboperations', None)
                 if completed is not None:
                     images = completed
+                    if progress_cb is not None:
+                        remaining = getattr(
+                            status, 'NumberOfRemainingSuboperations', 0) or 0
+                        total = completed + remaining
+                        try:
+                            progress_cb(completed, total)
+                        except Exception:
+                            # A misbehaving callback must never abort an
+                            # in-flight transfer.
+                            pass
         except Exception as e:
             logger.error(f"C-MOVE error: {e}")
         finally:

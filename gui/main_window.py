@@ -40,8 +40,9 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox,
     QTabWidget, QLabel, QApplication,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QFont
+from PySide6.QtMultimedia import QSoundEffect
 
 from core.config import AppConfig
 from core.dicom_ops import DicomOperations
@@ -65,6 +66,11 @@ logger = logging.getLogger("dicom_sync")
 # are not added to the Download Completions window — they're too small
 # to be meaningful exam records.
 MIN_IMAGES_FOR_COMPLETIONS_ENTRY = 10
+
+# When a watchdog-triggered auto-restart finds the source PACS
+# unreachable, retry the reachability probe this often (ms) — sounding
+# the siren each time — until the PACS answers and the engine starts.
+_AUTO_RESTART_RETRY_MS = 5_000
 
 
 class MainWindow(QMainWindow):
@@ -100,6 +106,14 @@ class MainWindow(QMainWindow):
         # so a second queued signal for the same source can't stack a
         # duplicate modal dialog behind the first.
         self._connection_lost_open: Set[str] = set()
+        # remote_key → QTimer driving the auto-restart reachability
+        # retry loop: when a watchdog-triggered restart hits an
+        # unreachable PACS, we keep probing every
+        # _AUTO_RESTART_RETRY_MS (with the siren alarm) instead of
+        # aborting, until the PACS answers.
+        self._auto_restart_retry_timers: Dict[str, QTimer] = {}
+        # Lazy, single long-lived QSoundEffect for the recurring siren.
+        self._siren_effect: Optional[QSoundEffect] = None
 
         self.setWindowTitle("DICOM Sync")
         self.setMinimumSize(1000, 750)
@@ -125,11 +139,27 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _prewarm_sounds() -> None:
         try:
-            from gui.notification_sound import _generate_default_sound
+            from gui.notification_sound import (
+                _generate_default_sound, _generate_siren_sound)
             _generate_default_sound(sad=False)
             _generate_default_sound(sad=True)
+            _generate_siren_sound()
         except Exception as e:
             logger.debug(f"Notification prewarm failed: {e}")
+
+    def _play_siren(self) -> None:
+        """Play the recurring PACS-unreachable siren via a single
+        long-lived QSoundEffect (lazy-created on first use)."""
+        try:
+            from gui.notification_sound import _generate_siren_sound
+            path = _generate_siren_sound()
+            if self._siren_effect is None:
+                self._siren_effect = QSoundEffect(self)
+            self._siren_effect.stop()
+            self._siren_effect.setSource(QUrl.fromLocalFile(path))
+            self._siren_effect.play()
+        except Exception as e:
+            logger.debug(f"Siren playback failed: {e}")
 
     # ── Menu ──────────────────────────────────────────────────────────────
 
@@ -245,6 +275,10 @@ class MainWindow(QMainWindow):
         if dlg.exec() == SettingsDialog.Accepted:
             # Rebuild tabs to reflect added/removed sources
             self._rebuild_tabs()
+            # Propagate a possibly-changed UI language to the live
+            # completions window so its Copy buttons use the new wording.
+            self.completions_window.set_language(
+                getattr(self.config, "language", "en"))
             self._log("Settings saved.")
 
     def _open_filter_groups(self) -> None:
@@ -348,7 +382,8 @@ class MainWindow(QMainWindow):
             if not engine.is_running:
                 continue
             for job in engine.queue_snapshot():
-                if job.status not in ("done", "error", "skipped"):
+                if job.status not in (
+                        "done", "error", "skipped", "unavailable"):
                     total_pending += job.to_transfer
             total_ipm += engine.stats.raw_images_per_minute()
         self.completions_window.update_transfer_progress(
@@ -378,12 +413,15 @@ class MainWindow(QMainWindow):
         first = study_jobs[0]
         wall_clock = engine.pop_study_wall_clock(study_uid)
         total_images = sum(j.transferred_images for j in study_jobs)
+        now = datetime.now()
         self.completions_window.add_completion(
             study_uid=study_uid,
             patient_name=first.patient_name,
             study_description=first.study_description,
             study_time=first.study_time,
-            completed_time=datetime.now().strftime("%H:%M:%S"),
+            study_date=first.study_date,
+            completed_time=now.strftime("%H:%M:%S"),
+            completed_date=now.strftime("%Y%m%d"),
             institution_name=first.institution_name,
             download_duration_seconds=wall_clock,
             image_count=total_images,
@@ -443,10 +481,25 @@ class MainWindow(QMainWindow):
 
     def _on_stop_service(self, remote_key: str) -> None:
         """Stop the download service for one source PACS."""
+        # Abort any in-flight auto-restart retry loop: during it the
+        # engine is already stopped, so the user pressing Stop must end
+        # the retry/siren too (and drop its queued start params).
+        was_retrying = remote_key in self._auto_restart_retry_timers
+        self._stop_auto_restart_retry(remote_key)
+        self._pending_start_params.pop(remote_key, None)
         engine = self.engines.get(remote_key)
         if engine and engine.is_running:
             engine.stop()
             self._log(f"Stopping service: {remote_key}...")
+        elif was_retrying:
+            # No live engine — the Stop ended a retry loop only.  Put the
+            # dashboard back to its idle state (no service_stopped signal
+            # will arrive to do it for us).
+            self._log(
+                f"Auto-restart for {remote_key} cancelled by user.")
+            dashboard = self.dashboards.get(remote_key)
+            if dashboard:
+                dashboard.set_service_running(False)
 
     def _on_service_stopped(self, remote_key: str,
                             engine: Optional[TransferEngine] = None) -> None:
@@ -566,8 +619,27 @@ class MainWindow(QMainWindow):
             return
 
         if not remote_reachable:
-            # Source PACS down — abort the start, tell the user, and
-            # leave the dashboard back in its idle ("Stopped") state.
+            # Auto-restart (watchdog) path: the PACS is often just slow,
+            # which is exactly what triggered the restart.  Don't abort —
+            # keep probing every _AUTO_RESTART_RETRY_MS, sounding the
+            # siren each time, until it answers.
+            if self._pending_start_params.get(
+                    remote_key, {}).get("auto_restart"):
+                self._log(
+                    f"Source PACS [{node.ae_title}@{node.ip_address}:"
+                    f"{node.port}] still unreachable for {remote_key} — "
+                    f"auto-restart retrying in "
+                    f"{_AUTO_RESTART_RETRY_MS // 1000}s.")
+                self._play_siren()
+                dashboard = self.dashboards.get(remote_key)
+                if dashboard:
+                    dashboard.show_awaiting_pacs(
+                        f"PACS nicht erreichbar — neuer Versuch in "
+                        f"{_AUTO_RESTART_RETRY_MS // 1000}s…")
+                self._schedule_auto_restart_retry(remote_key)
+                return
+            # Manual start: abort, tell the user, and leave the dashboard
+            # back in its idle ("Stopped") state.
             self._pending_start_params.pop(remote_key, None)
             self._log(
                 f"Source PACS [{node.ae_title}@{node.ip_address}:"
@@ -627,9 +699,40 @@ class MainWindow(QMainWindow):
                     f"not reachable for {remote_key}. "
                     f"No fallback folder configured.")
 
+        # PACS answered — cancel any pending auto-restart retry loop and
+        # silence the siren before bringing the engine up.
+        self._stop_auto_restart_retry(remote_key)
         # Now start the engine
         params = self._pending_start_params.pop(remote_key, {})
         self._start_engine(remote_key, params)
+
+    def _schedule_auto_restart_retry(self, remote_key: str) -> None:
+        """Re-run the reachability probe for *remote_key* after
+        _AUTO_RESTART_RETRY_MS.  The start params stay in
+        ``_pending_start_params`` so the retry reuses them; the loop ends
+        when the PACS becomes reachable (``_on_scp_check_done`` calls
+        ``_stop_auto_restart_retry``) or the user stops the service."""
+        # Don't retry a source the user already stopped / removed.
+        if remote_key not in self._pending_start_params:
+            return
+        timer = self._auto_restart_retry_timers.get(remote_key)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(
+                lambda rk=remote_key: self._ensure_storage_scp_for(rk))
+            self._auto_restart_retry_timers[remote_key] = timer
+        timer.start(_AUTO_RESTART_RETRY_MS)
+
+    def _stop_auto_restart_retry(self, remote_key: str) -> None:
+        """Cancel the auto-restart retry timer for *remote_key* and stop
+        the siren if no other source is still retrying."""
+        timer = self._auto_restart_retry_timers.pop(remote_key, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        if not self._auto_restart_retry_timers and self._siren_effect:
+            self._siren_effect.stop()
 
     def _on_fallback_image_received(self, scp_key: Tuple[str, int]) -> None:
         """Log built-in SCP receive progress, throttled so a large
@@ -659,6 +762,9 @@ class MainWindow(QMainWindow):
             lambda uid, inst, full, images, eng=engine, rk=remote_key:
                 self._on_study_completed_live(eng, uid, full, source=rk))
         e.signals.series_started.connect(dashboard.on_series_started)
+        e.signals.series_progress.connect(dashboard.on_series_progress)
+        e.signals.series_completed.connect(dashboard.on_series_completed)
+        e.signals.series_error.connect(dashboard.on_series_error)
         e.signals.stats_updated.connect(dashboard.on_stats_updated)
         # Forward queue/stats to the completions-window ETE countdown
         e.signals.queue_updated.connect(
@@ -685,8 +791,11 @@ class MainWindow(QMainWindow):
             self._on_unknown_institution)
         # Connection lost / restored during a running service
         e.signals.connection_lost.connect(self._on_connection_lost)
+        e.signals.connection_lost.connect(dashboard.on_connection_lost)
         e.signals.connection_restored.connect(
             self._on_connection_restored)
+        e.signals.connection_restored.connect(
+            dashboard.on_connection_restored)
 
     # ── Unknown institution handling ──────────────────────────────────────
 
@@ -776,6 +885,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Waiting for current downloads to finish...")
             self._join_engines_responsive(total_timeout=30)
+
+        # Stop any auto-restart retry loops and silence the siren so a
+        # pending QTimer can't fire into a half-torn-down window.
+        for rk in list(self._auto_restart_retry_timers):
+            self._stop_auto_restart_retry(rk)
 
         for scp in self.storage_scps.values():
             if scp.running:

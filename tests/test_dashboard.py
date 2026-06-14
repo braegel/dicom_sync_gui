@@ -1408,6 +1408,42 @@ class TestSadSoundGeneration:
             f"Normal second tone ({_NORMAL_FREQ_2} Hz) should be above A5 (880 Hz)")
 
 
+class TestSirenSoundGeneration:
+    """The PACS-unreachable siren is a distinct alarm from the chimes."""
+
+    def test_siren_generates_wav(self):
+        from gui.notification_sound import _generate_siren_sound
+        path = _generate_siren_sound()
+        assert path.endswith(".wav")
+        assert os.path.exists(path)
+
+    def test_siren_differs_from_chime(self):
+        """Siren WAV data must differ from the completion chime so the
+        user can tell the alarms apart."""
+        import gui.notification_sound as mod
+        from gui.notification_sound import (
+            _generate_siren_sound, _generate_default_sound)
+        mod._default_sound_path = None
+        mod._siren_sound_path = None
+        chime = _generate_default_sound(sad=True)
+        siren = _generate_siren_sound()
+        assert chime != siren
+        with open(chime, "rb") as f:
+            chime_data = f.read()
+        with open(siren, "rb") as f:
+            siren_data = f.read()
+        assert chime_data != siren_data
+
+    def test_siren_is_cached(self):
+        """Repeated calls return the same cached file."""
+        import gui.notification_sound as mod
+        from gui.notification_sound import _generate_siren_sound
+        mod._siren_sound_path = None
+        first = _generate_siren_sound()
+        second = _generate_siren_sound()
+        assert first == second
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Config — PacsNode notification sound fields
 # ═══════════════════════════════════════════════════════════════════════════

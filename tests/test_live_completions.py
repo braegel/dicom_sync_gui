@@ -1368,6 +1368,122 @@ class TestSortableColumns:
             f"got {order}")
 
 
+class TestTimeColumnsSortByDate:
+    """The Time Acquired / Download Completed columns display only the
+    time of day but must sort by the full date+time, so studies from
+    different days end up in chronological order — not interleaved by
+    time-of-day."""
+
+    def test_acquired_sorts_chronologically_across_days(self, window):
+        """Earlier day must sort before a later day even when its
+        time-of-day is *later* (a naive text sort would invert them)."""
+        # Yesterday 23:00 — earlier instant, but later clock time.
+        window.add_completion(
+            patient_name="Yesterday", study_description="CT",
+            study_date="20260610", study_time="230000",
+            completed_date="20260610", completed_time="23:10:00",
+            institution_name="X",
+        )
+        # Today 08:00 — later instant, but earlier clock time.
+        window.add_completion(
+            patient_name="Today", study_description="CT",
+            study_date="20260611", study_time="080000",
+            completed_date="20260611", completed_time="08:10:00",
+            institution_name="X",
+        )
+        acq_col = _column_index_for_header(window, "acquired")
+        patient_col = _column_index_for_header(window, "patient")
+        assert acq_col >= 0
+
+        window.completions_table.sortByColumn(acq_col, Qt.AscendingOrder)
+
+        order = [window.completions_table.item(r, patient_col).text()
+                 for r in range(window.completions_table.rowCount())]
+        assert order == ["Yesterday", "Today"], (
+            "ascending acquired-time sort must order by date+time, "
+            f"not by clock time alone; got {order}")
+
+    def test_completed_sorts_chronologically_across_days(self, window):
+        window.add_completion(
+            patient_name="Yesterday", study_description="CT",
+            study_date="20260610", study_time="100000",
+            completed_date="20260610", completed_time="23:00:00",
+            institution_name="X",
+        )
+        window.add_completion(
+            patient_name="Today", study_description="CT",
+            study_date="20260611", study_time="100000",
+            completed_date="20260611", completed_time="07:00:00",
+            institution_name="X",
+        )
+        comp_col = _column_index_for_header(window, "completed")
+        patient_col = _column_index_for_header(window, "patient")
+        assert comp_col >= 0
+
+        window.completions_table.sortByColumn(comp_col, Qt.AscendingOrder)
+
+        order = [window.completions_table.item(r, patient_col).text()
+                 for r in range(window.completions_table.rowCount())]
+        assert order == ["Yesterday", "Today"]
+
+    def test_same_day_still_sorts_by_time(self, window):
+        """Within one day the time of day still decides the order."""
+        for name, t in (("Late", "14:00:00"), ("Early", "08:00:00")):
+            window.add_completion(
+                patient_name=name, study_description="CT",
+                study_date="20260611", study_time=t.replace(":", ""),
+                completed_date="20260611", completed_time=t,
+                institution_name="X",
+            )
+        acq_col = _column_index_for_header(window, "acquired")
+        patient_col = _column_index_for_header(window, "patient")
+
+        window.completions_table.sortByColumn(acq_col, Qt.AscendingOrder)
+
+        order = [window.completions_table.item(r, patient_col).text()
+                 for r in range(window.completions_table.rowCount())]
+        assert order == ["Early", "Late"]
+
+    def test_aggregation_updates_completed_sort_key(self, window):
+        """A repeat emit that advances the completion into a new day
+        must move the row chronologically, not keep the stale key."""
+        # Row created "yesterday".
+        window.add_completion(
+            study_uid="U1", patient_name="Rolling", study_description="CT",
+            study_date="20260610", study_time="100000",
+            completed_date="20260610", completed_time="23:50:00",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0, source="P1",
+        )
+        # Second row, genuinely today.
+        window.add_completion(
+            study_uid="U2", patient_name="Fresh", study_description="CT",
+            study_date="20260611", study_time="100000",
+            completed_date="20260611", completed_time="08:00:00",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0, source="P1",
+        )
+        # U1 gets a second wave that completes after midnight (today,
+        # later than Fresh).
+        window.add_completion(
+            study_uid="U1", patient_name="Rolling", study_description="CT",
+            study_date="20260610", study_time="100000",
+            completed_date="20260611", completed_time="09:00:00",
+            institution_name="X", image_count=50,
+            download_duration_seconds=10.0, source="P1",
+        )
+        comp_col = _column_index_for_header(window, "completed")
+        patient_col = _column_index_for_header(window, "patient")
+
+        window.completions_table.sortByColumn(comp_col, Qt.AscendingOrder)
+
+        order = [window.completions_table.item(r, patient_col).text()
+                 for r in range(window.completions_table.rowCount())]
+        assert order == ["Fresh", "Rolling"], (
+            "Rolling completed at 09:00 today, after Fresh at 08:00; "
+            "its sort key must follow the advanced completion time")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Copy button localization — clipboard text in the configured language
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1416,11 +1532,11 @@ class TestCopyButtonLocalization:
             win.close()
 
     def test_german(self, qapp):
-        """Clipboard format in German: 'Abschluss Bildübertragung: HH:MM:SS'."""
+        """Clipboard format in German: 'Abschluss Bildeingang: HH:MM:SS'."""
         win = self._make_window(qapp, "de")
         try:
             assert self._add_row_and_click(win) == \
-                "Abschluss Bildübertragung: 08:15:30"
+                "Abschluss Bildeingang: 08:15:30"
         finally:
             win.close()
 
@@ -1446,6 +1562,24 @@ class TestCopyButtonLocalization:
         try:
             assert self._add_row_and_click(win) == \
                 "Image transfer completed: 08:15:30"
+        finally:
+            win.close()
+
+    def test_set_language_changes_existing_row(self, qapp):
+        """A language switch after a row was added must change what its
+        Copy button copies — the prefix resolves at click time."""
+        win = self._make_window(qapp, "en")
+        try:
+            win.add_completion(
+                patient_name="A", study_description="CT",
+                study_time="080000", completed_time="08:15:30",
+                institution_name="X",
+            )
+            win.set_language("de")
+            QApplication.clipboard().clear()
+            _find_copy_button(win, row=0).click()
+            assert QApplication.clipboard().text().strip() == \
+                "Abschluss Bildeingang: 08:15:30"
         finally:
             win.close()
 

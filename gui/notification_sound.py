@@ -25,9 +25,16 @@ import wave
 
 _default_sound_path: str | None = None
 _sad_sound_path: str | None = None
+_siren_sound_path: str | None = None
 
 _NORMAL_FREQ_2 = 1174  # D6 — ascending interval from A5
 _SAD_FREQ_2 = 660      # E5 — descending interval from A5
+
+# Siren sweep bounds (Hz) for the PACS-unreachable alarm.  A wailing
+# up/down glissando, deliberately distinct from the two-tone chimes so
+# the user can tell "can't reach the PACS" apart from "slow download".
+_SIREN_LOW = 600
+_SIREN_HIGH = 1200
 
 
 def _remove_quietly(path: str) -> None:
@@ -93,4 +100,55 @@ def _generate_default_sound(sad: bool = False) -> str:
         _sad_sound_path = path
     else:
         _default_sound_path = path
+    return path
+
+
+def _generate_siren_sound() -> str:
+    """Generate a wailing two-cycle siren WAV and return its path.
+
+    A continuous sine whose frequency sweeps _SIREN_LOW ↔ _SIREN_HIGH
+    twice — used as the recurring PACS-unreachable alarm, distinct from
+    the chime tones so the user recognises it instantly.  Cached at
+    module level like the chimes (generated at most once per run)."""
+    global _siren_sound_path
+    if _siren_sound_path and os.path.exists(_siren_sound_path):
+        return _siren_sound_path
+
+    sample_rate = 44100
+    duration = 1.4          # two ~0.7 s wails
+    cycles = 2.0            # number of low→high→low sweeps
+    n_samples = int(sample_rate * duration)
+    mid = (_SIREN_LOW + _SIREN_HIGH) / 2.0
+    half_span = (_SIREN_HIGH - _SIREN_LOW) / 2.0
+
+    raw = []
+    phase = 0.0
+    for i in range(n_samples):
+        t = i / sample_rate
+        # Triangle-ish sweep via a sine LFO on the frequency.
+        freq = mid + half_span * math.sin(
+            2 * math.pi * cycles * t / duration)
+        phase += 2 * math.pi * freq / sample_rate
+        # Short fade in/out so the loop edges don't click.
+        if t < 0.02:
+            amp = t / 0.02
+        elif t > duration - 0.02:
+            amp = max(0.0, (duration - t) / 0.02)
+        else:
+            amp = 1.0
+        val = 0.35 * amp * math.sin(phase)
+        raw.append(int(max(-1.0, min(1.0, val)) * 32767))
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack(f"<{len(raw)}h", *raw))
+
+    fd, path = tempfile.mkstemp(suffix=".wav", prefix="dicom_siren_")
+    os.write(fd, buf.getvalue())
+    os.close(fd)
+    atexit.register(_remove_quietly, path)
+    _siren_sound_path = path
     return path

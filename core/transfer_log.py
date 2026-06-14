@@ -348,7 +348,7 @@ class TransferLog:
 
     def is_series_blacklisted(self, *, source_pacs: str,
                               series_uid: str,
-                              max_attempts: int = 2) -> bool:
+                              max_attempts: int = 3) -> bool:
         return self.get_series_failure_count(
             source_pacs=source_pacs,
             series_uid=series_uid) >= max_attempts

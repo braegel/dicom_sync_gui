@@ -768,8 +768,12 @@ class TestSeriesFailureTracking:
         assert log.get_series_failure_count(
             source_pacs="mr_scanner", series_uid="1.2.3") == 2
 
-    def test_is_series_blacklisted_default_threshold_is_two(self, log):
-        """Blacklist after the 2nd failed attempt."""
+    def test_is_series_blacklisted_default_threshold_is_three(self, log):
+        """Blacklist after the 3rd failed attempt."""
+        assert log.is_series_blacklisted(
+            source_pacs="ct_scanner", series_uid="1.2.3") is False
+        log.record_series_failure(
+            source_pacs="ct_scanner", series_uid="1.2.3")
         assert log.is_series_blacklisted(
             source_pacs="ct_scanner", series_uid="1.2.3") is False
         log.record_series_failure(
@@ -822,6 +826,11 @@ class TestSeriesFailureTracking:
         try:
             assert tl2.get_series_failure_count(
                 source_pacs="ct_scanner", series_uid="1.2.3") == 2
+            # Two failures is below the default threshold of 3, but a
+            # third (re-)failure after reopen must tip it over —
+            # proving the count persisted.
+            tl2.record_series_failure(
+                source_pacs="ct_scanner", series_uid="1.2.3")
             assert tl2.is_series_blacklisted(
                 source_pacs="ct_scanner", series_uid="1.2.3") is True
         finally:

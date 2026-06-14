@@ -40,7 +40,9 @@ class SeriesJob:
     series_uid: str = ""
     remote_count: int = 0
     local_count: int = 0
-    status: str = "queued"  # queued, transferring, done, error, skipped
+    # queued, transferring, done, error, skipped, unavailable
+    # ("unavailable" = retry budget exhausted, will not be fetched again)
+    status: str = "queued"
     institution_name: str = ""
     accession_number: str = ""
     images_per_minute: float = 0.0
@@ -94,6 +96,12 @@ class SeriesCompletionRecord:
 # silently suppress the Download Completions entry for everything else
 # that did arrive.
 SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION = 6
+
+# A series is retried at most this many times before it is marked
+# permanently unavailable (status "unavailable").  Small series that
+# fail to transfer for DICOM-level reasons would otherwise be retried
+# every cycle forever.
+MAX_SERIES_TRANSFER_ATTEMPTS = 3
 
 # Series whose description matches this pattern (case-insensitive,
 # "ax" at a word start: "Axial", "ax 3mm", "T2 ax" — but NOT "Thorax")
@@ -312,6 +320,12 @@ class TransferEngine:
         self._selected_uids: Set[str] = set()
         self._completed_patients: Set[str] = set()
         self._completed_studies: Set[str] = set()
+        # study_uids that have ALREADY played their completion chime.
+        # Unlike ``_completed_studies`` (cleared every cycle), this
+        # persists for the engine's lifetime so a study that gets
+        # re-queried and re-completes (local-PACS count lag) chimes only
+        # once.
+        self._chimed_studies: Set[str] = set()
         self._transfer_log = (transfer_log if transfer_log is not None
                               else TransferLog(default_db_path()))
         # study_uid → accumulated transfer seconds of the study's OWN
@@ -586,6 +600,10 @@ class TransferEngine:
         for job in jobs:
             if self._cancel.is_set():
                 break
+            # Series that exhausted their retry budget are kept in the
+            # queue for visibility but never transferred again.
+            if job.status == "unavailable":
+                continue
             try:
                 total_images += self._transfer_series(job, dicom_ops)
             except PacsConnectionError as e:
@@ -836,15 +854,6 @@ class TransferEngine:
 
         series_list = dicom_ops.c_find_series(study_uid)
 
-        # Exclude blacklisted series: they will never be fetched, so
-        # they must not appear in the queue.
-        series_list = [
-            ser for ser in series_list
-            if not self._transfer_log.is_series_blacklisted(
-                source_pacs=self.remote_key,
-                series_uid=getattr(ser, 'SeriesInstanceUID', ''))
-        ]
-
         # InstitutionName fallback: read from first series
         if not institution and series_list:
             institution = str(
@@ -882,6 +891,14 @@ class TransferEngine:
                 continue
 
             seen_series.add(series_uid)
+            # Series that already failed MAX_SERIES_TRANSFER_ATTEMPTS
+            # times stay visible in the queue with an "unavailable"
+            # status instead of being re-attempted forever — small
+            # series often fail to transfer for DICOM-level reasons.
+            blacklisted = self._transfer_log.is_series_blacklisted(
+                source_pacs=self.remote_key,
+                series_uid=series_uid,
+                max_attempts=MAX_SERIES_TRANSFER_ATTEMPTS)
             jobs.append(SeriesJob(
                 patient_name=patient_name,
                 patient_id=patient_id,
@@ -897,6 +914,7 @@ class TransferEngine:
                 accession_number=accession,
                 study_date=study_date,
                 study_time=study_time,
+                status="unavailable" if blacklisted else "queued",
             ))
         return jobs
 
@@ -926,11 +944,24 @@ class TransferEngine:
 
     def _do_move(self, dicom_ops: DicomOperations,
                  job: SeriesJob) -> Tuple[bool, int, float]:
-        """Run the C-MOVE.  Returns (success, images, elapsed)."""
+        """Run the C-MOVE.  Returns (success, images, elapsed).
+
+        Emits ``series_progress`` on each sub-operation update so the
+        GUI's per-image stall watchdog sees that the transfer is still
+        alive (it re-arms its timeout on every emit)."""
         t_start = time.time()
+
+        def _on_progress(completed: int, total: int) -> None:
+            try:
+                self.signals.series_progress.emit(
+                    job.series_uid, completed, total)
+            except RuntimeError:
+                # Signals QObject torn down during shutdown — see _log.
+                pass
+
         try:
             success, images = dicom_ops.c_move_series(
-                job.study_uid, job.series_uid)
+                job.study_uid, job.series_uid, progress_cb=_on_progress)
         except PacsConnectionError:
             # PACS unreachable — let _transfer_queue abort the cycle
             # and raise the one-per-outage connection_lost popup.
@@ -1019,7 +1050,7 @@ class TransferEngine:
                         if j.study_uid == study_uid]
         if not study_series:
             return
-        if all(j.status in ("done", "error", "skipped")
+        if all(j.status in ("done", "error", "skipped", "unavailable")
                for j in study_series):
             self._completed_studies.add(study_uid)
             institution = study_series[0].institution_name
@@ -1064,10 +1095,29 @@ class TransferEngine:
             def _ok_for_completion(j: SeriesJob) -> bool:
                 if j.status == "done":
                     return True
+                # An "unavailable" series exhausted its retry budget;
+                # it can never arrive, so it must not block the study's
+                # fully_complete signal — same treatment as a small
+                # error/skipped series.
+                if j.status == "unavailable":
+                    return True
                 return j.remote_count < SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION
 
             fully_complete = all(_ok_for_completion(j)
                                  for j in study_series)
+            # Suppress a duplicate "study complete" chime: a study that
+            # was already fully downloaded in an earlier cycle can be
+            # re-queried (the local PACS lags in reporting its counts) or
+            # re-run after an auto-restart, complete instantly with a
+            # no-op C-MOVE, and would otherwise chime every cycle.  We
+            # chime only the FIRST time a study reports fully_complete;
+            # ``_chimed_studies`` persists across cycles (unlike
+            # ``_completed_studies``, which is cleared each cycle).
+            if fully_complete:
+                if study_uid in self._chimed_studies:
+                    fully_complete = False
+                else:
+                    self._chimed_studies.add(study_uid)
             self.signals.study_completed.emit(
                 study_uid, institution, fully_complete, total_images)
 
@@ -1080,7 +1130,7 @@ class TransferEngine:
                           if j.patient_id == patient_id]
         if not patient_series:
             return
-        if all(j.status in ("done", "error", "skipped")
+        if all(j.status in ("done", "error", "skipped", "unavailable")
                for j in patient_series):
             self._completed_patients.add(patient_id)
             institution = patient_series[0].institution_name
@@ -1217,6 +1267,10 @@ class TransferEngine:
                     remote_count, local_count, max_images):
                 continue
             seen_series.add(series_uid)
+            blacklisted = self._transfer_log.is_series_blacklisted(
+                source_pacs=self.remote_key,
+                series_uid=series_uid,
+                max_attempts=MAX_SERIES_TRANSFER_ATTEMPTS)
             jobs.append(SeriesJob(
                 patient_name=ps_name,
                 patient_id=pid,
@@ -1231,6 +1285,7 @@ class TransferEngine:
                 study_date=ps_date,
                 study_time=ps_time,
                 is_prior=True,
+                status="unavailable" if blacklisted else "queued",
             ))
         return jobs
 

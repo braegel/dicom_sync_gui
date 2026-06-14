@@ -91,6 +91,17 @@ SPEED_BAND_RATIO = 0.2
 STATS_REFRESH_MS = 2000
 # Debounce window for coalescing config writes from UI events (ms)
 CONFIG_SAVE_DEBOUNCE_MS = 500
+# How long a single image may stall before the slow-transfer watchdog
+# fires a sad-sound + popup + auto-restart (ms).  The watchdog re-arms
+# on every per-image progress tick (series_progress), so this is a
+# per-image stall timeout, NOT a per-series budget: it only fires when
+# no single image arrives for this long, which means the transfer is
+# genuinely wedged rather than merely slow on a large series.
+_SLOW_TRANSFER_TIMEOUT_MS = 10_000
+
+# Statuses a series can no longer leave: it contributes no pending
+# images and gets no ETE.  "unavailable" = retry budget exhausted.
+_TERMINAL_STATUSES = ("done", "error", "skipped", "unavailable")
 
 # Palette.  Green/yellow/red are defined in gui.study_rate (single
 # source of truth, shared with the studies-per-hour colour bands) and
@@ -189,6 +200,11 @@ class SourceDashboard(QWidget):
         # effective settings.
         self._restart_pending = False
         self._restart_params: Optional[ServiceParams] = None
+        # True when the pending restart was triggered by the slow-transfer
+        # watchdog (not the manual Restart button).  The auto-start path
+        # forwards this so MainWindow keeps retrying-with-siren on an
+        # unreachable PACS instead of aborting the start.
+        self._restart_is_auto = False
         self._last_high_load_groups: set = set()
         # Set True while _setup_ui runs so any toggled signal fired by
         # setChecked() during construction is ignored — those would
@@ -203,6 +219,21 @@ class SourceDashboard(QWidget):
         # Deferred init solves both: one instance, but only when the
         # first sound actually plays.
         self._sound_effect: Optional[QSoundEffect] = None
+        # series_uid of the currently active transfer (set by
+        # on_series_started, cleared by on_series_completed /
+        # on_series_error).  The slow-transfer watchdog uses this to
+        # include the series UID in its log/popup.
+        self._active_series_uid: Optional[str] = None
+        # Images the active transfer has received so far (from the latest
+        # series_progress emit).  Lets the Pending / ETE columns count
+        # down live between queue/stats emits instead of jumping only
+        # when a whole series completes.
+        self._active_series_done: int = 0
+        # True while the engine has reported a PACS connection outage
+        # (connection_lost) and not yet recovered (connection_restored).
+        # The slow-transfer watchdog skips the auto-restart in this state
+        # because the engine recovers automatically without help.
+        self._pacs_connection_lost: bool = False
         self._setup_ui()
 
         # Refresh stats display every 2 seconds
@@ -225,6 +256,25 @@ class SourceDashboard(QWidget):
         self._restart_safety_timer.setSingleShot(True)
         self._restart_safety_timer.timeout.connect(
             self._on_restart_safety_timeout)
+
+        # Slow-transfer watchdog: fires when a single image download
+        # takes longer than _SLOW_TRANSFER_TIMEOUT_MS without completing.
+        # Plays the sad sound, shows a non-modal popup, and auto-restarts
+        # the service so a wedged C-MOVE doesn't block the queue forever.
+        self._slow_transfer_timer = QTimer(self)
+        self._slow_transfer_timer.setSingleShot(True)
+        self._slow_transfer_timer.timeout.connect(
+            self._on_slow_transfer_detected)
+
+        # 1 Hz live refresh of the Pending / ETE columns so they count
+        # down every second during an active transfer instead of only
+        # jumping when a queue/stats signal arrives.  Runs only while a
+        # transfer is active (started/stopped in on_series_started /
+        # on_series_completed / on_series_error).
+        self._live_refresh_timer = QTimer(self)
+        self._live_refresh_timer.setInterval(1000)
+        self._live_refresh_timer.timeout.connect(
+            self._refresh_pending_and_ete)
 
     def _save_config_debounced(self) -> None:
         """Schedule a config save 500ms in the future; coalesces bursts."""
@@ -660,7 +710,7 @@ class SourceDashboard(QWidget):
             self._settings_dirty = True
             self.restart_banner.setVisible(True)
 
-    def _on_start_clicked(self) -> None:
+    def _on_start_clicked(self, auto_restart: bool = False) -> None:
         self._settings_dirty = False
         self.restart_banner.setVisible(False)
         # Save per-source params to config (immediate — user-intent
@@ -672,6 +722,12 @@ class SourceDashboard(QWidget):
             node.sync_interval = self.interval_spin.value()
             self.flush_pending_save()
         params = self._current_service_params().to_dict()
+        # When the start comes from the slow-transfer watchdog's
+        # auto-restart, MainWindow must keep retrying (with the siren
+        # alarm) instead of aborting if the PACS reachability probe
+        # fails — the PACS is often just slow, which is what triggered
+        # the restart in the first place.
+        params["auto_restart"] = auto_restart
         # Give the user immediate feedback during the startup window;
         # MainWindow may take a moment to bring the engine up.
         self.lbl_status.setText("Starting service…")
@@ -682,11 +738,16 @@ class SourceDashboard(QWidget):
         self.restart_banner.setVisible(False)
         self.stop_requested.emit(self.remote_key)
 
-    def _on_restart_clicked(self) -> None:
+    def _on_restart_clicked(self, auto_restart: bool = False) -> None:
         """Stop the service and start it again as soon as it has
         actually stopped.  The two-phase flow piggybacks on the
         existing stop/start signals — no new wiring needed in
         MainWindow.
+
+        *auto_restart* marks a watchdog-triggered restart (vs. the
+        manual Restart button).  It is forwarded to the auto-start path
+        so MainWindow keeps retrying-with-siren on an unreachable PACS
+        instead of aborting.
 
         Idempotent: a second click while a restart is already pending
         is a no-op; we never re-emit stop_requested because the
@@ -708,6 +769,7 @@ class SourceDashboard(QWidget):
         if self._restart_pending:
             return
         self._restart_pending = True
+        self._restart_is_auto = auto_restart
         self._restart_params = self._current_service_params()
         self.lbl_status.setText("Restarting…")
         # 60 s = 2 × the closeEvent join timeout in MainWindow; if
@@ -739,6 +801,15 @@ class SourceDashboard(QWidget):
             selection_mode=self.manual_selection_check.isChecked(),
         )
 
+    def show_awaiting_pacs(self, message: str) -> None:
+        """Put the dashboard into the auto-restart waiting state: the
+        engine is stopped while MainWindow keeps probing an unreachable
+        PACS, but the user must still be able to Stop the loop, so keep
+        the Stop button live and show *message*."""
+        self._service_running = True
+        self._apply_control_enabled(True)
+        self.lbl_status.setText(message)
+
     def set_service_running(self, running: bool) -> None:
         self._service_running = running
         self._apply_control_enabled(running)
@@ -754,6 +825,11 @@ class SourceDashboard(QWidget):
         self.lbl_status.setText("Stopped")
         self._apply_selection_ui_visible(False)
         self.series_table.setColumnHidden(0, True)
+        # No transfer can be in flight once stopped — halt the live
+        # Pending / ETE countdown.
+        self._live_refresh_timer.stop()
+        self._active_series_uid = None
+        self._active_series_done = 0
         if self._restart_pending:
             # Engine reached the idle state we were waiting for after
             # a Restart click; bring it back up with the params
@@ -763,8 +839,10 @@ class SourceDashboard(QWidget):
             # since the expected callback arrived in time.
             self._restart_safety_timer.stop()
             params = self._restart_params
+            auto = self._restart_is_auto
             self._restart_pending = False
             self._restart_params = None
+            self._restart_is_auto = False
             # If the source was removed from the config during the
             # restart wait window, MainWindow would silently drop the
             # start_requested signal and leave the user staring at a
@@ -781,7 +859,7 @@ class SourceDashboard(QWidget):
                 self.interval_spin.setValue(params.sync_interval)
                 self.manual_selection_check.setChecked(
                     params.selection_mode)
-            self._on_start_clicked()
+            self._on_start_clicked(auto_restart=auto)
 
     def _apply_control_enabled(self, running: bool) -> None:
         """Enable / disable the service-control buttons and spinboxes
@@ -809,14 +887,21 @@ class SourceDashboard(QWidget):
         ipm = self._current_stats.overall_images_per_minute()
         return ipm / 60.0 if ipm > 0 else 0.0
 
-    @staticmethod
-    def _compute_cumulative_pending(queue: list) -> list:
+    def _pending_for(self, job: dict) -> int:
+        """Pending images for one job, discounting images the active
+        transfer has already received this run so the count drops live."""
+        if job["status"] in _TERMINAL_STATUSES:
+            return 0
+        pending = max(job["remote_count"] - job["local_count"], 0)
+        if (job["series_uid"] == self._active_series_uid
+                and self._active_series_done > 0):
+            pending = max(pending - self._active_series_done, 0)
+        return pending
+
+    def _compute_cumulative_pending(self, queue: list) -> list:
         """Return a list of cumulative pending-image counts per queue row."""
-        def pending_for(job: dict) -> int:
-            if job["status"] in ("done", "error", "skipped"):
-                return 0
-            return max(job["remote_count"] - job["local_count"], 0)
-        return list(itertools.accumulate(pending_for(j) for j in queue))
+        return list(itertools.accumulate(
+            self._pending_for(j) for j in queue))
 
     @staticmethod
     def _format_ete(seconds: float) -> str:
@@ -839,11 +924,10 @@ class SourceDashboard(QWidget):
     # stats-driven ``_update_ete_column``) so text and colour can never
     # drift between them.
 
-    @staticmethod
-    def _make_pending_item(job: dict) -> QTableWidgetItem:
-        """Pending column (6): remote minus local images, floored at 0."""
-        pending = job["remote_count"] - job["local_count"]
-        return QTableWidgetItem(str(max(pending, 0)))
+    def _make_pending_item(self, job: dict) -> QTableWidgetItem:
+        """Pending column (6): images still to fetch, discounting any the
+        active transfer has already received so the count drops live."""
+        return QTableWidgetItem(str(self._pending_for(job)))
 
     @staticmethod
     def _make_ipm_item(job: dict) -> QTableWidgetItem:
@@ -871,7 +955,7 @@ class SourceDashboard(QWidget):
         """ETE column (9): check-mark when done, dash when dead or
         unknown, otherwise the cumulative pending image count for this
         and all preceding rows divided by the current rate."""
-        if status in ("done", "error", "skipped"):
+        if status in _TERMINAL_STATUSES:
             ete_text = "✓" if status == "done" else "—"
             ete_item = QTableWidgetItem(ete_text)
             if status == "done":
@@ -1061,6 +1145,75 @@ class SourceDashboard(QWidget):
         self.lbl_status.setText(
             f"Transferring: {info['patient_name']} \u2014 "
             f"[{info.get('modality', '')}] {info['series_description']}")
+        self._active_series_uid = info.get("series_uid")
+        self._active_series_done = 0
+        self._slow_transfer_timer.start(_SLOW_TRANSFER_TIMEOUT_MS)
+        # Drive the per-second Pending / ETE countdown for as long as a
+        # transfer is in flight.
+        if not self._live_refresh_timer.isActive():
+            self._live_refresh_timer.start()
+
+    def on_series_progress(self, series_uid: str, completed: int,
+                           total: int) -> None:
+        """Per-image progress tick during a C-MOVE \u2014 re-arm the stall
+        watchdog so a slow-but-alive transfer is not mistaken for a
+        wedged one, and record how many images have arrived so the
+        Pending / ETE columns can count down live.  Only acts while a
+        transfer is actually active."""
+        if self._active_series_uid is None or self._restart_pending:
+            return
+        self._active_series_done = max(completed, 0)
+        self._slow_transfer_timer.start(_SLOW_TRANSFER_TIMEOUT_MS)
+
+    def on_series_completed(self, series_uid: str, images: int) -> None:
+        """Called when a series finishes successfully \u2014 disarms the watchdog."""
+        self._slow_transfer_timer.stop()
+        self._active_series_uid = None
+        self._active_series_done = 0
+        self._live_refresh_timer.stop()
+
+    def on_series_error(self, series_uid: str, error_msg: str) -> None:
+        """Called when a series transfer fails \u2014 disarms the watchdog."""
+        self._slow_transfer_timer.stop()
+        self._active_series_uid = None
+        self._active_series_done = 0
+        self._live_refresh_timer.stop()
+
+    def on_connection_lost(self, remote_key: str, detail: str) -> None:
+        """PACS became unreachable \u2014 suppress the slow-transfer watchdog restart.
+        The engine retries automatically; no restart needed from our side."""
+        self._pacs_connection_lost = True
+        self._slow_transfer_timer.stop()
+
+    def on_connection_restored(self, remote_key: str) -> None:
+        """PACS connection recovered \u2014 re-arm the watchdog for future transfers."""
+        self._pacs_connection_lost = False
+
+    def _on_slow_transfer_detected(self) -> None:
+        """Watchdog fired: series download exceeded _SLOW_TRANSFER_TIMEOUT_MS.
+
+        Skipped when the engine already reported a PACS connection outage
+        (it recovers on its own). Otherwise plays the sad sound, shows a
+        non-modal warning, and auto-restarts to unblock a wedged C-MOVE."""
+        if self._pacs_connection_lost:
+            return
+        uid = self._active_series_uid or "?"
+        logger.warning(
+            f"[{self.remote_key}] Slow/stalled transfer detected "
+            f"(>{_SLOW_TRANSFER_TIMEOUT_MS // 1000}s) \u2014 series {uid} \u2014 "
+            f"triggering auto-restart")
+        self._play_sound(_generate_default_sound(sad=True))
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Langsamer Download erkannt")
+        msg.setText(
+            f"Ein Bild-Download bei <b>{self.remote_key}</b> hat l\u00e4nger als "
+            f"{_SLOW_TRANSFER_TIMEOUT_MS // 1000} Sekunden gedauert.\n\n"
+            f"Der Dienst wird automatisch neu gestartet.")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.show()  # non-modal: show() returns immediately, engine keeps running
+        if self._service_running and not self._restart_pending:
+            self._on_restart_clicked(auto_restart=True)
 
     def on_stats_updated(self, stats: TransferStats) -> None:
         self._current_stats = stats
@@ -1114,6 +1267,24 @@ class SourceDashboard(QWidget):
         for i, job in enumerate(queue):
             if i >= self.series_table.rowCount():
                 break
+            self.series_table.setItem(
+                i, 9, self._make_ete_item(
+                    job["status"], cumulative[i], rate))
+
+    def _refresh_pending_and_ete(self) -> None:
+        """Per-second tick: refresh the Pending (6) and ETE (9) columns
+        from the active transfer's live progress so both count down
+        smoothly between queue/stats signals.  Driven by
+        ``_live_refresh_timer`` only while a transfer is in flight."""
+        queue = self._last_queue
+        if not queue:
+            return
+        rate = self._get_rate()
+        cumulative = self._compute_cumulative_pending(queue)
+        for i, job in enumerate(queue):
+            if i >= self.series_table.rowCount():
+                break
+            self.series_table.setItem(i, 6, self._make_pending_item(job))
             self.series_table.setItem(
                 i, 9, self._make_ete_item(
                     job["status"], cumulative[i], rate))
@@ -1278,6 +1449,7 @@ class SourceDashboard(QWidget):
             "done": "\u2713 Done",
             "error": "\u2717 Error",
             "skipped": "\u2014 Skipped",
+            "unavailable": "\u2298 Not available",
         }.get(status, status)
 
     @staticmethod
@@ -1288,12 +1460,17 @@ class SourceDashboard(QWidget):
             "done": QColor(COLOR_GREEN),
             "error": QColor(COLOR_RED),
             "skipped": QColor(COLOR_MUTED),
+            "unavailable": QColor(COLOR_RED),
         }.get(status, QColor("#d4d4d4"))
 
     def reset(self) -> None:
         self.series_table.setRowCount(0)
         self._current_stats = None
         self._last_queue = []
+        # Stop the live Pending / ETE countdown — no transfer is active.
+        self._live_refresh_timer.stop()
+        self._active_series_uid = None
+        self._active_series_done = 0
         # Table was just cleared — next on_queue_updated must rebuild.
         self._rendered_uids = None
         self._last_high_load_groups = set()
