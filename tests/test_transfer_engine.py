@@ -1715,9 +1715,8 @@ class TestPrioritySeriesOrdering:
         assert [j.study_uid for j in out] == ["S1", "PR2", "PR1"]
 
     def test_axial_series_float_to_front_across_patients(self):
-        """Series whose description contains "ax" (case-insensitive)
-        lead the queue across studies AND patients — even with no
-        priority terms configured."""
+        """The first >10-image series of each study leads (across studies
+        AND patients); the axial fast-lane then orders what remains."""
         self.config.remote_nodes["ct"].priority_series_terms = []
         jobs = [
             self._make_job("S1", "S1.1", "Topogramm", patient_id="P1"),
@@ -1727,10 +1726,12 @@ class TestPrioritySeriesOrdering:
             self._make_job("S3", "S3.1", "Coronal", patient_id="P3"),
         ]
         out = self.engine._apply_priority_ordering(list(jobs))
+        # first-substantial lane (one per study, original order) leads;
+        # then the remaining axial series; then the rest.
         assert [j.series_uid for j in out] == [
-            "S1.2", "S2.2", "S1.1", "S2.1", "S3.1"], (
-            "both patients' axial series must precede every "
-            "non-axial series; remaining order stays stable")
+            "S1.1", "S2.1", "S3.1", "S1.2", "S2.2"], (
+            "each study's first >10-image series leads across patients, "
+            "then the leftover axial series, then the rest")
 
     def test_axial_match_is_case_insensitive(self):
         self.config.remote_nodes["ct"].priority_series_terms = []
@@ -1757,8 +1758,8 @@ class TestPrioritySeriesOrdering:
 
     def test_axial_tier_is_subordinate_to_priority_terms(self):
         """A priority-term study (e.g. stroke CCT) keeps its whole
-        block ahead of other patients' axial series; within that block
-        its own axial series lead."""
+        block ahead of other patients; within that block its first
+        >10-image series leads, then its axial series."""
         self.config.remote_nodes["ct"].priority_series_terms = [
             {"term": "cct", "is_regex": False},
         ]
@@ -1768,13 +1769,16 @@ class TestPrioritySeriesOrdering:
             self._make_job("SX", "SX.2", "CCT ax weich", patient_id="P2"),
         ]
         out = self.engine._apply_priority_ordering(list(jobs))
-        assert [j.series_uid for j in out] == ["SX.2", "SX.1", "S1.1"], (
-            "the priority study's axial series first, then its other "
-            "series, then the routine patient's axial series")
+        # Whole priority block first; inside it SX.1 is the study's first
+        # >10-image series so it leads, then its axial SX.2; the routine
+        # patient's study trails.
+        assert [j.series_uid for j in out] == ["SX.1", "SX.2", "S1.1"], (
+            "the priority study's first substantial series first, then "
+            "its axial series, then the routine patient's study")
 
     def test_axial_priors_stay_behind_current_studies(self):
-        """The axial fast-lane must not override the priors-last rule:
-        an axial Voruntersuchung still waits for all current series."""
+        """The fast-lanes must not override the priors-last rule:
+        a Voruntersuchung still waits for all current series."""
         self.config.remote_nodes["ct"].priority_series_terms = []
         jobs = [
             self._make_job("PR1", "PR1.1", "Axial alt", is_prior=True),
@@ -1782,7 +1786,9 @@ class TestPrioritySeriesOrdering:
             self._make_job("S1", "S1.2", "Axial neu"),
         ]
         out = self.engine._apply_priority_ordering(list(jobs))
-        assert [j.series_uid for j in out] == ["S1.2", "S1.1", "PR1.1"]
+        # S1.1 is the study's first >10-image series → leads; S1.2 axial
+        # next; the prior trails regardless of being axial.
+        assert [j.series_uid for j in out] == ["S1.1", "S1.2", "PR1.1"]
 
     def test_engine_reads_from_its_own_remote_node(self):
         """The ``mri`` engine must NOT honour the ``ct`` engine's
@@ -1799,3 +1805,81 @@ class TestPrioritySeriesOrdering:
         out = mri_engine._apply_priority_ordering(list(jobs))
         # No reordering on mri engine.
         assert [j.study_uid for j in out] == ["S1", "S2"]
+
+    # ── First-substantial-series fast-lane ────────────────────────────
+
+    def test_first_substantial_series_leads_across_patients(self):
+        """Each study's first >10-image series is pulled before any
+        other series of any patient."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Localizer",
+                           remote_count=5, patient_id="P1"),
+            self._make_job("S1", "S1.2", "Coronal",
+                           remote_count=200, patient_id="P1"),
+            self._make_job("S2", "S2.1", "Sagittal",
+                           remote_count=180, patient_id="P2"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        # S1.1 is too small (5 ≤ 10); S1.2 is S1's first substantial
+        # series, S2.1 is S2's — both lead, then the small S1.1.
+        assert [j.series_uid for j in out] == ["S1.2", "S2.1", "S1.1"]
+
+    def test_only_first_substantial_series_per_study_leads(self):
+        """Only ONE series per study joins the fast-lane — the first to
+        clear the threshold, not every large series."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Coronal",
+                           remote_count=100, patient_id="P1"),
+            self._make_job("S1", "S1.2", "Sagittal",
+                           remote_count=100, patient_id="P1"),
+            self._make_job("S2", "S2.1", "Coronal",
+                           remote_count=100, patient_id="P2"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        # Lane = {S1.1, S2.1}; S1.2 is not in the lane and keeps its
+        # original (post-lane) position.
+        assert [j.series_uid for j in out] == ["S1.1", "S2.1", "S1.2"]
+
+    def test_exactly_ten_images_does_not_qualify(self):
+        """The threshold is strict (> 10), so a 10-image series is not
+        substantial enough to lead."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Coronal",
+                           remote_count=10, patient_id="P1"),
+            self._make_job("S1", "S1.2", "Sagittal",
+                           remote_count=11, patient_id="P1"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        # S1.1 (=10) does not qualify; S1.2 (=11) is the first that does.
+        assert [j.series_uid for j in out] == ["S1.2", "S1.1"]
+
+    def test_study_with_only_small_series_keeps_order(self):
+        """A study whose series are all ≤10 images contributes nothing
+        to the fast-lane and keeps its original order."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Localizer",
+                           remote_count=3, patient_id="P1"),
+            self._make_job("S1", "S1.2", "Scout",
+                           remote_count=5, patient_id="P1"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        assert [j.series_uid for j in out] == ["S1.1", "S1.2"]
+
+    def test_first_substantial_leads_priority_and_axial(self):
+        """The first-substantial lane sits ABOVE the axial lane within a
+        tier: a study's first big series leads even its own axial."""
+        self.config.remote_nodes["ct"].priority_series_terms = []
+        jobs = [
+            self._make_job("S1", "S1.1", "Coronal",
+                           remote_count=100, patient_id="P1"),
+            self._make_job("S1", "S1.2", "Axial 3mm",
+                           remote_count=100, patient_id="P1"),
+        ]
+        out = self.engine._apply_priority_ordering(list(jobs))
+        # S1.1 is the first substantial series → leads, even though S1.2
+        # is axial.
+        assert [j.series_uid for j in out] == ["S1.1", "S1.2"]

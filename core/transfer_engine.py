@@ -111,6 +111,13 @@ MAX_SERIES_TRANSFER_ATTEMPTS = 3
 # as early as possible while reformats backfill afterwards.
 AXIAL_PRIORITY_PATTERN = re.compile(r"\bax", re.IGNORECASE)
 
+# The first series of each study with more than this many remote images
+# is pulled before everything else (even before the axial fast-lane) —
+# across studies and patients.  This gets one substantial, viewable
+# series of every study on screen as early as possible, so a reader can
+# triage all pending studies before any single one finishes in full.
+FIRST_SERIES_MIN_IMAGES = 10
+
 
 @dataclass
 class TransferStats:
@@ -743,34 +750,62 @@ class TransferEngine:
         a Voruntersuchung must never delay a fresh study.  Within the
         prior block the term order applies again.
 
-        Within each (is_prior, study-priority) tier, axial series
-        (description matches ``AXIAL_PRIORITY_PATTERN``, case-
-        insensitive) come first — across studies and patients, so
-        every study's primary reading series arrives before any
-        study's reformats.  This is the one rule that deliberately
-        breaks study grouping.
+        Within each (is_prior, study-priority) tier two fast-lanes
+        apply, across studies and patients:
+          1. the FIRST series of each study with more than
+             ``FIRST_SERIES_MIN_IMAGES`` remote images leads — one
+             substantial, viewable series of every study arrives first
+             so a reader can triage all pending studies early;
+          2. then axial series (description matches
+             ``AXIAL_PRIORITY_PATTERN``) — the primary reading series.
+        Both rules deliberately break study grouping.
 
-        Composed of three small helpers, each independently testable:
-        ``_compile_matchers`` → ``_compute_study_priorities`` →
-        stable-sort.
+        Composed of small helpers, each independently testable:
+        ``_compile_matchers`` → ``_compute_study_priorities`` /
+        ``_first_substantial_series_uids`` → stable-sort.
         """
         matchers = TransferEngine._compile_matchers(terms, log_label)
         study_prio = TransferEngine._compute_study_priorities(
             jobs, matchers)
-        # Stable sort by (is_prior, study_priority, non-axial,
-        # original_position):
+        first_substantial = TransferEngine._first_substantial_series_uids(
+            jobs)
+        # Stable sort by (is_prior, study_priority, not-first-substantial,
+        # non-axial, original_position):
         #   - current studies always precede priors,
         #   - priority studies float to the top in priority order,
-        #   - axial series lead within their tier, across patients,
+        #   - each study's first >10-image series leads its tier,
+        #   - axial series come next within their tier, across patients,
         #   - within the same slot, original order is kept.
         indexed = list(enumerate(jobs))
         indexed.sort(
             key=lambda pair: (pair[1].is_prior,
                               study_prio[pair[1].study_uid],
+                              pair[1].series_uid not in first_substantial,
                               not TransferEngine._is_axial(
                                   pair[1].series_description),
                               pair[0]))
         return [j for _, j in indexed]
+
+    @staticmethod
+    def _first_substantial_series_uids(
+            jobs: List[SeriesJob]) -> Set[str]:
+        """Return the set of ``series_uid``s that are, per study, the
+        FIRST series (in original queue order) whose ``remote_count``
+        exceeds ``FIRST_SERIES_MIN_IMAGES``.
+
+        Exactly one series per study qualifies (the first that clears
+        the threshold); studies whose series are all small contribute
+        none.  These lead the queue so every study gets one viewable
+        series early — across studies and patients."""
+        seen_studies: Set[str] = set()
+        result: Set[str] = set()
+        for j in jobs:
+            if j.study_uid in seen_studies:
+                continue
+            if j.remote_count > FIRST_SERIES_MIN_IMAGES:
+                seen_studies.add(j.study_uid)
+                result.add(j.series_uid)
+        return result
 
     @staticmethod
     def _is_axial(series_description: str) -> bool:
