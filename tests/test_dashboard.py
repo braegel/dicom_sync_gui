@@ -107,6 +107,37 @@ class TestETEFormat:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SourceDashboard — Series Created column formatting
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSeriesCreatedFormatting:
+
+    def test_full_date_and_time(self):
+        assert SourceDashboard._format_series_created(
+            "20260615", "143005") == "15.06.2026 14:30"
+
+    def test_date_only_when_time_missing(self):
+        assert SourceDashboard._format_series_created(
+            "20260615", "") == "15.06.2026"
+
+    def test_time_only_when_date_missing(self):
+        assert SourceDashboard._format_series_created(
+            "", "143005") == "14:30"
+
+    def test_both_missing_is_dash(self):
+        assert SourceDashboard._format_series_created("", "") == "—"
+
+    def test_unparseable_date_shown_verbatim(self):
+        assert SourceDashboard._format_series_created(
+            "2026", "") == "2026"
+
+    def test_fractional_time_trimmed(self):
+        # DICOM TM may carry fractional seconds; HH:MM is enough.
+        assert SourceDashboard._format_series_created(
+            "20260615", "143005.250000") == "15.06.2026 14:30"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SourceDashboard — status helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -171,17 +202,24 @@ class TestDashboardUI:
 
     def test_table_has_correct_columns(self):
         table = self.dashboard.series_table
-        # 11 total columns: hidden ☑ (0), Patient–ETE (1-9), Group (10)
-        assert table.columnCount() == 11
+        # 12 total columns: hidden ☑ (0), Patient–ETE (1-9), Group (10),
+        # Series Created (11).  Group's visibility follows the config's
+        # filter_groups_enabled flag; the checkbox column is always hidden
+        # outside selection mode.
+        assert table.columnCount() == 12
         visible = [
             table.horizontalHeaderItem(i).text()
             for i in range(table.columnCount())
             if not table.isColumnHidden(i)
         ]
-        assert visible == [
-            "Patient", "Study", "Series", "Modality",
-            "Images", "Pending", "img/min", "Status", "ETE", "Group",
-        ]
+        # "Series Created" is always visible and trails the layout.
+        assert visible[0] == "Patient"
+        assert visible[-1] == "Series Created"
+        for expected in ("Patient", "Study", "Series", "Modality",
+                         "Images", "Pending", "img/min", "Status",
+                         "ETE", "Series Created"):
+            assert expected in visible
+        assert "☑" not in visible
 
     def test_signals_exist(self):
         assert hasattr(self.dashboard, 'start_requested')

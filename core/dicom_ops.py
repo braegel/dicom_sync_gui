@@ -214,6 +214,8 @@ class DicomOperations:
         ds.SeriesNumber = ''
         ds.Modality = ''
         ds.SeriesDescription = ''
+        ds.SeriesDate = ''
+        ds.SeriesTime = ''
         ds.NumberOfSeriesRelatedInstances = ''
         ds.InstitutionName = ''
         return self._execute_find(ds)

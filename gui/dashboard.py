@@ -99,6 +99,11 @@ CONFIG_SAVE_DEBOUNCE_MS = 500
 # genuinely wedged rather than merely slow on a large series.
 _SLOW_TRANSFER_TIMEOUT_MS = 10_000
 
+# How long the (non-blocking) slow-transfer auto-restart notice stays on
+# screen before it dismisses itself (ms).  It's informational only — the
+# service restarts regardless of whether the user ever sees it.
+_SLOW_TRANSFER_NOTICE_MS = 5_000
+
 # Statuses a series can no longer leave: it contributes no pending
 # images and gets no ETE.  "unavailable" = retry budget exhausted.
 _TERMINAL_STATUSES = ("done", "error", "skipped", "unavailable")
@@ -219,6 +224,10 @@ class SourceDashboard(QWidget):
         # Deferred init solves both: one instance, but only when the
         # first sound actually plays.
         self._sound_effect: Optional[QSoundEffect] = None
+        # The single, reusable, non-blocking slow-transfer notice (and
+        # its auto-close timer).  Kept on the instance so repeated
+        # timeouts refresh it instead of stacking dialogs.
+        self._slow_transfer_notice: Optional[QMessageBox] = None
         # series_uid of the currently active transfer (set by
         # on_series_started, cleared by on_series_completed /
         # on_series_error).  The slow-transfer watchdog uses this to
@@ -265,6 +274,14 @@ class SourceDashboard(QWidget):
         self._slow_transfer_timer.setSingleShot(True)
         self._slow_transfer_timer.timeout.connect(
             self._on_slow_transfer_detected)
+
+        # Auto-dismiss the non-blocking slow-transfer notice after
+        # _SLOW_TRANSFER_NOTICE_MS so it never lingers in front of the
+        # running service.
+        self._slow_transfer_notice_timer = QTimer(self)
+        self._slow_transfer_notice_timer.setSingleShot(True)
+        self._slow_transfer_notice_timer.timeout.connect(
+            self._on_slow_transfer_notice_closed)
 
         # 1 Hz live refresh of the Pending / ETE columns so they count
         # down every second during an active transfer instead of only
@@ -545,10 +562,14 @@ class SourceDashboard(QWidget):
         tl = QVBoxLayout()
 
         self.series_table = QTableWidget()
-        self.series_table.setColumnCount(11)
+        # Column 11 ("Series Created") is appended last so the existing
+        # hardcoded column indices (Pending=6, Status=8, ETE=9, Group=10)
+        # stay valid.
+        self.series_table.setColumnCount(12)
         self.series_table.setHorizontalHeaderLabels([
             "☑", "Patient", "Study", "Series", "Modality",
-            "Images", "Pending", "img/min", "Status", "ETE", "Group"
+            "Images", "Pending", "img/min", "Status", "ETE", "Group",
+            "Series Created"
         ])
         header = self.series_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -562,6 +583,7 @@ class SourceDashboard(QWidget):
         header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(9, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(10, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(11, QHeaderView.ResizeToContents)
         self.series_table.setAlternatingRowColors(True)
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.series_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -949,6 +971,35 @@ class SourceDashboard(QWidget):
         status_item.setForeground(cls._status_color(status))
         return status_item
 
+    @staticmethod
+    def _format_series_created(date_digits: str, time_digits: str) -> str:
+        """Format a DICOM SeriesDate (``YYYYMMDD``) and SeriesTime
+        (``HHMMSS``) into ``DD.MM.YYYY HH:MM`` for display.  Falls back
+        gracefully: missing time shows the date only; an unparseable
+        value is shown verbatim; both missing → dash."""
+        d = (date_digits or "").strip()
+        t = (time_digits or "").strip()
+        date_part = ""
+        if len(d) == 8 and d.isdigit():
+            date_part = f"{d[6:8]}.{d[4:6]}.{d[0:4]}"
+        elif d:
+            date_part = d
+        time_part = ""
+        if len(t) >= 4 and t[:4].isdigit():
+            time_part = f"{t[0:2]}:{t[2:4]}"
+        if date_part and time_part:
+            return f"{date_part} {time_part}"
+        return date_part or time_part or "—"
+
+    @classmethod
+    def _make_series_created_item(cls, job: dict) -> QTableWidgetItem:
+        """Series Created column (11): when the series was acquired on the
+        modality (SeriesDate/SeriesTime, with study date/time fallback)."""
+        item = QTableWidgetItem(cls._format_series_created(
+            job.get("series_date", ""), job.get("series_time", "")))
+        item.setForeground(QColor(COLOR_MUTED))
+        return item
+
     @classmethod
     def _make_ete_item(cls, status: str, cumulative_pending: int,
                        rate: float) -> QTableWidgetItem:
@@ -1043,6 +1094,10 @@ class SourceDashboard(QWidget):
             self.series_table.setItem(
                 row, 10, QTableWidgetItem(group))
 
+            # Series Created column (static per series).
+            self.series_table.setItem(
+                row, 11, self._make_series_created_item(job))
+
         self._update_series_summary(queue)
 
     def _update_queue_cells_in_place(self, queue: list) -> None:
@@ -1108,6 +1163,10 @@ class SourceDashboard(QWidget):
                 job.get("institution_name", ""), "")
             self.series_table.setItem(
                 row, 10, QTableWidgetItem(group))
+
+            # Series Created column.
+            self.series_table.setItem(
+                row, 11, self._make_series_created_item(job))
 
         total = sum(max(j["remote_count"] - j["local_count"], 0) for j in queue)
         self.lbl_total_series.setText(f"Series: 0 / {len(queue)}")
@@ -1203,17 +1262,63 @@ class SourceDashboard(QWidget):
             f"(>{_SLOW_TRANSFER_TIMEOUT_MS // 1000}s) \u2014 series {uid} \u2014 "
             f"triggering auto-restart")
         self._play_sound(_generate_default_sound(sad=True))
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Langsamer Download erkannt")
-        msg.setText(
+        self._show_slow_transfer_notice()
+        if self._service_running and not self._restart_pending:
+            self._on_restart_clicked(auto_restart=True)
+
+    def _show_slow_transfer_notice(self) -> None:
+        """Show a purely informational, non-blocking notice that the
+        service is auto-restarting after a slow download.
+
+        Reuses a single self-dismissing popup: repeated timeouts update
+        the existing notice instead of stacking new dialogs the user
+        would have to click away, and it auto-closes after a few seconds
+        so it never sits in front of the running service."""
+        text = (
             f"Ein Bild-Download bei <b>{self.remote_key}</b> hat l\u00e4nger als "
             f"{_SLOW_TRANSFER_TIMEOUT_MS // 1000} Sekunden gedauert.\n\n"
             f"Der Dienst wird automatisch neu gestartet.")
+        existing = self._slow_transfer_notice
+        if existing is not None:
+            # Already on screen \u2014 just refresh its text and re-arm the
+            # auto-close timer instead of stacking another dialog.
+            existing.setText(text)
+            self._slow_transfer_notice_timer.start(
+                _SLOW_TRANSFER_NOTICE_MS)
+            return
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Langsamer Download erkannt")
+        msg.setText(text)
         msg.setIcon(QMessageBox.Warning)
         msg.setStandardButtons(QMessageBox.Ok)
-        msg.show()  # non-modal: show() returns immediately, engine keeps running
-        if self._service_running and not self._restart_pending:
-            self._on_restart_clicked(auto_restart=True)
+        # Explicitly non-modal so it can never block the event loop or
+        # the running service; the user may dismiss it or ignore it.
+        msg.setWindowModality(Qt.NonModal)
+        msg.setModal(False)
+        msg.finished.connect(self._on_slow_transfer_notice_closed)
+        self._slow_transfer_notice = msg
+        msg.show()
+        self._slow_transfer_notice_timer.start(_SLOW_TRANSFER_NOTICE_MS)
+
+    def _on_slow_transfer_notice_closed(self, _result: int = 0) -> None:
+        """Drop the reference once the notice is dismissed (by the user
+        or the auto-close timer) so the next timeout creates a fresh one.
+
+        Called both from the dialog's ``finished`` signal (user clicked
+        OK / closed it) and from the auto-close timer.  In the timer
+        case the dialog is still visible, so close it — but disconnect
+        ``finished`` first so the close doesn't re-enter this handler."""
+        self._slow_transfer_notice_timer.stop()
+        notice = self._slow_transfer_notice
+        self._slow_transfer_notice = None
+        if notice is not None:
+            try:
+                notice.finished.disconnect(
+                    self._on_slow_transfer_notice_closed)
+            except (RuntimeError, TypeError):
+                pass
+            notice.close()
+            notice.deleteLater()
 
     def on_stats_updated(self, stats: TransferStats) -> None:
         self._current_stats = stats

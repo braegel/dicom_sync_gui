@@ -50,6 +50,12 @@ class SeriesJob:
     duration_seconds: float = 0.0
     study_date: str = ""
     study_time: str = ""
+    # When the series itself was created on the modality (DICOM
+    # SeriesDate / SeriesTime, ``YYYYMMDD`` / ``HHMMSS``).  Falls back to
+    # the study date/time when the PACS doesn't return series-level
+    # values.  Shown in the queue's "Series Created" column.
+    series_date: str = ""
+    series_time: str = ""
     # True for series of a prior study (Voruntersuchung).  Priors are
     # always transferred AFTER all current studies — even when one of
     # their series matches a configured priority term.
@@ -77,6 +83,8 @@ class SeriesJob:
             "images_per_minute": self.images_per_minute,
             "study_date": self.study_date,
             "study_time": self.study_time,
+            "series_date": self.series_date,
+            "series_time": self.series_time,
             "is_prior": self.is_prior,
         }
 
@@ -926,6 +934,8 @@ class TransferEngine:
                 continue
 
             seen_series.add(series_uid)
+            ser_date, ser_time = self._series_datetime(
+                ser, study_date, study_time)
             # Series that already failed MAX_SERIES_TRANSFER_ATTEMPTS
             # times stay visible in the queue with an "unavailable"
             # status instead of being re-attempted forever — small
@@ -949,9 +959,23 @@ class TransferEngine:
                 accession_number=accession,
                 study_date=study_date,
                 study_time=study_time,
+                series_date=ser_date,
+                series_time=ser_time,
                 status="unavailable" if blacklisted else "queued",
             ))
         return jobs
+
+    @staticmethod
+    def _series_datetime(ser, study_date: str,
+                         study_time: str) -> Tuple[str, str]:
+        """Return ``(series_date, series_time)`` for a series C-FIND
+        result, falling back to the study's date/time when the PACS
+        omits the series-level values.  ``series_time`` is trimmed to
+        ``HHMMSS`` (DICOM TM may carry fractional seconds)."""
+        s_date = str(getattr(ser, 'SeriesDate', '') or '').strip()
+        s_time_raw = str(getattr(ser, 'SeriesTime', '') or '').strip()
+        s_time = s_time_raw[:6]
+        return (s_date or study_date, s_time or study_time)
 
     def _transfer_series(self, job: SeriesJob,
                          dicom_ops: Optional[DicomOperations] = None
@@ -1302,6 +1326,8 @@ class TransferEngine:
                     remote_count, local_count, max_images):
                 continue
             seen_series.add(series_uid)
+            ser_date, ser_time = self._series_datetime(
+                ser, ps_date, ps_time)
             blacklisted = self._transfer_log.is_series_blacklisted(
                 source_pacs=self.remote_key,
                 series_uid=series_uid,
@@ -1319,6 +1345,8 @@ class TransferEngine:
                 local_count=local_count,
                 study_date=ps_date,
                 study_time=ps_time,
+                series_date=ser_date,
+                series_time=ser_time,
                 is_prior=True,
                 status="unavailable" if blacklisted else "queued",
             ))

@@ -95,6 +95,7 @@ class TestSeriesJob:
             "study_uid", "series_uid", "remote_count", "local_count",
             "status", "institution_name", "accession_number",
             "images_per_minute", "study_date", "study_time",
+            "series_date", "series_time",
             "is_prior",
         }
         assert set(d.keys()) == expected
@@ -115,6 +116,42 @@ class TestSeriesJob:
 
     def test_is_prior_in_to_dict(self):
         assert SeriesJob(is_prior=True).to_dict()["is_prior"] is True
+
+    def test_series_date_time_defaults_and_to_dict(self):
+        job = SeriesJob(series_date="20260615", series_time="143005")
+        d = job.to_dict()
+        assert d["series_date"] == "20260615"
+        assert d["series_time"] == "143005"
+        assert SeriesJob().series_date == ""
+        assert SeriesJob().series_time == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine._series_datetime — SeriesDate/Time with study fallback
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSeriesDateTime:
+
+    def test_uses_series_values_when_present(self):
+        ser = MagicMock()
+        ser.SeriesDate = "20260615"
+        ser.SeriesTime = "143005"
+        assert TransferEngine._series_datetime(
+            ser, "20260101", "090000") == ("20260615", "143005")
+
+    def test_trims_fractional_seconds(self):
+        ser = MagicMock()
+        ser.SeriesDate = "20260615"
+        ser.SeriesTime = "143005.500000"
+        assert TransferEngine._series_datetime(
+            ser, "", "") == ("20260615", "143005")
+
+    def test_falls_back_to_study_when_series_missing(self):
+        ser = MagicMock()
+        ser.SeriesDate = ""
+        ser.SeriesTime = ""
+        assert TransferEngine._series_datetime(
+            ser, "20260101", "090000") == ("20260101", "090000")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
