@@ -111,6 +111,16 @@ SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION = 6
 # every cycle forever.
 MAX_SERIES_TRANSFER_ATTEMPTS = 3
 
+# Minimum wall-clock gap between two ``series_progress`` emits during a
+# single C-MOVE.  pynetdicom yields one sub-operation status PER IMAGE;
+# emitting a queued cross-thread signal for every image of a large
+# series floods the GUI thread's event queue and pins it at 100% CPU
+# (the UI freezes until the series finishes).  Throttling to a few
+# updates per second keeps the stall watchdog and live Pending/ETE
+# counters responsive without the storm.  A final emit is always sent
+# when the series completes, regardless of this interval.
+PROGRESS_EMIT_INTERVAL_S = 0.5
+
 # Series whose description matches this pattern (case-insensitive,
 # "ax" at a word start: "Axial", "ax 3mm", "T2 ax" — but NOT "Thorax")
 # are transferred before all other series of the same priority tier —
@@ -1005,12 +1015,24 @@ class TransferEngine:
                  job: SeriesJob) -> Tuple[bool, int, float]:
         """Run the C-MOVE.  Returns (success, images, elapsed).
 
-        Emits ``series_progress`` on each sub-operation update so the
-        GUI's per-image stall watchdog sees that the transfer is still
-        alive (it re-arms its timeout on every emit)."""
+        Emits ``series_progress`` so the GUI's per-image stall watchdog
+        sees the transfer is alive and the live Pending/ETE counters
+        advance.  The emit is THROTTLED to one every
+        ``PROGRESS_EMIT_INTERVAL_S``: pynetdicom yields a status per
+        image, and emitting a queued cross-thread signal for each image
+        of a large series floods the GUI event queue and freezes the UI.
+        The final image (completed >= total) always emits so the bar
+        finishes at 100%."""
         t_start = time.time()
+        last_emit = [0.0]  # list = mutable cell for the closure
 
         def _on_progress(completed: int, total: int) -> None:
+            now = time.time()
+            is_final = total > 0 and completed >= total
+            if not is_final and (now - last_emit[0]
+                                 < PROGRESS_EMIT_INTERVAL_S):
+                return
+            last_emit[0] = now
             try:
                 self.signals.series_progress.emit(
                     job.series_uid, completed, total)

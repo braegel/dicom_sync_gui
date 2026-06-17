@@ -499,6 +499,77 @@ class TestTransferSignals:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine._do_move — series_progress throttling
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestProgressThrottle:
+    """pynetdicom yields a status per image; emitting series_progress for
+    every image of a large series floods the GUI event queue and pins it
+    at 100% CPU.  _do_move throttles emits to PROGRESS_EMIT_INTERVAL_S,
+    but always emits the final (completed >= total) update."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.engine = TransferEngine(self.config, "ct")
+        self.emits = []
+        self.engine.signals.series_progress.connect(
+            lambda uid, c, t: self.emits.append((c, t)))
+
+    def _run_move(self, n_images, clock):
+        """Drive _do_move with a c_move that fires one progress tick per
+        image, advancing the patched clock by *clock* seconds per tick."""
+        job = SeriesJob(study_uid="S1", series_uid="S1.1",
+                        remote_count=n_images)
+
+        def fake_c_move(study_uid, series_uid, progress_cb=None):
+            for i in range(1, n_images + 1):
+                progress_cb(i, n_images)
+            return (True, n_images)
+
+        ops = MagicMock()
+        ops.c_move_series.side_effect = fake_c_move
+
+        # Deterministic, monotonically advancing clock: each time.time()
+        # call returns the next value, advancing by *clock* seconds.
+        # _do_move calls time.time() once for t_start, once per progress
+        # tick, and once at the end — generously oversized so it never
+        # raises StopIteration.
+        counter = {"n": 0}
+
+        def fake_time():
+            v = 1000.0 + counter["n"] * clock
+            counter["n"] += 1
+            return v
+
+        with patch("core.transfer_engine.time.time",
+                   side_effect=fake_time):
+            self.engine._do_move(ops, job)
+
+    def test_fast_ticks_are_throttled(self):
+        """100 images arriving faster than the interval collapse to just
+        a handful of emits (plus the guaranteed final one)."""
+        # 0.01 s/image → 100 images in ~1 s; at 0.5 s interval that's
+        # roughly 2-3 emits, not 100.
+        self._run_move(100, clock=0.01)
+        assert len(self.emits) <= 5, (
+            f"expected throttled emits, got {len(self.emits)}")
+
+    def test_final_image_always_emits(self):
+        """The last update (completed >= total) is emitted even if it
+        falls inside the throttle window."""
+        self._run_move(100, clock=0.01)
+        assert self.emits[-1] == (100, 100)
+
+    def test_slow_ticks_each_emit(self):
+        """When images arrive slower than the interval, every tick gets
+        its own emit (no throttling penalty for slow transfers)."""
+        # 1.0 s/image > 0.5 s interval → every tick emits.
+        self._run_move(4, clock=1.0)
+        assert len(self.emits) == 4
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TransferEngine — Institution Filter
 # ═══════════════════════════════════════════════════════════════════════════
 
