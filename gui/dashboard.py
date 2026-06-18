@@ -1376,35 +1376,63 @@ class SourceDashboard(QWidget):
         self.lbl_total_images.setText(f"Total: {stats.total_images} images")
 
     def _update_ete_column(self) -> None:
-        """Update only the ETE column without rebuilding the whole table."""
+        """Update only the ETE column without rebuilding the whole table.
+
+        Updates existing cells' text in place (see ``_set_ete_text``)
+        rather than reallocating an item per row on every stats tick."""
         rate = self._get_rate()
         queue = self._last_queue
         cumulative = self._compute_cumulative_pending(queue)
-
+        rows = self.series_table.rowCount()
         for i, job in enumerate(queue):
-            if i >= self.series_table.rowCount():
+            if i >= rows:
                 break
-            self.series_table.setItem(
-                i, 9, self._make_ete_item(
-                    job["status"], cumulative[i], rate))
+            self._set_ete_text(i, job["status"], cumulative[i], rate)
 
     def _refresh_pending_and_ete(self) -> None:
         """Per-second tick: refresh the Pending (6) and ETE (9) columns
         from the active transfer's live progress so both count down
         smoothly between queue/stats signals.  Driven by
-        ``_live_refresh_timer`` only while a transfer is in flight."""
+        ``_live_refresh_timer`` only while a transfer is in flight.
+
+        Updates the TEXT of existing cells in place (``setText``) rather
+        than allocating fresh ``QTableWidgetItem``s every tick — at 1 Hz
+        across a large queue (and several source tabs) the allocation +
+        relayout churn of recreating every cell was enough to make the UI
+        unresponsive during a download.  When the window is hidden there
+        is nothing to repaint, so we skip the work entirely."""
         queue = self._last_queue
-        if not queue:
+        if not queue or not self.isVisible():
             return
         rate = self._get_rate()
         cumulative = self._compute_cumulative_pending(queue)
+        rows = self.series_table.rowCount()
         for i, job in enumerate(queue):
-            if i >= self.series_table.rowCount():
+            if i >= rows:
                 break
-            self.series_table.setItem(i, 6, self._make_pending_item(job))
+            pending_item = self.series_table.item(i, 6)
+            if pending_item is not None:
+                pending_item.setText(str(self._pending_for(job)))
+            else:
+                self.series_table.setItem(i, 6, self._make_pending_item(job))
+            self._set_ete_text(i, job["status"], cumulative[i], rate)
+
+    def _set_ete_text(self, row: int, status: str,
+                      cumulative_pending: int, rate: float) -> None:
+        """Update only the ETE cell's TEXT in place when an item already
+        exists, falling back to building a fresh item otherwise.  Avoids
+        re-creating the item (and re-setting its brush/alignment) on
+        every 1 Hz tick."""
+        existing = self.series_table.item(row, 9)
+        if existing is None:
             self.series_table.setItem(
-                i, 9, self._make_ete_item(
-                    job["status"], cumulative[i], rate))
+                row, 9, self._make_ete_item(status, cumulative_pending, rate))
+            return
+        if status in _TERMINAL_STATUSES or rate <= 0:
+            # Terminal / unknown-rate cells don't count down; leave the
+            # item the queue path already rendered untouched.
+            return
+        existing.setText(self._format_ete(cumulative_pending / rate))
 
     # ── Study rate ────────────────────────────────────────────────────────
 

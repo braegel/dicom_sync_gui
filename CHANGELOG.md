@@ -2,6 +2,65 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.3.0] — 2026-06-18
+
+Transfer resilience, queue prioritization, and a full follow-up code
+review pass.
+
+### Added
+- **Per-image stall watchdog**: if no image of a series arrives for
+  10 s, a sad chime + a non-blocking notice fire and the service
+  auto-restarts to unblock a wedged C-MOVE.  The watchdog re-arms on
+  every image, so a merely slow large series never trips it.
+- **PACS-unreachable auto-restart loop**: when the watchdog restart hits
+  a source PACS that is briefly unreachable, the service keeps retrying
+  every 5 s — with a distinct siren alarm — until the PACS answers,
+  instead of silently staying stopped.  Stop / quit cancel the loop.
+- **First-substantial-series fast-lane**: the first series of every study
+  with more than 10 images is pulled before all other series, across
+  studies and patients, so a reader gets one viewable series of every
+  pending study as early as possible (ranked above the axial fast-lane).
+- **"Series Created" column** in the Series Queue, showing each series'
+  acquisition date/time (DICOM SeriesDate/SeriesTime, study date/time
+  fallback), formatted `DD.MM.YYYY HH:MM`.
+- **Live Pending / ETE countdown**: both columns now count down each
+  second during an active transfer.
+
+### Fixed
+- **UI freeze during large downloads**: the per-second live refresh
+  reallocated a table item for every queue row every tick (across all
+  source tabs), pinning the GUI thread; it now updates cell text in
+  place and skips hidden tabs entirely.
+- **GUI-thread CPU spin on large series**: `series_progress` was emitted
+  once per image (a queued cross-thread signal per image flooded the
+  event loop); it is now throttled to ~2/s with a guaranteed final emit.
+- **Duplicate "study complete" chime**: an already-local study that got
+  re-queried (or re-run after a restart) chimed every cycle; it now
+  chimes only the first time it completes.
+- **Series that can't be retrieved are retried at most 3 times**, then
+  shown as "⊘ Not available" in the queue instead of being retried
+  forever; they no longer block study/patient completion.
+- **Auto-restart notice no longer blocks the service**: a single,
+  self-dismissing, non-modal notice replaces the stacking modal dialogs.
+
+### Changed
+- The Download Completions Copy button resolves its localized prefix at
+  click time and follows a language change via `set_language()`.
+
+### Internal
+- Extracted the pure queue-ordering logic (axial / first-substantial /
+  priority-term sort) into a new Qt-free `core.queue_planner` module.
+- Code-review pass: `_queue` reads now honor the `_queue_lock` contract;
+  `TERMINAL_STATUSES` is a single shared constant; several god-methods
+  (`_check_study_complete`, `_on_scp_check_done`, `DicomOperations`
+  `__init__`, `config.load`, `main`, and five dialog `_setup_ui`
+  builders) split into focused helpers; swallowed exceptions are logged.
+
+### Tests
+- 912 → 945 (per-image throttle, retry/unavailable status, series
+  date/time, siren generation, auto-restart retry loop, live-refresh
+  performance, queue-planner extraction).
+
 ## [1.2.0] — 2026-06-11
 
 Full-project code review: 5 critical, 14 medium and 14 low findings

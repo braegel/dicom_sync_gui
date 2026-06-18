@@ -436,6 +436,68 @@ class TestDashboardQueue:
 # SourceDashboard \u2014 incremental queue updates
 # \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 
+class TestLiveRefreshPerformance:
+    """The 1 Hz live Pending/ETE refresh must not reallocate a fresh
+    QTableWidgetItem per cell per tick (that churn froze the UI during
+    large downloads), and must skip entirely when the window is hidden."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def _make_job_dict(self, **overrides):
+        base = {
+            "patient_name": "Doe^John", "study_description": "CT",
+            "series_description": "Axial", "modality": "CT",
+            "remote_count": 200, "local_count": 0, "status": "queued",
+            "series_uid": "u1", "study_uid": "s1",
+            "images_per_minute": 0.0, "institution_name": "H",
+            "series_date": "", "series_time": "",
+        }
+        base.update(overrides)
+        return base
+
+    def test_refresh_reuses_existing_items(self):
+        """A live tick must update existing cells in place, not replace
+        the item objects."""
+        self.dashboard.show()
+        queue = [self._make_job_dict(series_uid="u1"),
+                 self._make_job_dict(series_uid="u2")]
+        self.dashboard.on_queue_updated(queue)
+        pending_before = self.dashboard.series_table.item(0, 6)
+        ete_before = self.dashboard.series_table.item(0, 9)
+        self.dashboard._active_series_uid = "u1"
+        self.dashboard._active_series_done = 50
+        self.dashboard._refresh_pending_and_ete()
+        # Same item objects, just updated text — not reallocated.
+        assert self.dashboard.series_table.item(0, 6) is pending_before
+        assert self.dashboard.series_table.item(0, 9) is ete_before
+
+    def test_refresh_updates_pending_text_live(self):
+        """Pending count drops by the active transfer's received images."""
+        self.dashboard.show()
+        queue = [self._make_job_dict(
+            series_uid="u1", remote_count=200, local_count=0)]
+        self.dashboard.on_queue_updated(queue)
+        self.dashboard._active_series_uid = "u1"
+        self.dashboard._active_series_done = 60
+        self.dashboard._refresh_pending_and_ete()
+        assert self.dashboard.series_table.item(0, 6).text() == "140"
+
+    def test_refresh_skips_when_hidden(self):
+        """A hidden dashboard does no per-tick work."""
+        queue = [self._make_job_dict(series_uid="u1")]
+        self.dashboard.on_queue_updated(queue)
+        self.dashboard.hide()
+        self.dashboard._active_series_uid = "u1"
+        self.dashboard._active_series_done = 99
+        # Should be a no-op: pending text stays at the queue-rendered value.
+        before = self.dashboard.series_table.item(0, 6).text()
+        self.dashboard._refresh_pending_and_ete()
+        assert self.dashboard.series_table.item(0, 6).text() == before
+
+
 class TestIncrementalQueueUpdate:
     """on_queue_updated must do a full rebuild only when the incoming
     series_uid sequence differs from the rendered one; an identical
