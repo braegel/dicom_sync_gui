@@ -862,6 +862,53 @@ class TestAutoRestartRetry:
         assert "ct" in self.win._auto_restart_retry_timers
         assert "ct" in self.win._pending_start_params
 
+    @patch("gui.main_window.StorageSCP")
+    def test_auto_restart_fallback_scp_failure_schedules_retry(self, MockSCP):
+        """When the built-in fallback SCP can't start during a watchdog
+        auto-restart (e.g. the local port is still transiently bound right
+        after the engine tore down its AE), the service must NOT land
+        silently on 'Stopped'.  It must sound the siren, keep the params,
+        and arm a retry timer — just like the unreachable-remote path."""
+        mock_scp = MagicMock()
+        mock_scp.running = False
+        mock_scp.start.side_effect = RuntimeError(
+            "Storage SCP failed to bind on port 11112")
+        MockSCP.return_value = mock_scp
+
+        node = self.win.config.remote_nodes["ct"]
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60,
+                   "auto_restart": True}}
+        with patch.object(MainWindow, "_play_siren") as mock_siren:
+            # remote reachable, local unreachable → fallback SCP path,
+            # whose start() raises.
+            self.win._on_scp_check_done("ct", True, False, node.to_dict())
+
+        mock_siren.assert_called_once()
+        assert "ct" in self.win._auto_restart_retry_timers
+        assert "ct" in self.win._pending_start_params
+
+    @patch("gui.main_window.StorageSCP")
+    def test_manual_fallback_scp_failure_does_not_retry(self, MockSCP):
+        """A manual start whose fallback SCP fails to bind must still
+        abort (no retry timer, params dropped) — only auto-restarts loop."""
+        mock_scp = MagicMock()
+        mock_scp.running = False
+        mock_scp.start.side_effect = RuntimeError(
+            "Storage SCP failed to bind on port 11112")
+        MockSCP.return_value = mock_scp
+
+        node = self.win.config.remote_nodes["ct"]
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60,
+                   "auto_restart": False}}
+        with patch.object(MainWindow, "_play_siren") as mock_siren:
+            self.win._on_scp_check_done("ct", True, False, node.to_dict())
+
+        mock_siren.assert_not_called()
+        assert "ct" not in self.win._auto_restart_retry_timers
+        assert "ct" not in self.win._pending_start_params
+
     def test_retry_stops_when_pacs_recovers(self):
         """Once the PACS answers, the retry loop is cancelled and the
         engine starts."""

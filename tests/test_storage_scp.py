@@ -50,6 +50,25 @@ class TestStorageSCPSignal:
 
         assert result == 0x0000
         assert len(received) == 1
+        # Payload is now the running received-count (int), not the dataset.
+        assert received == [1]
+
+    def test_image_received_is_throttled(self, scp, tmp_path):
+        """A per-image cross-thread emit floods the GUI thread; the SCP
+        emits only the first image and then every Nth, while still
+        storing (and counting) every image."""
+        from core.storage_scp import _IMAGE_SIGNAL_EVERY
+        received = []
+        scp.image_received.connect(received.append)
+
+        n = _IMAGE_SIGNAL_EVERY * 2
+        for i in range(n):
+            scp.handle_store(self._make_event(tmp_path, sop_uid=f"1.2.{i}"))
+
+        # Every image was stored/counted...
+        assert scp.images_received == n
+        # ...but the signal fired only for #1 and each Nth.
+        assert received == [1, _IMAGE_SIGNAL_EVERY, _IMAGE_SIGNAL_EVERY * 2]
 
     def test_image_received_not_emitted_on_save_failure(self, scp, tmp_path):
         received = []

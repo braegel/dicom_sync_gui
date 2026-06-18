@@ -630,7 +630,31 @@ class MainWindow(QMainWindow):
             return
 
         if not local_reachable:
+            # Snapshot the auto_restart flag BEFORE _ensure_fallback_scp,
+            # which pops the pending-start params on failure.
+            was_auto_restart = self._pending_start_params.get(
+                remote_key, {}).get("auto_restart", False)
+            saved_params = dict(
+                self._pending_start_params.get(remote_key, {}))
             if not self._ensure_fallback_scp(remote_key, node):
+                # SCP startup failed (e.g. the local port is still
+                # transiently bound during the restart window).  A
+                # watchdog auto-restart must not die silently on
+                # "Stopped" — re-queue the start and retry with the
+                # siren, mirroring the unreachable-remote path.
+                if was_auto_restart:
+                    self._pending_start_params[remote_key] = saved_params
+                    self._log(
+                        f"Built-in SCP for {remote_key} not ready — "
+                        f"auto-restart retrying in "
+                        f"{_AUTO_RESTART_RETRY_MS // 1000}s.")
+                    self._play_siren()
+                    dashboard = self.dashboards.get(remote_key)
+                    if dashboard:
+                        dashboard.show_awaiting_pacs(
+                            f"PACS nicht erreichbar — neuer Versuch in "
+                            f"{_AUTO_RESTART_RETRY_MS // 1000}s…")
+                    self._schedule_auto_restart_retry(remote_key)
                 return
 
         # PACS answered — cancel any pending auto-restart retry loop and
@@ -710,8 +734,8 @@ class MainWindow(QMainWindow):
             # the pynetdicom reactor thread; Qt.AutoConnection
             # queues the slot onto the GUI thread.
             scp.image_received.connect(
-                lambda _ds, k=scp_key:
-                    self._on_fallback_image_received(k))
+                lambda count, k=scp_key:
+                    self._on_fallback_image_received(k, count))
             try:
                 scp.start()
             except RuntimeError as e:
@@ -760,18 +784,17 @@ class MainWindow(QMainWindow):
         if not self._auto_restart_retry_timers and self._siren_effect:
             self._siren_effect.stop()
 
-    def _on_fallback_image_received(self, scp_key: Tuple[str, int]) -> None:
-        """Log built-in SCP receive progress, throttled so a large
-        series doesn't flood the log window (first image, then every
-        25th — the count plateaus are enough to confirm flow)."""
+    def _on_fallback_image_received(self, scp_key: Tuple[str, int],
+                                    count: int) -> None:
+        """Log built-in SCP receive progress.  The SCP already throttles
+        the signal (first image + every Nth), so every delivered *count*
+        is worth a log line."""
         scp = self.storage_scps.get(scp_key)
         if scp is None:
             return
-        count = scp.images_received
-        if count == 1 or count % 25 == 0:
-            self._log(
-                f"Built-in SCP [{scp_key[0]}:{scp_key[1]}] received "
-                f"{count} image(s) — saving to {scp.storage_path}")
+        self._log(
+            f"Built-in SCP [{scp_key[0]}:{scp_key[1]}] received "
+            f"{count} image(s) — saving to {scp.storage_path}")
 
     # ── Engine signal wiring ──────────────────────────────────────────────
 

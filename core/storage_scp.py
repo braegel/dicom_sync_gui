@@ -31,16 +31,28 @@ _SAVE_AS_KWARGS = (
     else {"write_like_original": False}
 )
 
+# handle_store runs on the pynetdicom reactor thread for EVERY received
+# image.  Emitting a queued cross-thread Qt signal per image floods the
+# GUI thread's event queue during a large fallback transfer and pins it
+# at 100% CPU (the UI freezes).  Emit only the first image and then every
+# Nth, which is all the throttled progress-log handler needs anyway.
+_IMAGE_SIGNAL_EVERY = 25
+
 
 class StorageSCP(QObject):
     """Built-in DICOM Storage SCP.
 
     `image_received` is emitted from the pynetdicom reactor thread
-    after each successful C-STORE.  Qt marshals the signal to the
-    main thread when the connection uses the default
-    Qt.AutoConnection, so slots can safely touch widgets."""
+    after a successful C-STORE — THROTTLED to the first image and then
+    every ``_IMAGE_SIGNAL_EVERY``th (a per-image emit floods the GUI
+    event queue on a large transfer and freezes the UI).  Its payload is
+    the running received-count, not the dataset: marshalling a full
+    Dataset across threads per image was both wasteful and unused by the
+    GUI (the handler only reports the count).  Qt marshals the signal to
+    the main thread under the default Qt.AutoConnection, so slots can
+    safely touch widgets."""
 
-    image_received = Signal(Dataset)
+    image_received = Signal(int)
 
     def __init__(self, ae_title: str, port: int, storage_path: str,
                  bind_address: str = "0.0.0.0"):
@@ -90,7 +102,13 @@ class StorageSCP(QObject):
             ds.save_as(filepath, **_SAVE_AS_KWARGS)
             with self._lock:
                 self._images_received += 1
-            self.image_received.emit(ds)
+                count = self._images_received
+            # Throttle the cross-thread emit: first image + every Nth.
+            # The reactor thread can store images far faster than the GUI
+            # thread drains queued signals, so an unthrottled per-image
+            # emit floods the event queue and freezes the UI.
+            if count == 1 or count % _IMAGE_SIGNAL_EVERY == 0:
+                self.image_received.emit(count)
             return 0x0000
         except Exception as e:
             logger.error(f"Store failed: {e}")

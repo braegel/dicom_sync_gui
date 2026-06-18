@@ -8,6 +8,7 @@ and real-time throughput statistics with color-coded indicators.
 import itertools
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Optional
@@ -245,6 +246,18 @@ class SourceDashboard(QWidget):
         # The slow-transfer watchdog skips the auto-restart in this state
         # because the engine recovers automatically without help.
         self._pacs_connection_lost: bool = False
+        # Per-row cache of the last-rendered Status (col 8) and img/min
+        # text (col 7), keyed by series_uid.  The in-place queue update
+        # only rewrites those two (brush-carrying) cells when the cached
+        # value actually changed, avoiding a setItem storm on every
+        # completed series.  Cleared on full rebuild and reset.
+        self._queue_cell_cache: dict = {}
+        # Monotonic timestamp of the last real transfer progress (set in
+        # on_series_started / on_series_progress).  The slow-transfer
+        # watchdog double-checks the actual elapsed wall time against this
+        # before restarting, so a timer that fires late merely because the
+        # GUI thread was busy does NOT trigger a spurious auto-restart.
+        self._last_progress_ts: float = 0.0
         self._setup_ui()
 
         # Refresh stats display every 2 seconds
@@ -1063,43 +1076,56 @@ class SourceDashboard(QWidget):
             self._rendered_uids = uids
 
     def _rebuild_queue_table(self, queue: list) -> None:
-        """Full rebuild of the series table (uid sequence changed)."""
+        """Full rebuild of the series table (uid sequence changed).
+
+        Wrapped in ``setUpdatesEnabled(False)`` so the whole rebuild
+        repaints once.  Resets ``_queue_cell_cache`` since every row is
+        re-rendered fresh here."""
         rate = self._get_rate()
-        self.series_table.setRowCount(0)
         cumulative = self._compute_cumulative_pending(queue)
+        self._queue_cell_cache.clear()
 
-        for i, job in enumerate(queue):
-            row = self.series_table.rowCount()
-            self.series_table.insertRow(row)
+        self.series_table.setUpdatesEnabled(False)
+        try:
+            self.series_table.setRowCount(0)
+            for i, job in enumerate(queue):
+                row = self.series_table.rowCount()
+                self.series_table.insertRow(row)
 
-            self.series_table.setItem(
-                row, 1, QTableWidgetItem(job["patient_name"]))
-            self.series_table.setItem(
-                row, 2, QTableWidgetItem(job["study_description"]))
-            self.series_table.setItem(
-                row, 3, QTableWidgetItem(job["series_description"]))
-            self.series_table.setItem(
-                row, 4, QTableWidgetItem(job["modality"]))
-            self.series_table.setItem(
-                row, 5, QTableWidgetItem(str(job["remote_count"])))
+                self.series_table.setItem(
+                    row, 1, QTableWidgetItem(job["patient_name"]))
+                self.series_table.setItem(
+                    row, 2, QTableWidgetItem(job["study_description"]))
+                self.series_table.setItem(
+                    row, 3, QTableWidgetItem(job["series_description"]))
+                self.series_table.setItem(
+                    row, 4, QTableWidgetItem(job["modality"]))
+                self.series_table.setItem(
+                    row, 5, QTableWidgetItem(str(job["remote_count"])))
 
-            self.series_table.setItem(row, 6, self._make_pending_item(job))
-            self.series_table.setItem(row, 7, self._make_ipm_item(job))
-            self.series_table.setItem(
-                row, 8, self._make_status_item(job["status"]))
-            self.series_table.setItem(
-                row, 9, self._make_ete_item(
-                    job["status"], cumulative[i], rate))
+                self.series_table.setItem(
+                    row, 6, self._make_pending_item(job))
+                self.series_table.setItem(row, 7, self._make_ipm_item(job))
+                self.series_table.setItem(
+                    row, 8, self._make_status_item(job["status"]))
+                self.series_table.setItem(
+                    row, 9, self._make_ete_item(
+                        job["status"], cumulative[i], rate))
 
-            # Group column
-            group = self.config.institution_assignments.get(
-                job.get("institution_name", ""), "")
-            self.series_table.setItem(
-                row, 10, QTableWidgetItem(group))
+                # Group column
+                group = self.config.institution_assignments.get(
+                    job.get("institution_name", ""), "")
+                self.series_table.setItem(
+                    row, 10, QTableWidgetItem(group))
 
-            # Series Created column (static per series).
-            self.series_table.setItem(
-                row, 11, self._make_series_created_item(job))
+                # Series Created column (static per series).
+                self.series_table.setItem(
+                    row, 11, self._make_series_created_item(job))
+
+                self._queue_cell_cache[job["series_uid"]] = (
+                    job["status"], self._ipm_text(job))
+        finally:
+            self.series_table.setUpdatesEnabled(True)
 
         self._update_series_summary(queue)
 
@@ -1107,20 +1133,59 @@ class SourceDashboard(QWidget):
         """Same uid sequence as currently rendered — refresh only the
         cells that can change between per-series progress emits.  The
         static columns (patient, study, series, modality, images,
-        group) are keyed by series_uid and cannot have changed."""
+        group) are keyed by series_uid and cannot have changed.
+
+        This runs after EVERY completed series, so it must be cheap.
+        Pending (6) and ETE (9) are updated in place via ``setText``;
+        the brush-carrying img/min (7) and Status (8) cells are only
+        rebuilt when their rendered value actually changed (tracked in
+        ``_queue_cell_cache``).  The whole pass is wrapped in
+        ``setUpdatesEnabled(False)`` so Qt coalesces one repaint instead
+        of emitting a ``dataChanged``→``visualRect`` storm per cell —
+        that storm was pinning the GUI thread at 100% on large queues."""
         rate = self._get_rate()
         cumulative = self._compute_cumulative_pending(queue)
 
-        for i, job in enumerate(queue):
-            self.series_table.setItem(i, 6, self._make_pending_item(job))
-            self.series_table.setItem(i, 7, self._make_ipm_item(job))
-            self.series_table.setItem(
-                i, 8, self._make_status_item(job["status"]))
-            self.series_table.setItem(
-                i, 9, self._make_ete_item(
-                    job["status"], cumulative[i], rate))
+        self.series_table.setUpdatesEnabled(False)
+        try:
+            for i, job in enumerate(queue):
+                uid = job["series_uid"]
+                cached = self._queue_cell_cache.get(uid, (None, None))
+
+                # Pending (6): update existing item text in place.
+                pending_item = self.series_table.item(i, 6)
+                if pending_item is not None:
+                    pending_item.setText(str(self._pending_for(job)))
+                else:
+                    self.series_table.setItem(
+                        i, 6, self._make_pending_item(job))
+
+                # img/min (7) and Status (8) carry a colour brush, so a
+                # plain setText would not recolour them — rebuild only on
+                # an actual change.
+                status = job["status"]
+                ipm_text = self._ipm_text(job)
+                if cached != (status, ipm_text):
+                    self.series_table.setItem(
+                        i, 7, self._make_ipm_item(job))
+                    self.series_table.setItem(
+                        i, 8, self._make_status_item(status))
+                    self._queue_cell_cache[uid] = (status, ipm_text)
+
+                # ETE (9): in-place text via the shared helper.
+                self._set_ete_text(i, status, cumulative[i], rate)
+        finally:
+            self.series_table.setUpdatesEnabled(True)
 
         self._update_series_summary(queue)
+
+    @staticmethod
+    def _ipm_text(job: dict) -> str:
+        """The img/min cell's display text for *job* — used both to
+        render the cell and as the change-detection key for the in-place
+        update cache."""
+        ipm = job.get("images_per_minute", 0.0)
+        return f"{ipm:.0f}" if job["status"] == "done" and ipm > 0 else "—"
 
     def on_queue_ready_for_selection(self, queue: list) -> None:
         """Engine paused after query — show checkboxes for manual selection."""
@@ -1209,6 +1274,7 @@ class SourceDashboard(QWidget):
             f"[{info.get('modality', '')}] {info['series_description']}")
         self._active_series_uid = info.get("series_uid")
         self._active_series_done = 0
+        self._last_progress_ts = time.monotonic()
         self._slow_transfer_timer.start(_SLOW_TRANSFER_TIMEOUT_MS)
         # Drive the per-second Pending / ETE countdown for as long as a
         # transfer is in flight.
@@ -1225,6 +1291,7 @@ class SourceDashboard(QWidget):
         if self._active_series_uid is None or self._restart_pending:
             return
         self._active_series_done = max(completed, 0)
+        self._last_progress_ts = time.monotonic()
         self._slow_transfer_timer.start(_SLOW_TRANSFER_TIMEOUT_MS)
 
     def _disarm_active_transfer(self) -> None:
@@ -1237,6 +1304,7 @@ class SourceDashboard(QWidget):
         self._slow_transfer_timer.stop()
         self._active_series_uid = None
         self._active_series_done = 0
+        self._last_progress_ts = 0.0
         self._live_refresh_timer.stop()
 
     def on_series_completed(self, series_uid: str, images: int) -> None:
@@ -1265,6 +1333,19 @@ class SourceDashboard(QWidget):
         non-modal warning, and auto-restarts to unblock a wedged C-MOVE."""
         if self._pacs_connection_lost:
             return
+        # Guard against a SPURIOUS firing: the watchdog is a GUI-thread
+        # QTimer, so if the GUI thread was busy (e.g. rendering a big
+        # queue) the timer can fire late even though images kept arriving
+        # — the queued ``on_series_progress`` re-arms just hadn't been
+        # delivered yet.  Re-check the real elapsed time since the last
+        # progress; if it's under the timeout the transfer is alive, so
+        # re-arm for the remainder instead of restarting.
+        if self._active_series_uid is not None and self._last_progress_ts:
+            elapsed_ms = (time.monotonic() - self._last_progress_ts) * 1000
+            if elapsed_ms < _SLOW_TRANSFER_TIMEOUT_MS:
+                remaining = int(_SLOW_TRANSFER_TIMEOUT_MS - elapsed_ms)
+                self._slow_transfer_timer.start(max(remaining, 100))
+                return
         uid = self._active_series_uid or "?"
         logger.warning(
             f"[{self.remote_key}] Slow/stalled transfer detected "
@@ -1615,7 +1696,10 @@ class SourceDashboard(QWidget):
         # Stop the live Pending / ETE countdown (and stall watchdog) —
         # no transfer is active.
         self._disarm_active_transfer()
-        # Table was just cleared — next on_queue_updated must rebuild.
+        # Table was just cleared — drop the per-row render cache and
+        # force the next on_queue_updated to rebuild.
+        self._queue_cell_cache.clear()
+        self._last_progress_ts = 0.0
         self._rendered_uids = None
         self._last_high_load_groups = set()
         self.stat_last.setText("\u2014")

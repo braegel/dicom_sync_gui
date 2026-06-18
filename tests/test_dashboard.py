@@ -497,6 +497,54 @@ class TestLiveRefreshPerformance:
         self.dashboard._refresh_pending_and_ete()
         assert self.dashboard.series_table.item(0, 6).text() == before
 
+    def test_in_place_update_reuses_pending_item(self):
+        """The per-series in-place update must not reallocate the Pending
+        cell each time (that churn is what froze the UI)."""
+        self.dashboard.show()
+        queue = [self._make_job_dict(series_uid="u1", remote_count=200,
+                                     local_count=0)]
+        self.dashboard.on_queue_updated(queue)
+        pending_before = self.dashboard.series_table.item(0, 6)
+        # Same uid sequence → in-place path; mutate local_count so the
+        # pending text changes.
+        queue2 = [self._make_job_dict(series_uid="u1", remote_count=200,
+                                      local_count=50)]
+        self.dashboard.on_queue_updated(queue2)
+        assert self.dashboard.series_table.item(0, 6) is pending_before
+        assert self.dashboard.series_table.item(0, 6).text() == "150"
+
+
+class TestSlowTransferWatchdogSpuriousGuard:
+    """The stall watchdog must NOT auto-restart when its timer merely
+    fired late (GUI thread was busy) but real progress was recent."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+        self.dashboard._service_running = True
+
+    def test_recent_progress_does_not_restart(self):
+        import time as _t
+        self.dashboard._active_series_uid = "u1"
+        # Last progress was 2s ago — well under the 10s timeout.
+        self.dashboard._last_progress_ts = _t.monotonic() - 2.0
+        with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
+                patch.object(self.dashboard, "_play_sound"):
+            self.dashboard._on_slow_transfer_detected()
+        restart.assert_not_called()
+
+    def test_genuine_stall_restarts(self):
+        import time as _t
+        self.dashboard._active_series_uid = "u1"
+        # Last progress was 20s ago — a real stall.
+        self.dashboard._last_progress_ts = _t.monotonic() - 20.0
+        with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
+                patch.object(self.dashboard, "_play_sound"), \
+                patch.object(self.dashboard, "_show_slow_transfer_notice"):
+            self.dashboard._on_slow_transfer_detected()
+        restart.assert_called_once()
+
 
 class TestIncrementalQueueUpdate:
     """on_queue_updated must do a full rebuild only when the incoming
