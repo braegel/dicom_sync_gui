@@ -6,7 +6,6 @@ Emits Qt signals so the GUI can display queue and progress in real time.
 """
 
 import logging
-import re
 import sqlite3
 import threading
 import time
@@ -16,6 +15,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, Signal
 
+from core import queue_planner
 from core.dicom_ops import DicomOperations, PacsConnectionError
 from core.stats_utils import median
 from core.transfer_log import TransferLog, default_db_path
@@ -127,20 +127,12 @@ MAX_SERIES_TRANSFER_ATTEMPTS = 3
 # when the series completes, regardless of this interval.
 PROGRESS_EMIT_INTERVAL_S = 0.5
 
-# Series whose description matches this pattern (case-insensitive,
-# "ax" at a word start: "Axial", "ax 3mm", "T2 ax" — but NOT "Thorax")
-# are transferred before all other series of the same priority tier —
-# across studies and patients.  Axial reconstructions are the primary
-# reading series; pulling them first means every study becomes readable
-# as early as possible while reformats backfill afterwards.
-AXIAL_PRIORITY_PATTERN = re.compile(r"\bax", re.IGNORECASE)
-
-# The first series of each study with more than this many remote images
-# is pulled before everything else (even before the axial fast-lane) —
-# across studies and patients.  This gets one substantial, viewable
-# series of every study on screen as early as possible, so a reader can
-# triage all pending studies before any single one finishes in full.
-FIRST_SERIES_MIN_IMAGES = 10
+# Queue-ordering rules (axial fast-lane, first-substantial fast-lane,
+# priority terms) live in the pure, Qt-free core.queue_planner module.
+# Re-exported here so existing importers of these names from
+# core.transfer_engine keep working.
+AXIAL_PRIORITY_PATTERN = queue_planner.AXIAL_PRIORITY_PATTERN
+FIRST_SERIES_MIN_IMAGES = queue_planner.FIRST_SERIES_MIN_IMAGES
 
 
 @dataclass
@@ -761,139 +753,34 @@ class TransferEngine:
         return self._sort_jobs_by_priority(
             jobs, terms, log_label=self.remote_key)
 
+    # The queue-ordering rules live in the pure core.queue_planner
+    # module.  These thin staticmethod wrappers preserve the historical
+    # TransferEngine._foo(...) call sites and the unit tests that target
+    # them directly, while delegating the logic to the testable module.
     @staticmethod
     def _sort_jobs_by_priority(jobs: List[SeriesJob],
                                terms: List[Dict[str, Any]],
                                log_label: str = "") -> List[SeriesJob]:
-        """Pure stable-sort: studies that contain at least one
-        priority-matching series float to the top, in the order the
-        terms appear.
-
-        Prior studies (``is_prior``) always sort BELOW every current
-        study, even when one of their series matches a priority term —
-        a Voruntersuchung must never delay a fresh study.  Within the
-        prior block the term order applies again.
-
-        Within each (is_prior, study-priority) tier two fast-lanes
-        apply, across studies and patients:
-          1. the FIRST series of each study with more than
-             ``FIRST_SERIES_MIN_IMAGES`` remote images leads — one
-             substantial, viewable series of every study arrives first
-             so a reader can triage all pending studies early;
-          2. then axial series (description matches
-             ``AXIAL_PRIORITY_PATTERN``) — the primary reading series.
-        Both rules deliberately break study grouping.
-
-        Composed of small helpers, each independently testable:
-        ``_compile_matchers`` → ``_compute_study_priorities`` /
-        ``_first_substantial_series_uids`` → stable-sort.
-        """
-        matchers = TransferEngine._compile_matchers(terms, log_label)
-        study_prio = TransferEngine._compute_study_priorities(
-            jobs, matchers)
-        first_substantial = TransferEngine._first_substantial_series_uids(
-            jobs)
-        # Stable sort by (is_prior, study_priority, not-first-substantial,
-        # non-axial, original_position):
-        #   - current studies always precede priors,
-        #   - priority studies float to the top in priority order,
-        #   - each study's first >10-image series leads its tier,
-        #   - axial series come next within their tier, across patients,
-        #   - within the same slot, original order is kept.
-        indexed = list(enumerate(jobs))
-        indexed.sort(
-            key=lambda pair: (pair[1].is_prior,
-                              study_prio[pair[1].study_uid],
-                              pair[1].series_uid not in first_substantial,
-                              not TransferEngine._is_axial(
-                                  pair[1].series_description),
-                              pair[0]))
-        return [j for _, j in indexed]
+        return queue_planner.sort_jobs_by_priority(jobs, terms, log_label)
 
     @staticmethod
     def _first_substantial_series_uids(
             jobs: List[SeriesJob]) -> Set[str]:
-        """Return the set of ``series_uid``s that are, per study, the
-        FIRST series (in original queue order) whose ``remote_count``
-        exceeds ``FIRST_SERIES_MIN_IMAGES``.
-
-        Exactly one series per study qualifies (the first that clears
-        the threshold); studies whose series are all small contribute
-        none.  These lead the queue so every study gets one viewable
-        series early — across studies and patients."""
-        seen_studies: Set[str] = set()
-        result: Set[str] = set()
-        for j in jobs:
-            if j.study_uid in seen_studies:
-                continue
-            if j.remote_count > FIRST_SERIES_MIN_IMAGES:
-                seen_studies.add(j.study_uid)
-                result.add(j.series_uid)
-        return result
+        return queue_planner.first_substantial_series_uids(jobs)
 
     @staticmethod
     def _is_axial(series_description: str) -> bool:
-        """True when *series_description* contains "ax" at a word
-        start (case-insensitive): "Axial", "T2 ax 3mm", "AX T2".
-        Words merely containing/ending in "ax" ("Thorax", "max") do
-        not count."""
-        return bool(AXIAL_PRIORITY_PATTERN.search(
-            series_description or ""))
+        return queue_planner.is_axial(series_description)
 
     @staticmethod
     def _compile_matchers(terms: List[Dict[str, Any]],
                           log_label: str = "") -> list:
-        """Build one matcher per term.  Each matcher takes a series
-        description and returns ``True`` if it matches.  Invalid
-        regexes are logged and become permanently-False matchers."""
-        prefix = f"[{log_label}] " if log_label else ""
-        matchers = []
-        for entry in terms:
-            t = entry.get("term", "") if isinstance(entry, dict) else ""
-            if not t:
-                matchers.append(lambda _s: False)
-                continue
-            if entry.get("is_regex"):
-                try:
-                    pat = re.compile(t, re.IGNORECASE)
-                    matchers.append(
-                        lambda s, p=pat: bool(p.search(s or "")))
-                except re.error as exc:
-                    # Visible in the log so the user can tell why a
-                    # priority entry no longer biases the queue.
-                    logger.warning(
-                        f"{prefix}priority regex {t!r} did not "
-                        f"compile: {exc} — the entry will match "
-                        f"nothing this cycle")
-                    matchers.append(lambda _s: False)
-            else:
-                needle = t.casefold()
-                matchers.append(
-                    lambda s, n=needle: n in (s or "").casefold())
-        return matchers
+        return queue_planner.compile_matchers(terms, log_label)
 
     @staticmethod
     def _compute_study_priorities(
             jobs: List[SeriesJob], matchers: list) -> Dict[str, int]:
-        """Per study_uid: index of the FIRST matcher that fires on any
-        of its series descriptions.  Studies with no match get the
-        sentinel ``len(matchers)`` and end up at the bottom."""
-        sentinel = len(matchers)
-        out: Dict[str, int] = {}
-        for j in jobs:
-            best = sentinel
-            for i, m in enumerate(matchers):
-                if m(j.series_description):
-                    best = i
-                    break
-            # Keep the *lowest* matcher index seen across the study's
-            # series.  ``study_uid not in out`` handles the first
-            # series we see for this study (no prior value), then the
-            # subsequent ones tighten ``best`` if they hit a higher-
-            # priority term.
-            if j.study_uid not in out or best < out[j.study_uid]:
-                out[j.study_uid] = best
-        return out
+        return queue_planner.compute_study_priorities(jobs, matchers)
 
     def _build_study_jobs(
             self, dicom_ops: DicomOperations, study_ds,
