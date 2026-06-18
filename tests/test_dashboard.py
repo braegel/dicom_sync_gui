@@ -299,6 +299,25 @@ class TestDashboardUI:
         for k in ("hours", "max_images", "sync_interval"):
             assert k in emitted_params
 
+    def test_safety_timeout_forces_restart_not_stopped(self):
+        """If the engine never emits service_stopped after a Restart
+        (wedged in a C-MOVE), the safety timeout must FORCE a fresh
+        start rather than abandon the restart and leave it Stopped."""
+        starts = []
+        self.dashboard.start_requested.connect(
+            lambda *args: starts.append(args))
+
+        self.dashboard.set_service_running(True)
+        self.dashboard.btn_restart.click()   # sets _restart_pending
+        assert self.dashboard._restart_pending is True
+
+        # service_stopped never arrives → safety timeout fires.
+        self.dashboard._on_restart_safety_timeout()
+
+        assert self.dashboard._restart_pending is False
+        assert len(starts) == 1, (
+            "safety timeout must force start_requested, not give up")
+
     def test_normal_stop_does_not_trigger_restart(self):
         """A plain Stop click must NOT cause the dashboard to
         auto-start the engine again."""

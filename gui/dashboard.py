@@ -105,6 +105,14 @@ _SLOW_TRANSFER_TIMEOUT_MS = 10_000
 # service restarts regardless of whether the user ever sees it.
 _SLOW_TRANSFER_NOTICE_MS = 5_000
 
+# How long to wait for the engine to actually stop after a Restart click
+# before forcing the issue.  A wedged C-MOVE only unblocks once its DIMSE
+# timeout (300 s in core.dicom_ops) elapses, so this MUST exceed that —
+# otherwise the safety timer fires while the engine is still legitimately
+# winding down a stuck transfer and the restart is abandoned, leaving the
+# service "Stopped".  360 s = 300 s DIMSE + margin.
+_RESTART_SAFETY_TIMEOUT_MS = 360_000
+
 # Statuses a series can no longer leave: it contributes no pending
 # images and gets no ETE.  "unavailable" = retry budget exhausted.
 # Canonical definition now lives in core.transfer_engine; aliased here
@@ -809,26 +817,43 @@ class SourceDashboard(QWidget):
         self._restart_is_auto = auto_restart
         self._restart_params = self._current_service_params()
         self.lbl_status.setText("Restarting…")
-        # 60 s = 2 × the closeEvent join timeout in MainWindow; if
-        # the engine hasn't stopped by then something is wedged.
-        self._restart_safety_timer.start(60_000)
+        # Must exceed the engine's DIMSE timeout: a wedged C-MOVE only
+        # unblocks (and lets the loop emit service_stopped) once that
+        # elapses.  A shorter window would fire while the engine is still
+        # legitimately winding down and abandon the restart.
+        self._restart_safety_timer.start(_RESTART_SAFETY_TIMEOUT_MS)
         self.stop_requested.emit(self.remote_key)
 
     def _on_restart_safety_timeout(self) -> None:
         """Fired if a Restart click never gets its corresponding
-        ``set_service_running(False)`` callback within 60 s — clears
-        the pending flag so the status label and cycle handlers
-        recover."""
+        ``set_service_running(False)`` callback within the safety window
+        — the engine is genuinely wedged.
+
+        Rather than abandon the restart (which left the service silently
+        "Stopped"), force it through: re-issue the start with the
+        snapshotted params so the service comes back up on a fresh
+        engine.  An auto-restart (watchdog) forces the start with the
+        auto flag so MainWindow keeps retrying if the PACS is still
+        unreachable."""
         if not self._restart_pending:
             return
+        params = self._restart_params
+        auto = self._restart_is_auto
         self._restart_pending = False
         self._restart_params = None
-        self.lbl_status.setText(
-            "Restart timed out — engine did not stop within 60 s.")
+        self._restart_is_auto = False
         logger.warning(
-            f"[{self.remote_key}] restart safety timeout fired; "
-            f"engine did not emit service_stopped after the Restart "
-            f"click — pending flag cleared")
+            f"[{self.remote_key}] restart safety timeout fired; engine "
+            f"did not emit service_stopped — forcing a fresh start")
+        if self.remote_key not in self.config.remote_nodes:
+            self.lbl_status.setText("Restart cancelled — source removed.")
+            return
+        if params is not None:
+            self.hours_spin.setValue(params.hours)
+            self.max_images_spin.setValue(params.max_images)
+            self.interval_spin.setValue(params.sync_interval)
+            self.manual_selection_check.setChecked(params.selection_mode)
+        self._on_start_clicked(auto_restart=auto)
 
     def _current_service_params(self) -> ServiceParams:
         return ServiceParams(
