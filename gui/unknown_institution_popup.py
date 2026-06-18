@@ -23,6 +23,12 @@ from gui.styles import BTN_OK_BLUE
 
 logger = logging.getLogger("dicom_sync")
 
+# Header styling (kept local so this popup stays self-contained — these
+# values aren't exported by gui.styles).
+_WARN_COLOR = "#f39c12"
+_HEADER_FONT_SIZE = 14
+_LABEL_PADDING = "4px"
+
 
 def _play_alert() -> None:
     """Play system beep / alert sound."""
@@ -32,7 +38,8 @@ def _play_alert() -> None:
         if app:
             app.beep()
     except Exception:
-        pass
+        logger.debug("UnknownInstitutionPopup: alert beep failed",
+                     exc_info=True)
 
 
 class UnknownInstitutionPopup(QDialog):
@@ -65,9 +72,9 @@ class UnknownInstitutionPopup(QDialog):
         # Warning icon + message
         header = QLabel(
             "\u26a0  Unknown Institution")
-        header.setFont(QFont("", 14, QFont.Bold))
+        header.setFont(QFont("", _HEADER_FONT_SIZE, QFont.Bold))
         header.setStyleSheet(
-            "QLabel { color: #f39c12; padding: 4px; }")
+            f"QLabel {{ color: {_WARN_COLOR}; padding: {_LABEL_PADDING}; }}")
         layout.addWidget(header)
 
         msg = QLabel(
@@ -78,7 +85,7 @@ class UnknownInstitutionPopup(QDialog):
             f"You can assign this institution to a group now, or "
             f"manage it later in Settings \u2192 Manage Filter Groups.")
         msg.setWordWrap(True)
-        msg.setStyleSheet("QLabel { padding: 4px; }")
+        msg.setStyleSheet(f"QLabel {{ padding: {_LABEL_PADDING}; }}")
         layout.addWidget(msg)
 
         # Assignment controls

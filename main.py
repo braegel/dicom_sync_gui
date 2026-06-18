@@ -54,21 +54,14 @@ logging.basicConfig(
 logger = logging.getLogger("dicom_sync")
 
 
-def check_dependencies():
+def check_dependencies() -> None:
     """Check that required packages are installed."""
-    missing = []
-    try:
-        import PySide6
-    except ImportError:
-        missing.append("PySide6")
-    try:
-        import pydicom
-    except ImportError:
-        missing.append("pydicom")
-    try:
-        import pynetdicom
-    except ImportError:
-        missing.append("pynetdicom")
+    import importlib.util
+
+    missing = [
+        name for name in ("PySide6", "pydicom", "pynetdicom")
+        if importlib.util.find_spec(name) is None
+    ]
 
     if missing:
         print(f"Missing dependencies: {', '.join(missing)}")
@@ -76,15 +69,56 @@ def check_dependencies():
         sys.exit(1)
 
 
-def main():
+def _ensure_config(config) -> None:
+    """Load the config, running the first-run setup dialog if none exists.
+
+    Exits the process if the user cancels the initial-setup dialog.
+    """
+    if not config.load():
+        logger.info("No configuration found. Opening settings...")
+        # Show settings dialog for first-time setup
+        from gui.settings_dialog import SettingsDialog
+        dlg = SettingsDialog(config)
+        dlg.setWindowTitle("Initial Setup — DICOM Sync")
+        if dlg.exec() != SettingsDialog.Accepted:
+            sys.exit(0)
+
+
+def _configure_gc(app) -> None:
+    """Install the GC workaround for the Python 3.14 cross-thread crash.
+
+    Python 3.14's incremental GC runs mark_stacks at any bytecode
+    safepoint on any thread.  When the service-loop thread triggers a
+    collection while the Qt thread is mid-dealloc of a PySide wrapper,
+    the stack walk races the dealloc and SIGSEGVs in mark_stacks.
+    Mitigation: freeze all startup objects so they're never scanned,
+    disable automatic GC entirely, and drive collection ourselves from
+    a QTimer that only ever fires on the main thread.  With automatic
+    GC off, mark_stacks can never run on the service-loop thread, so
+    the cross-thread race becomes unreachable.  Refcount cleanup is
+    unaffected.
+
+    The QTimer is parented to *app* so it outlives this function
+    (``main`` never returns, but parenting keeps it explicit).
+    """
+    from PySide6.QtCore import QTimer
+
+    gc.freeze()
+    gc.disable()
+    gc_timer = QTimer(app)
+    gc_timer.setInterval(60 * 1000)
+    gc_timer.timeout.connect(lambda: gc.collect())
+    gc_timer.start()
+
+
+def main() -> None:
     check_dependencies()
 
     from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtCore import Qt
 
     from core.config import AppConfig
     from gui.main_window import MainWindow
-    from gui.settings_dialog import SettingsDialog
     from gui.styles import DARK_THEME
 
     # High-DPI support
@@ -100,13 +134,7 @@ def main():
 
     # Load or create config
     config = AppConfig()
-    if not config.load():
-        logger.info("No configuration found. Opening settings...")
-        # Show settings dialog for first-time setup
-        dlg = SettingsDialog(config)
-        dlg.setWindowTitle("Initial Setup — DICOM Sync")
-        if dlg.exec() != SettingsDialog.Accepted:
-            sys.exit(0)
+    _ensure_config(config)
 
     # Auto-update local IP
     config.update_local_ip()
@@ -115,22 +143,7 @@ def main():
     window = MainWindow(config)
     window.show()
 
-    # Python 3.14's incremental GC runs mark_stacks at any bytecode
-    # safepoint on any thread.  When the service-loop thread triggers a
-    # collection while the Qt thread is mid-dealloc of a PySide wrapper,
-    # the stack walk races the dealloc and SIGSEGVs in mark_stacks.
-    # Mitigation: freeze all startup objects so they're never scanned,
-    # disable automatic GC entirely, and drive collection ourselves from
-    # a QTimer that only ever fires on the main thread.  With automatic
-    # GC off, mark_stacks can never run on the service-loop thread, so
-    # the cross-thread race becomes unreachable.  Refcount cleanup is
-    # unaffected.
-    gc.freeze()
-    gc.disable()
-    gc_timer = QTimer()
-    gc_timer.setInterval(60 * 1000)
-    gc_timer.timeout.connect(lambda: gc.collect())
-    gc_timer.start()
+    _configure_gc(app)
 
     sys.exit(app.exec())
 

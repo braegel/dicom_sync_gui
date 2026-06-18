@@ -47,13 +47,19 @@ class TransferStatsWindow(QWidget):
         try:
             self._log.close()
         except Exception:
-            pass
+            logger.debug("TransferStatsWindow: closing log failed",
+                         exc_info=True)
         super().closeEvent(event)
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
+        self._build_filters(layout)
+        self._build_summary(layout)
+        self._build_chart(layout)
+        self._build_breakdown_tables(layout)
+        self._build_detail_tabs(layout)
 
-        # ── Filters ──────────────────────────────────────────────────
+    def _build_filters(self, layout: QVBoxLayout) -> None:
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Source:"))
         self.filter_source = QComboBox()
@@ -69,7 +75,7 @@ class TransferStatsWindow(QWidget):
         filter_row.addWidget(self.btn_refresh)
         layout.addLayout(filter_row)
 
-        # ── Summary ──────────────────────────────────────────────────
+    def _build_summary(self, layout: QVBoxLayout) -> None:
         self.summary_group = QGroupBox("Summary")
         sg = QGridLayout(self.summary_group)
         self.lbl_total_studies = QLabel("—")
@@ -89,7 +95,7 @@ class TransferStatsWindow(QWidget):
         sg.addWidget(self.lbl_median_mbps, 1, 5)
         layout.addWidget(self.summary_group)
 
-        # ── Boxplot chart ────────────────────────────────────────────
+    def _build_chart(self, layout: QVBoxLayout) -> None:
         chart_row = QHBoxLayout()
         chart_row.addWidget(QLabel("Aggregate by:"))
         self.combo_aggregation = QComboBox()
@@ -108,7 +114,7 @@ class TransferStatsWindow(QWidget):
         self.chart_view.setMinimumHeight(400)
         layout.addWidget(self.chart_view)
 
-        # ── Breakdown tables ─────────────────────────────────────────
+    def _build_breakdown_tables(self, layout: QVBoxLayout) -> None:
         breakdown = QHBoxLayout()
 
         source_group = QGroupBox("Per Source")
@@ -127,7 +133,7 @@ class TransferStatsWindow(QWidget):
 
         layout.addLayout(breakdown)
 
-        # ── Detail tabs ──────────────────────────────────────────────
+    def _build_detail_tabs(self, layout: QVBoxLayout) -> None:
         tabs = QTabWidget()
         study_tab = QWidget()
         stl = QVBoxLayout(study_tab)

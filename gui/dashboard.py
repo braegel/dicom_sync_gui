@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QApplication,
 )
 
-from core.transfer_engine import TransferStats
+from core.transfer_engine import TERMINAL_STATUSES, TransferStats
 # WAV synthesis lives in gui.notification_sound (which owns the
 # module-level path cache); ``_generate_default_sound`` and the two
 # frequency constants are re-exported here for backwards compatibility
@@ -106,7 +106,9 @@ _SLOW_TRANSFER_NOTICE_MS = 5_000
 
 # Statuses a series can no longer leave: it contributes no pending
 # images and gets no ETE.  "unavailable" = retry budget exhausted.
-_TERMINAL_STATUSES = ("done", "error", "skipped", "unavailable")
+# Canonical definition now lives in core.transfer_engine; aliased here
+# for minimal churn so existing _TERMINAL_STATUSES call sites keep working.
+_TERMINAL_STATUSES = TERMINAL_STATUSES
 
 # Palette.  Green/yellow/red are defined in gui.study_rate (single
 # source of truth, shared with the studies-per-hour colour bands) and
@@ -160,10 +162,10 @@ class StatsLabel(QLabel):
 
     @staticmethod
     def _style(color: str) -> str:
-        bg = "#2c2c2c" if color == "white" else (
-            "#1a3a1a" if color == COLOR_GREEN else
-            "#3a1a1a" if color == COLOR_RED else "#2c2c2c"
-        )
+        bg = {
+            COLOR_GREEN: "#1a3a1a",
+            COLOR_RED: "#3a1a1a",
+        }.get(color, "#2c2c2c")
         return (
             f"QLabel {{ color: {color}; background: {bg}; "
             f"border: 1px solid #555; border-radius: 6px; padding: 6px; }}"
@@ -828,6 +830,9 @@ class SourceDashboard(QWidget):
         engine is stopped while MainWindow keeps probing an unreachable
         PACS, but the user must still be able to Stop the loop, so keep
         the Stop button live and show *message*."""
+        # NOTE(i18n): *message* arrives pre-rendered from the caller; any
+        # German wording should be produced via core.i18n.tr(key, language)
+        # at the call site once the corresponding keys exist in core/i18n.py.
         self._service_running = True
         self._apply_control_enabled(True)
         self.lbl_status.setText(message)
@@ -848,10 +853,8 @@ class SourceDashboard(QWidget):
         self._apply_selection_ui_visible(False)
         self.series_table.setColumnHidden(0, True)
         # No transfer can be in flight once stopped — halt the live
-        # Pending / ETE countdown.
-        self._live_refresh_timer.stop()
-        self._active_series_uid = None
-        self._active_series_done = 0
+        # Pending / ETE countdown (and the stall watchdog).
+        self._disarm_active_transfer()
         if self._restart_pending:
             # Engine reached the idle state we were waiting for after
             # a Restart click; bring it back up with the params
@@ -1224,19 +1227,25 @@ class SourceDashboard(QWidget):
         self._active_series_done = max(completed, 0)
         self._slow_transfer_timer.start(_SLOW_TRANSFER_TIMEOUT_MS)
 
-    def on_series_completed(self, series_uid: str, images: int) -> None:
-        """Called when a series finishes successfully \u2014 disarms the watchdog."""
+    def _disarm_active_transfer(self) -> None:
+        """Tear down all per-transfer activity: stop the stall watchdog,
+        forget the active series, and halt the per-second Pending / ETE
+        countdown.  Shared by on_series_completed / on_series_error (a
+        series finished) and by the stopped path of set_service_running /
+        reset (no transfer can be in flight).  Each call is a no-op when
+        the timers are already stopped, so it is safe at every site."""
         self._slow_transfer_timer.stop()
         self._active_series_uid = None
         self._active_series_done = 0
         self._live_refresh_timer.stop()
 
+    def on_series_completed(self, series_uid: str, images: int) -> None:
+        """Called when a series finishes successfully \u2014 disarms the watchdog."""
+        self._disarm_active_transfer()
+
     def on_series_error(self, series_uid: str, error_msg: str) -> None:
         """Called when a series transfer fails \u2014 disarms the watchdog."""
-        self._slow_transfer_timer.stop()
-        self._active_series_uid = None
-        self._active_series_done = 0
-        self._live_refresh_timer.stop()
+        self._disarm_active_transfer()
 
     def on_connection_lost(self, remote_key: str, detail: str) -> None:
         """PACS became unreachable \u2014 suppress the slow-transfer watchdog restart.
@@ -1274,6 +1283,9 @@ class SourceDashboard(QWidget):
         the existing notice instead of stacking new dialogs the user
         would have to click away, and it auto-closes after a few seconds
         so it never sits in front of the running service."""
+        # TODO(i18n): these user-facing German strings (and the window
+        # title below) should move to core.i18n.tr(key, language) once the
+        # corresponding translation keys exist in core/i18n.py.
         text = (
             f"Ein Bild-Download bei <b>{self.remote_key}</b> hat l\u00e4nger als "
             f"{_SLOW_TRANSFER_TIMEOUT_MS // 1000} Sekunden gedauert.\n\n"
@@ -1572,10 +1584,9 @@ class SourceDashboard(QWidget):
         self.series_table.setRowCount(0)
         self._current_stats = None
         self._last_queue = []
-        # Stop the live Pending / ETE countdown — no transfer is active.
-        self._live_refresh_timer.stop()
-        self._active_series_uid = None
-        self._active_series_done = 0
+        # Stop the live Pending / ETE countdown (and stall watchdog) —
+        # no transfer is active.
+        self._disarm_active_transfer()
         # Table was just cleared — next on_queue_updated must rebuild.
         self._rendered_uids = None
         self._last_high_load_groups = set()

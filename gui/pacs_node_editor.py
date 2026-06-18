@@ -16,7 +16,7 @@ from typing import Optional
 
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+    QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QSpinBox, QWidget,
 )
 
@@ -38,6 +38,12 @@ class PacsNodeEditor(QWidget):
         layout = QFormLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        self._build_remote_section(layout)
+        self._build_service_section(layout)
+        self._build_local_section(layout)
+        self._build_sound_section(layout)
+
+    def _build_remote_section(self, layout: QFormLayout) -> None:
         # ── Remote PACS connection ──
         self.name_edit = QLineEdit()
         self.ae_title_edit = QLineEdit()
@@ -59,6 +65,7 @@ class PacsNodeEditor(QWidget):
         # stays so existing callers/tests can still check for it.
         self.retrieve_combo = None
 
+    def _build_service_section(self, layout: QFormLayout) -> None:
         # ── Per-source service parameters ──
         self._add_separator(layout, "Service Parameters")
 
@@ -81,6 +88,7 @@ class PacsNodeEditor(QWidget):
         self.interval_spin.setSuffix(" sec")
         layout.addRow("Query interval:", self.interval_spin)
 
+    def _build_local_section(self, layout: QFormLayout) -> None:
         # ── Local destination (C-MOVE target) ──
         self._add_separator(layout, "Local Destination (C-MOVE Target)")
 
@@ -111,6 +119,7 @@ class PacsNodeEditor(QWidget):
         fb_widget.setLayout(fb_layout)
         layout.addRow("Fallback Folder:", fb_widget)
 
+    def _build_sound_section(self, layout: QFormLayout) -> None:
         # ── Notification sound ──
         self._add_separator(layout, "Notification Sound")
 
@@ -130,8 +139,10 @@ class PacsNodeEditor(QWidget):
 
     @staticmethod
     def _add_separator(layout: QFormLayout, title: str) -> None:
-        sep = QLabel("─" * 30)
-        sep.setStyleSheet("QLabel { color: #666; }")
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        sep.setStyleSheet("QFrame { color: #666; }")
         layout.addRow("", sep)
         lbl = QLabel(title)
         lbl.setFont(QFont("", -1, QFont.Bold))

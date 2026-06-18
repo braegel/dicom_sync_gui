@@ -48,8 +48,8 @@ class SettingsDialog(QDialog):
         self.setMinimumSize(780, 640)
 
         # Internal tracking — must init before _setup_ui
-        self._remote_keys: list = []
-        self._remote_nodes: dict = {}
+        self._remote_keys: list[str] = []
+        self._remote_nodes: dict[str, PacsNode] = {}
 
         self._setup_ui()
         self._load_config()
@@ -62,6 +62,19 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
 
+        tabs.addTab(self._build_source_tab(), "Source PACS")
+        tabs.addTab(self._build_general_tab(), "General")
+
+        layout.addWidget(tabs)
+
+        # Dialog buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _build_source_tab(self) -> QWidget:
         # ── Tab 1: Source PACS ──
         remote_tab = QWidget()
         remote_layout = QHBoxLayout(remote_tab)
@@ -123,8 +136,9 @@ class SettingsDialog(QDialog):
 
         remote_layout.addLayout(left, 1)
         remote_layout.addLayout(right, 2)
-        tabs.addTab(remote_tab, "Source PACS")
+        return remote_tab
 
+    def _build_general_tab(self) -> QWidget:
         # ── Tab 2: General ──
         general_tab = QWidget()
         gl = QFormLayout(general_tab)
@@ -156,16 +170,7 @@ class SettingsDialog(QDialog):
             "text copied from the Download Completions window.")
         gl.addRow("Language:", self.language_combo)
 
-        tabs.addTab(general_tab, "General")
-
-        layout.addWidget(tabs)
-
-        # Dialog buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        return general_tab
 
     # ── Mode switching ────────────────────────────────────────────────────
 

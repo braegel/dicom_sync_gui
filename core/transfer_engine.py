@@ -98,6 +98,12 @@ class SeriesCompletionRecord:
     images_per_minute: float = 0.0
 
 
+# Terminal SeriesJob.status values: a series in one of these states can
+# no longer change, contributes no pending images, and gets no ETE.
+# Single source of truth shared by the engine and the GUI (dashboard /
+# main_window) so the set cannot drift between them.
+TERMINAL_STATUSES = ("done", "error", "skipped", "unavailable")
+
 # Series with fewer than this many remote images may fail (error/
 # skipped) without blocking the study's fully_complete signal — small
 # series are typically localizers or stuck tiny series that should not
@@ -944,34 +950,18 @@ class TransferEngine:
                 continue
 
             seen_series.add(series_uid)
-            ser_date, ser_time = self._series_datetime(
-                ser, study_date, study_time)
-            # Series that already failed MAX_SERIES_TRANSFER_ATTEMPTS
-            # times stay visible in the queue with an "unavailable"
-            # status instead of being re-attempted forever — small
-            # series often fail to transfer for DICOM-level reasons.
-            blacklisted = self._transfer_log.is_series_blacklisted(
-                source_pacs=self.remote_key,
-                series_uid=series_uid,
-                max_attempts=MAX_SERIES_TRANSFER_ATTEMPTS)
-            jobs.append(SeriesJob(
-                patient_name=patient_name,
-                patient_id=patient_id,
-                study_description=study_desc,
-                series_description=getattr(ser, 'SeriesDescription', 'N/A'),
-                modality=getattr(ser, 'Modality', 'UN'),
-                series_number=str(getattr(ser, 'SeriesNumber', '')),
-                study_uid=study_uid,
-                series_uid=series_uid,
+            jobs.append(self._make_series_job(
+                ser,
                 remote_count=remote_count,
                 local_count=local_count,
-                institution_name=institution,
-                accession_number=accession,
+                patient_name=patient_name,
+                patient_id=patient_id,
+                study_uid=study_uid,
+                study_description=study_desc,
                 study_date=study_date,
                 study_time=study_time,
-                series_date=ser_date,
-                series_time=ser_time,
-                status="unavailable" if blacklisted else "queued",
+                institution_name=institution,
+                accession_number=accession,
             ))
         return jobs
 
@@ -986,6 +976,52 @@ class TransferEngine:
         s_time_raw = str(getattr(ser, 'SeriesTime', '') or '').strip()
         s_time = s_time_raw[:6]
         return (s_date or study_date, s_time or study_time)
+
+    def _make_series_job(self, ser, *, remote_count: int,
+                         local_count: int, patient_name: str,
+                         patient_id: str, study_uid: str,
+                         study_description: str, study_date: str,
+                         study_time: str, institution_name: str = "",
+                         accession_number: str = "",
+                         is_prior: bool = False) -> SeriesJob:
+        """Build one ``SeriesJob`` from a series C-FIND result.
+
+        Shared by the current-study and prior-study queue builders, which
+        otherwise duplicated this whole construction (series date/time
+        resolution, blacklist→"unavailable" status, field mapping).  The
+        differing bits (study_description prefix, institution/accession,
+        is_prior) are passed in by the caller."""
+        series_uid = getattr(ser, 'SeriesInstanceUID', '')
+        ser_date, ser_time = self._series_datetime(
+            ser, study_date, study_time)
+        # Series that already failed MAX_SERIES_TRANSFER_ATTEMPTS times
+        # stay visible in the queue with an "unavailable" status instead
+        # of being re-attempted forever — small series often fail to
+        # transfer for DICOM-level reasons.
+        blacklisted = self._transfer_log.is_series_blacklisted(
+            source_pacs=self.remote_key,
+            series_uid=series_uid,
+            max_attempts=MAX_SERIES_TRANSFER_ATTEMPTS)
+        return SeriesJob(
+            patient_name=patient_name,
+            patient_id=patient_id,
+            study_description=study_description,
+            series_description=getattr(ser, 'SeriesDescription', 'N/A'),
+            modality=getattr(ser, 'Modality', 'UN'),
+            series_number=str(getattr(ser, 'SeriesNumber', '')),
+            study_uid=study_uid,
+            series_uid=series_uid,
+            remote_count=remote_count,
+            local_count=local_count,
+            institution_name=institution_name,
+            accession_number=accession_number,
+            study_date=study_date,
+            study_time=study_time,
+            series_date=ser_date,
+            series_time=ser_time,
+            is_prior=is_prior,
+            status="unavailable" if blacklisted else "queued",
+        )
 
     def _transfer_series(self, job: SeriesJob,
                          dicom_ops: Optional[DicomOperations] = None
@@ -1124,94 +1160,111 @@ class TransferEngine:
         return 0
 
     def _check_study_complete(self, study_uid: str):
-        """Emit study_completed when all series of a study are done."""
+        """Emit study_completed once all series of a study are terminal.
+
+        Thin orchestrator: detect completion → persist the study record →
+        decide fully_complete (with one-shot chime de-dup) → emit."""
         if study_uid in self._completed_studies:
             return
-        study_series = [j for j in self._queue
-                        if j.study_uid == study_uid]
+        # Read the queue under the lock, per the class contract (see the
+        # _queue_lock docstring): whole-list reassignment is guarded, so
+        # snapshotting here keeps this consistent with that invariant
+        # even if a future caller runs it off the service thread.
+        with self._queue_lock:
+            study_series = [j for j in self._queue
+                            if j.study_uid == study_uid]
         if not study_series:
             return
-        if all(j.status in ("done", "error", "skipped", "unavailable")
-               for j in study_series):
-            self._completed_studies.add(study_uid)
-            institution = study_series[0].institution_name
-            # Log study-level aggregate to SQLite
-            done_series = [j for j in study_series if j.status == "done"]
-            total_images = sum(j.transferred_images for j in done_series)
-            if done_series:
-                first = done_series[0]
-                total_duration = sum(j.duration_seconds for j in done_series)
-                # Accumulated time spent on this study's own series
-                # (incl. failed attempts).  NOT first-start-to-last-
-                # end: the axial fast-lane interleaves studies in the
-                # queue, so that span would include other studies'
-                # downloads.
-                wall_clock = self._study_active_seconds.pop(
-                    study_uid, total_duration)
-                try:
-                    self._transfer_log.record_study(
-                        source_pacs=self.remote_key,
-                        study_uid=study_uid,
-                        patient_id=first.patient_id,
-                        accession_number=first.accession_number,
-                        study_date=first.study_date,
-                        study_time=first.study_time,
-                        modality=first.modality,
-                        study_description=first.study_description,
-                        total_series=len(done_series),
-                        total_images=total_images,
-                        total_duration_seconds=total_duration,
-                        wall_clock_seconds=wall_clock,
-                    )
-                except sqlite3.Error as e:
-                    logger.warning(f"TransferLog.record_study failed: {e}")
-                with self._study_wall_clock_lock:
-                    self._study_wall_clock[study_uid] = wall_clock
-            # fully_complete: every queued series of this study must be
-            # ``done``, except small series (< SMALL_SERIES_MAX_IMAGES…
-            # remote images) may also be error/skipped without blocking.
-            # Filter-rejected series are not in study_series at all, so
-            # they're naturally excluded.
+        if not all(j.status in TERMINAL_STATUSES for j in study_series):
+            return
 
-            def _ok_for_completion(j: SeriesJob) -> bool:
-                if j.status == "done":
-                    return True
-                # An "unavailable" series exhausted its retry budget;
-                # it can never arrive, so it must not block the study's
-                # fully_complete signal — same treatment as a small
-                # error/skipped series.
-                if j.status == "unavailable":
-                    return True
-                return j.remote_count < SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION
+        self._completed_studies.add(study_uid)
+        institution = study_series[0].institution_name
+        done_series = [j for j in study_series if j.status == "done"]
+        total_images = sum(j.transferred_images for j in done_series)
+        self._persist_study_record(study_uid, done_series, total_images)
 
-            fully_complete = all(_ok_for_completion(j)
-                                 for j in study_series)
-            # Suppress a duplicate "study complete" chime: a study that
-            # was already fully downloaded in an earlier cycle can be
-            # re-queried (the local PACS lags in reporting its counts) or
-            # re-run after an auto-restart, complete instantly with a
-            # no-op C-MOVE, and would otherwise chime every cycle.  We
-            # chime only the FIRST time a study reports fully_complete;
-            # ``_chimed_studies`` persists across cycles (unlike
-            # ``_completed_studies``, which is cleared each cycle).
-            if fully_complete:
-                if study_uid in self._chimed_studies:
-                    fully_complete = False
-                else:
-                    self._chimed_studies.add(study_uid)
-            self.signals.study_completed.emit(
-                study_uid, institution, fully_complete, total_images)
+        fully_complete = self._compute_fully_complete(study_uid, study_series)
+        self.signals.study_completed.emit(
+            study_uid, institution, fully_complete, total_images)
+
+    def _persist_study_record(self, study_uid: str,
+                              done_series: List[SeriesJob],
+                              total_images: int) -> None:
+        """Log the study-level aggregate to SQLite and stash its
+        wall-clock duration for the GUI to pop.  No-op when no series of
+        the study actually completed."""
+        if not done_series:
+            return
+        first = done_series[0]
+        total_duration = sum(j.duration_seconds for j in done_series)
+        # Accumulated time spent on this study's own series (incl. failed
+        # attempts).  NOT first-start-to-last-end: the axial fast-lane
+        # interleaves studies in the queue, so that span would include
+        # other studies' downloads.
+        wall_clock = self._study_active_seconds.pop(study_uid, total_duration)
+        try:
+            self._transfer_log.record_study(
+                source_pacs=self.remote_key,
+                study_uid=study_uid,
+                patient_id=first.patient_id,
+                accession_number=first.accession_number,
+                study_date=first.study_date,
+                study_time=first.study_time,
+                modality=first.modality,
+                study_description=first.study_description,
+                total_series=len(done_series),
+                total_images=total_images,
+                total_duration_seconds=total_duration,
+                wall_clock_seconds=wall_clock,
+            )
+        except sqlite3.Error as e:
+            logger.warning(f"TransferLog.record_study failed: {e}")
+        with self._study_wall_clock_lock:
+            self._study_wall_clock[study_uid] = wall_clock
+
+    def _compute_fully_complete(self, study_uid: str,
+                                study_series: List[SeriesJob]) -> bool:
+        """Decide whether the study counts as fully complete, applying
+        the one-shot chime de-dup.
+
+        fully_complete requires every queued series to be ``done``,
+        except small series (< SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION
+        remote images) and "unavailable" series (retry budget exhausted,
+        can never arrive) may also be error/skipped without blocking.
+        Filter-rejected series are not in study_series at all.
+
+        Chime de-dup: a study fully downloaded in an earlier cycle can be
+        re-queried (the local PACS lags in reporting its counts) or re-run
+        after an auto-restart and complete instantly with a no-op C-MOVE;
+        it would otherwise chime every cycle.  We report fully_complete
+        only the FIRST time — ``_chimed_studies`` persists across cycles,
+        unlike ``_completed_studies`` which is cleared each cycle."""
+        def _ok_for_completion(j: SeriesJob) -> bool:
+            if j.status in ("done", "unavailable"):
+                return True
+            return j.remote_count < SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION
+
+        if not all(_ok_for_completion(j) for j in study_series):
+            return False
+        if study_uid in self._chimed_studies:
+            return False
+        self._chimed_studies.add(study_uid)
+        return True
 
     def _check_patient_complete(self, patient_id: str):
         """Emit patient_studies_completed if all series for this patient
         (including priors) are done or errored."""
         if patient_id in self._completed_patients:
             return
-        patient_series = [j for j in self._queue
-                          if j.patient_id == patient_id]
+        # Read the queue under the lock, per the class contract — see
+        # _check_study_complete for the rationale.
+        with self._queue_lock:
+            patient_series = [j for j in self._queue
+                              if j.patient_id == patient_id]
         if not patient_series:
             return
-        if all(j.status in ("done", "error", "skipped", "unavailable")
+        if all(j.status in TERMINAL_STATUSES
                for j in patient_series):
             self._completed_patients.add(patient_id)
             institution = patient_series[0].institution_name
@@ -1348,29 +1401,17 @@ class TransferEngine:
                     remote_count, local_count, max_images):
                 continue
             seen_series.add(series_uid)
-            ser_date, ser_time = self._series_datetime(
-                ser, ps_date, ps_time)
-            blacklisted = self._transfer_log.is_series_blacklisted(
-                source_pacs=self.remote_key,
-                series_uid=series_uid,
-                max_attempts=MAX_SERIES_TRANSFER_ATTEMPTS)
-            jobs.append(SeriesJob(
-                patient_name=ps_name,
-                patient_id=pid,
-                study_description=f"[Prior] {ps_desc}",
-                series_description=getattr(ser, 'SeriesDescription', 'N/A'),
-                modality=getattr(ser, 'Modality', 'UN'),
-                series_number=str(getattr(ser, 'SeriesNumber', '')),
-                study_uid=ps_uid,
-                series_uid=series_uid,
+            jobs.append(self._make_series_job(
+                ser,
                 remote_count=remote_count,
                 local_count=local_count,
+                patient_name=ps_name,
+                patient_id=pid,
+                study_uid=ps_uid,
+                study_description=f"[Prior] {ps_desc}",
                 study_date=ps_date,
                 study_time=ps_time,
-                series_date=ser_date,
-                series_time=ser_time,
                 is_prior=True,
-                status="unavailable" if blacklisted else "queued",
             ))
         return jobs
 

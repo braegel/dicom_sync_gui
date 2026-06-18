@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QAbstractItemView,
     QFileDialog,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
 from core.config import (
@@ -36,8 +36,6 @@ logger = logging.getLogger("dicom_sync")
 
 class FilterGroupsDialog(QDialog):
     """Dialog for creating and managing institution filter groups."""
-
-    _query_results_ready = Signal(set)
 
     def __init__(self, config: AppConfig,
                  parent: Optional[QWidget] = None) -> None:
@@ -56,7 +54,6 @@ class FilterGroupsDialog(QDialog):
         self._setup_ui()
         self._refresh_group_list()
         self._refresh_institution_tree()
-        self._query_results_ready.connect(self._on_query_results)
 
     # ── UI ────────────────────────────────────────────────────────────────
 
@@ -64,6 +61,19 @@ class FilterGroupsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # ── Top: Query institutions from PACS ──
+        layout.addWidget(self._build_query_box())
+
+        # ── Middle: splitter with groups on left, institutions on right ──
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_groups_panel())
+        splitter.addWidget(self._build_institutions_panel())
+        splitter.setSizes([300, 600])
+        layout.addWidget(splitter, 1)
+
+        # ── Bottom: Export / Import / Save / Cancel ──
+        layout.addLayout(self._build_button_bar())
+
+    def _build_query_box(self) -> QGroupBox:
         query_group = QGroupBox("Discover Institutions from Source PACS")
         ql = QHBoxLayout()
 
@@ -85,11 +95,9 @@ class FilterGroupsDialog(QDialog):
         ql.addWidget(self.lbl_query_status)
 
         query_group.setLayout(ql)
-        layout.addWidget(query_group)
+        return query_group
 
-        # ── Middle: splitter with groups on left, institutions on right ──
-        splitter = QSplitter(Qt.Horizontal)
-
+    def _build_groups_panel(self) -> QGroupBox:
         # Left: Group management
         left_widget = QGroupBox("Filter Groups")
         left_layout = QVBoxLayout()
@@ -125,8 +133,9 @@ class FilterGroupsDialog(QDialog):
 
         left_layout.addLayout(grp_btn_layout)
         left_widget.setLayout(left_layout)
-        splitter.addWidget(left_widget)
+        return left_widget
 
+    def _build_institutions_panel(self) -> QGroupBox:
         # Right: Institution assignment
         right_widget = QGroupBox("Institutions")
         right_layout = QVBoxLayout()
@@ -180,12 +189,9 @@ class FilterGroupsDialog(QDialog):
 
         right_layout.addLayout(assign_layout)
         right_widget.setLayout(right_layout)
-        splitter.addWidget(right_widget)
+        return right_widget
 
-        splitter.setSizes([300, 600])
-        layout.addWidget(splitter, 1)
-
-        # ── Bottom: Export / Import / Save / Cancel ──
+    def _build_button_bar(self) -> QHBoxLayout:
         btn_layout = QHBoxLayout()
 
         self.btn_export = QPushButton("Export...")
@@ -211,7 +217,7 @@ class FilterGroupsDialog(QDialog):
         btn_save.clicked.connect(self._save)
         btn_layout.addWidget(btn_save)
 
-        layout.addLayout(btn_layout)
+        return btn_layout
 
     # ── Group management ──────────────────────────────────────────────────
 
@@ -390,9 +396,9 @@ class FilterGroupsDialog(QDialog):
         # Run the C-FIND on a background thread; ``run_in_background``
         # owns the weakref-shim that keeps a closed dialog from being
         # finalized on the worker thread (which used to segfault the
-        # QDialog destructor).  Results are delivered via the
-        # ``_query_results_ready`` Qt signal — Qt.AutoConnection
-        # marshals the call back to the GUI thread.
+        # QDialog destructor).  ``run_in_background`` also marshals the
+        # ``on_done`` callback back onto the GUI thread, so we can hand
+        # it ``_on_query_results`` directly.
         def discover() -> Set[str]:
             discovered: Set[str] = set()
             for remote_key, (local_cfg, remote_cfg, name) in remotes.items():
@@ -412,7 +418,7 @@ class FilterGroupsDialog(QDialog):
             return discovered
 
         run_in_background(
-            self, discover, self._query_results_ready.emit,
+            self, discover, self._on_query_results,
             label="filter_groups_query")
 
     def _on_query_results(self, discovered: set) -> None:
@@ -465,24 +471,10 @@ class FilterGroupsDialog(QDialog):
         if not path:
             return
 
-        # Peek at file to show summary in confirmation dialog
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            QMessageBox.critical(
-                self, "Import Failed",
-                f"Could not read file:\n{e}")
+        peeked = self._peek_import_file(path)
+        if peeked is None:
             return
-
-        imported_groups = data.get("filter_group_names", [])
-        imported_assignments = data.get("institution_assignments", {})
-
-        if not imported_groups and not imported_assignments:
-            QMessageBox.warning(
-                self, "Import Empty",
-                "The selected file contains no filter group data.")
-            return
+        imported_groups, imported_assignments = peeked
 
         # Ask whether to replace or merge
         reply = QMessageBox.question(
@@ -508,6 +500,40 @@ class FilterGroupsDialog(QDialog):
                 self._group_names, self._assignments,
                 imported_groups, imported_assignments, merge)
 
+        self._report_import_result(summary, merge)
+
+        self._refresh_group_list()
+        self._refresh_institution_tree()
+
+    def _peek_import_file(self, path: str):
+        """Read + parse the import file and validate it is non-empty.
+
+        Returns ``(imported_groups, imported_assignments)`` on success,
+        or ``None`` after showing the appropriate error/warning dialog.
+        """
+        # Peek at file to show summary in confirmation dialog
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            QMessageBox.critical(
+                self, "Import Failed",
+                f"Could not read file:\n{e}")
+            return None
+
+        imported_groups = data.get("filter_group_names", [])
+        imported_assignments = data.get("institution_assignments", {})
+
+        if not imported_groups and not imported_assignments:
+            QMessageBox.warning(
+                self, "Import Empty",
+                "The selected file contains no filter group data.")
+            return None
+
+        return imported_groups, imported_assignments
+
+    def _report_import_result(self, summary: dict, merge: bool) -> None:
+        """Show the merge/replace completion dialog for *summary*."""
         if merge:
             QMessageBox.information(
                 self, "Import Complete",
@@ -519,9 +545,6 @@ class FilterGroupsDialog(QDialog):
                 self, "Import Complete",
                 f"Replaced with {summary['groups_added']} groups and "
                 f"{summary['institutions_added']} institutions.")
-
-        self._refresh_group_list()
-        self._refresh_institution_tree()
 
     # ── Save ──────────────────────────────────────────────────────────
 

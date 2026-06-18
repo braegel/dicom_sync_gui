@@ -19,8 +19,14 @@ from gui.async_helpers import run_in_background
 
 logger = logging.getLogger("dicom_sync")
 
+# A series is flagged as a likely resend when its effective throughput
+# falls below ``median - RESEND_STDDEV_MULTIPLIER * stddev`` of all
+# series in the log.
+RESEND_STDDEV_MULTIPLIER = 2
+
 
 class ExaminationLookupDialog(QDialog):
+    """Dialog to look up transfer-log details by PatientID/AccessionNumber."""
 
     def __init__(self, db_path: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -120,36 +126,45 @@ class ExaminationLookupDialog(QDialog):
         self.results_table.setHorizontalHeaderLabels(headers)
         self.results_table.setRowCount(len(results))
         for row, r in enumerate(results):
-            # Acquisition time from DICOM StudyTime (HHMMSS)
-            st = r["study_time"]
-            acq = f"{st[:2]}:{st[2:4]}:{st[4:6]}" if len(st) >= 6 else st
-            # Download end = timestamp from DB
-            end_str = r["timestamp"]
-            # Download start = end - duration
-            try:
-                end_dt = datetime.fromisoformat(end_str)
-                start_dt = end_dt - timedelta(seconds=r["duration_seconds"])
-                start_str = start_dt.strftime("%H:%M:%S")
-                end_short = end_dt.strftime("%H:%M:%S")
-            except (ValueError, TypeError):
-                start_str = "—"
-                end_short = end_str
-            self.results_table.setItem(row, 0, QTableWidgetItem(acq))
-            self.results_table.setItem(row, 1, QTableWidgetItem(start_str))
-            self.results_table.setItem(row, 2, QTableWidgetItem(end_short))
-            self.results_table.setItem(row, 3, QTableWidgetItem(r["source_pacs"]))
-            self.results_table.setItem(row, 4, QTableWidgetItem(r["modality"]))
-            self.results_table.setItem(row, 5, QTableWidgetItem(r["study_description"]))
-            self.results_table.setItem(row, 6, QTableWidgetItem(r["series_description"]))
-            self.results_table.setItem(row, 7, QTableWidgetItem(str(r["image_count"])))
-            self.results_table.setItem(row, 8, QTableWidgetItem(f"{r['duration_seconds']:.1f}"))
-            self.results_table.setItem(row, 9, QTableWidgetItem(f"{r['estimated_mbps']:.2f}"))
+            for col, text in enumerate(self._build_row_cells(r)):
+                self.results_table.setItem(row, col, QTableWidgetItem(text))
+
+    def _build_row_cells(self, r: dict) -> list[str]:
+        """Return the ordered cell strings for one result row,
+        matching the column order in ``_populate_table``."""
+        # Acquisition time from DICOM StudyTime (HHMMSS)
+        st = r["study_time"]
+        acq = f"{st[:2]}:{st[2:4]}:{st[4:6]}" if len(st) >= 6 else st
+        # Download end = timestamp from DB
+        end_str = r["timestamp"]
+        # Download start = end - duration
+        try:
+            end_dt = datetime.fromisoformat(end_str)
+            start_dt = end_dt - timedelta(seconds=r["duration_seconds"])
+            start_str = start_dt.strftime("%H:%M:%S")
+            end_short = end_dt.strftime("%H:%M:%S")
+        except (ValueError, TypeError):
+            start_str = "—"
+            end_short = end_str
+        return [
+            acq,
+            start_str,
+            end_short,
+            r["source_pacs"],
+            r["modality"],
+            r["study_description"],
+            r["series_description"],
+            str(r["image_count"]),
+            f"{r['duration_seconds']:.1f}",
+            f"{r['estimated_mbps']:.2f}",
+        ]
 
     def _check_resend(self, results: list[dict],
                       baseline: dict | None) -> None:
         if not results or not baseline:
             return
-        threshold = baseline["median"] - 2 * baseline["stddev"]
+        threshold = (baseline["median"]
+                     - RESEND_STDDEV_MULTIPLIER * baseline["stddev"])
         for r in results:
             if r["estimated_mbps"] > 0 and r["estimated_mbps"] < threshold:
                 self.lbl_resend_warning.setText(

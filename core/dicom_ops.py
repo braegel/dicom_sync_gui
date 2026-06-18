@@ -5,7 +5,7 @@ Abstracted from the original CLI script for GUI use.
 
 import logging
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydicom import Dataset
 from pydicom.uid import (
@@ -22,6 +22,10 @@ from pynetdicom.sop_class import (
 )
 
 logger = logging.getLogger("dicom_sync")
+
+# Progress callback signature: called with running (completed, total)
+# image counts during a C-MOVE.
+ProgressCB = Callable[[int, int], None]
 
 
 class PacsConnectionError(Exception):
@@ -83,7 +87,8 @@ def parse_dicom_date(date_str: str) -> str:
 class DicomOperations:
     """Handles all DICOM network operations."""
 
-    def __init__(self, local_config: Dict, remote_config: Dict, remote_name: str = ""):
+    def __init__(self, local_config: Dict[str, Any], remote_config: Dict[str, Any],
+                 remote_name: str = ""):
         self.local_config = local_config
         self.remote_config = remote_config
         self.remote_name = remote_name
@@ -94,23 +99,37 @@ class DicomOperations:
         # for this specific source PACS.
         self.move_dest_config = local_config
 
-        self.ae = AE(ae_title=local_config.get('ae_title', 'LOCAL_AE'))
-        self.ae.acse_timeout = ACSE_TIMEOUT_S
-        self.ae.dimse_timeout = DIMSE_TIMEOUT_S
-        self.ae.network_timeout = NETWORK_TIMEOUT_S
-        self.ae.connection_timeout = CONNECTION_TIMEOUT_S
-        # Offer the configured per-node transfer syntax as the
-        # *preferred* syntax on the query/retrieve contexts.  This only
-        # affects negotiation of this query association (C-FIND/C-MOVE
-        # requests carry identifier datasets, never pixel data); the
-        # transfer syntax of the actual image transfer during a C-MOVE
-        # is negotiated between the source PACS and the destination
-        # Store SCP on a separate association this AE does not control.
-        # Explicit VR LE and Implicit VR LE stay in the list as
-        # fallbacks — Implicit VR LE is the DICOM baseline every SCP
-        # must support — so interoperability cannot regress.  Skip
-        # duplicates in case the configured syntax already is one of
-        # the two fallbacks.
+        self.ae = self._build_ae()
+        self._register_contexts()
+
+    def _build_ae(self) -> AE:
+        """Construct the AE with its title and the four association
+        timeouts.  See the module-level timeout constants for the
+        rationale behind each value."""
+        ae = AE(ae_title=self.local_config.get('ae_title', 'LOCAL_AE'))
+        ae.acse_timeout = ACSE_TIMEOUT_S
+        ae.dimse_timeout = DIMSE_TIMEOUT_S
+        ae.network_timeout = NETWORK_TIMEOUT_S
+        ae.connection_timeout = CONNECTION_TIMEOUT_S
+        return ae
+
+    def _register_contexts(self) -> None:
+        """Register the query/retrieve and verification presentation
+        contexts on ``self.ae``.
+
+        Offer the configured per-node transfer syntax as the
+        *preferred* syntax on the query/retrieve contexts.  This only
+        affects negotiation of this query association (C-FIND/C-MOVE
+        requests carry identifier datasets, never pixel data); the
+        transfer syntax of the actual image transfer during a C-MOVE
+        is negotiated between the source PACS and the destination
+        Store SCP on a separate association this AE does not control.
+        Explicit VR LE and Implicit VR LE stay in the list as
+        fallbacks — Implicit VR LE is the DICOM baseline every SCP
+        must support — so interoperability cannot regress.  Skip
+        duplicates in case the configured syntax already is one of
+        the two fallbacks.
+        """
         query_syntaxes = [self.transfer_syntax]
         for fallback in (ExplicitVRLittleEndian, ImplicitVRLittleEndian):
             if fallback not in query_syntaxes:
@@ -311,7 +330,7 @@ class DicomOperations:
         return results
 
     def c_move_series(self, study_uid: str, series_uid: str,
-                      progress_cb=None) -> Tuple[bool, int]:
+                      progress_cb: Optional[ProgressCB] = None) -> Tuple[bool, int]:
         ds = Dataset()
         ds.QueryRetrieveLevel = 'SERIES'
         ds.StudyInstanceUID = study_uid
@@ -327,7 +346,7 @@ class DicomOperations:
         return self._execute_move(ds)
 
     def _execute_move(self, query_ds: Dataset,
-                      progress_cb=None) -> Tuple[bool, int]:
+                      progress_cb: Optional[ProgressCB] = None) -> Tuple[bool, int]:
         """Run a C-MOVE.  *progress_cb*, if given, is called with the
         running ``(completed, total)`` image counts each time the remote
         sends a sub-operation status update — used by the engine's

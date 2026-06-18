@@ -47,7 +47,7 @@ from PySide6.QtMultimedia import QSoundEffect
 from core.config import AppConfig
 from core.dicom_ops import DicomOperations
 from core.storage_scp import StorageSCP
-from core.transfer_engine import TransferEngine
+from core.transfer_engine import TransferEngine, TERMINAL_STATUSES
 from core.transfer_log import TransferLog, default_db_path
 from gui.settings_dialog import SettingsDialog
 from gui.dashboard import SourceDashboard
@@ -308,41 +308,44 @@ class MainWindow(QMainWindow):
         self._echo_action.setEnabled(False)
         self.statusBar().showMessage("C-ECHO test running...")
 
-        def echo_one(key: str, node, target: str) -> bool:
-            local_config = self.config.get_local_dict_for(key)
-            ops = DicomOperations(local_config, node.to_dict(), key)
-            # ``finally`` so the AE's threads are shut down before the
-            # object is dropped — see DicomOperations.close().
-            try:
-                return ops.c_echo(target=target)
-            finally:
-                ops.close()
+        threading.Thread(target=self._run_echo_thread, daemon=True).start()
 
-        def run_echo():
-            results = []
-            for key, node in self.config.remote_nodes.items():
-                ok = echo_one(key, node, target='remote')
+    def _echo_one(self, key: str, node, target: str) -> bool:
+        local_config = self.config.get_local_dict_for(key)
+        ops = DicomOperations(local_config, node.to_dict(), key)
+        # ``finally`` so the AE's threads are shut down before the
+        # object is dropped — see DicomOperations.close().
+        try:
+            return ops.c_echo(target=target)
+        finally:
+            ops.close()
+
+    def _run_echo_thread(self) -> None:
+        """Run all C-ECHO probes on a daemon thread, then marshal the
+        formatted results back to the GUI thread via the
+        ``_echo_results_ready`` signal."""
+        results = []
+        for key, node in self.config.remote_nodes.items():
+            ok = self._echo_one(key, node, target='remote')
+            results.append(
+                f"  {key} ({node.name}): "
+                f"{'Reachable' if ok else 'Not reachable'}")
+
+        tested_locals = set()
+        for key, node in self.config.remote_nodes.items():
+            local_key = (node.local_ae_title, node.local_port)
+            if local_key in tested_locals:
+                continue
+            tested_locals.add(local_key)
+            local_ok = self._echo_one(key, node, target='local')
+            results.append(
+                f"\n  Local [{node.local_ae_title}:{node.local_port}]: "
+                f"{'Reachable' if local_ok else 'Not reachable'}")
+            if not local_ok and node.fallback_folder:
                 results.append(
-                    f"  {key} ({node.name}): "
-                    f"{'Reachable' if ok else 'Not reachable'}")
+                    f"  Fallback: {node.fallback_folder}")
 
-            tested_locals = set()
-            for key, node in self.config.remote_nodes.items():
-                local_key = (node.local_ae_title, node.local_port)
-                if local_key in tested_locals:
-                    continue
-                tested_locals.add(local_key)
-                local_ok = echo_one(key, node, target='local')
-                results.append(
-                    f"\n  Local [{node.local_ae_title}:{node.local_port}]: "
-                    f"{'Reachable' if local_ok else 'Not reachable'}")
-                if not local_ok and node.fallback_folder:
-                    results.append(
-                        f"  Fallback: {node.fallback_folder}")
-
-            self._echo_results_ready.emit(results)
-
-        threading.Thread(target=run_echo, daemon=True).start()
+        self._echo_results_ready.emit(results)
 
     def _on_echo_results(self, results: list) -> None:
         self._echo_action.setEnabled(True)
@@ -382,8 +385,7 @@ class MainWindow(QMainWindow):
             if not engine.is_running:
                 continue
             for job in engine.queue_snapshot():
-                if job.status not in (
-                        "done", "error", "skipped", "unavailable"):
+                if job.status not in TERMINAL_STATUSES:
                     total_pending += job.to_transfer
             total_ipm += engine.stats.raw_images_per_minute()
         self.completions_window.update_transfer_progress(
@@ -609,7 +611,12 @@ class MainWindow(QMainWindow):
 
     def _on_scp_check_done(self, remote_key: str, remote_reachable: bool,
                            local_reachable: bool, node_dict: dict) -> None:
-        """Handle reachability check result on the main thread."""
+        """Handle reachability check result on the main thread.
+
+        Short orchestrator: guards against a removed node, dispatches the
+        unreachable-remote and local-unreachable-fallback branches to
+        their helpers, then brings the engine up once the path is clear.
+        """
         node = self.config.remote_nodes.get(remote_key)
         if not node:
             # Source removed mid-flight — drop the queued start params
@@ -619,85 +626,12 @@ class MainWindow(QMainWindow):
             return
 
         if not remote_reachable:
-            # Auto-restart (watchdog) path: the PACS is often just slow,
-            # which is exactly what triggered the restart.  Don't abort —
-            # keep probing every _AUTO_RESTART_RETRY_MS, sounding the
-            # siren each time, until it answers.
-            if self._pending_start_params.get(
-                    remote_key, {}).get("auto_restart"):
-                self._log(
-                    f"Source PACS [{node.ae_title}@{node.ip_address}:"
-                    f"{node.port}] still unreachable for {remote_key} — "
-                    f"auto-restart retrying in "
-                    f"{_AUTO_RESTART_RETRY_MS // 1000}s.")
-                self._play_siren()
-                dashboard = self.dashboards.get(remote_key)
-                if dashboard:
-                    dashboard.show_awaiting_pacs(
-                        f"PACS nicht erreichbar — neuer Versuch in "
-                        f"{_AUTO_RESTART_RETRY_MS // 1000}s…")
-                self._schedule_auto_restart_retry(remote_key)
-                return
-            # Manual start: abort, tell the user, and leave the dashboard
-            # back in its idle ("Stopped") state.
-            self._pending_start_params.pop(remote_key, None)
-            self._log(
-                f"Source PACS [{node.ae_title}@{node.ip_address}:"
-                f"{node.port}] not reachable for {remote_key}. "
-                f"Service not started.")
-            lang = getattr(self.config, "language", "en")
-            QMessageBox.warning(
-                self,
-                tr("pacs_unreachable_title", lang),
-                tr("pacs_unreachable_msg", lang,
-                   name=node.name or remote_key,
-                   ip=node.ip_address, port=node.port))
-            dashboard = self.dashboards.get(remote_key)
-            if dashboard:
-                dashboard.set_service_running(False)
+            self._handle_unreachable_remote(remote_key, node)
             return
 
         if not local_reachable:
-            fallback = node.fallback_folder
-            if fallback:
-                storage_path = os.path.join(fallback, remote_key)
-                self._log(
-                    f"Local PACS [{node.local_ae_title}:{node.local_port}] "
-                    f"not reachable for {remote_key}. "
-                    f"Starting built-in SCP — saving to: {storage_path}")
-                scp_key = (node.local_ae_title, node.local_port)
-                scp = StorageSCP(
-                    node.local_ae_title,
-                    node.local_port,
-                    storage_path,
-                )
-                # Surface fallback-mode activity in the log — without
-                # this the user has no feedback that images actually
-                # land in the folder.  Throttled in the handler (first
-                # image, then every 25th).  The signal is emitted from
-                # the pynetdicom reactor thread; Qt.AutoConnection
-                # queues the slot onto the GUI thread.
-                scp.image_received.connect(
-                    lambda _ds, k=scp_key:
-                        self._on_fallback_image_received(k))
-                try:
-                    scp.start()
-                except RuntimeError as e:
-                    # Port already in use, permission denied, etc.  Drop
-                    # the pending start so the engine doesn't fire C-MOVEs
-                    # at a dead local SCP, and surface the failure in
-                    # the log instead of leaking the traceback to stderr.
-                    self._log(
-                        f"Storage SCP startup failed for {remote_key}: "
-                        f"{e}. Engine not started.")
-                    self._pending_start_params.pop(remote_key, None)
-                    return
-                self.storage_scps[scp_key] = scp
-            else:
-                self._log(
-                    f"Local PACS [{node.local_ae_title}:{node.local_port}] "
-                    f"not reachable for {remote_key}. "
-                    f"No fallback folder configured.")
+            if not self._ensure_fallback_scp(remote_key, node):
+                return
 
         # PACS answered — cancel any pending auto-restart retry loop and
         # silence the siren before bringing the engine up.
@@ -705,6 +639,98 @@ class MainWindow(QMainWindow):
         # Now start the engine
         params = self._pending_start_params.pop(remote_key, {})
         self._start_engine(remote_key, params)
+
+    def _handle_unreachable_remote(self, remote_key: str, node) -> None:
+        """The source PACS did not answer the reachability probe.
+
+        Auto-restart (watchdog) starts keep retrying with the siren;
+        manual starts abort with a warning dialog and reset the
+        dashboard."""
+        # Auto-restart (watchdog) path: the PACS is often just slow,
+        # which is exactly what triggered the restart.  Don't abort —
+        # keep probing every _AUTO_RESTART_RETRY_MS, sounding the
+        # siren each time, until it answers.
+        if self._pending_start_params.get(
+                remote_key, {}).get("auto_restart"):
+            self._log(
+                f"Source PACS [{node.ae_title}@{node.ip_address}:"
+                f"{node.port}] still unreachable for {remote_key} — "
+                f"auto-restart retrying in "
+                f"{_AUTO_RESTART_RETRY_MS // 1000}s.")
+            self._play_siren()
+            dashboard = self.dashboards.get(remote_key)
+            if dashboard:
+                dashboard.show_awaiting_pacs(
+                    f"PACS nicht erreichbar — neuer Versuch in "
+                    f"{_AUTO_RESTART_RETRY_MS // 1000}s…")
+            self._schedule_auto_restart_retry(remote_key)
+            return
+        # Manual start: abort, tell the user, and leave the dashboard
+        # back in its idle ("Stopped") state.
+        self._pending_start_params.pop(remote_key, None)
+        self._log(
+            f"Source PACS [{node.ae_title}@{node.ip_address}:"
+            f"{node.port}] not reachable for {remote_key}. "
+            f"Service not started.")
+        lang = getattr(self.config, "language", "en")
+        QMessageBox.warning(
+            self,
+            tr("pacs_unreachable_title", lang),
+            tr("pacs_unreachable_msg", lang,
+               name=node.name or remote_key,
+               ip=node.ip_address, port=node.port))
+        dashboard = self.dashboards.get(remote_key)
+        if dashboard:
+            dashboard.set_service_running(False)
+
+    def _ensure_fallback_scp(self, remote_key: str, node) -> bool:
+        """Local PACS is unreachable — bring up the built-in StorageSCP
+        if a fallback folder is configured.
+
+        Returns ``True`` when the caller may proceed to start the engine
+        (SCP started, or no fallback configured), ``False`` when SCP
+        startup failed and the engine must not be started."""
+        fallback = node.fallback_folder
+        if fallback:
+            storage_path = os.path.join(fallback, remote_key)
+            self._log(
+                f"Local PACS [{node.local_ae_title}:{node.local_port}] "
+                f"not reachable for {remote_key}. "
+                f"Starting built-in SCP — saving to: {storage_path}")
+            scp_key = (node.local_ae_title, node.local_port)
+            scp = StorageSCP(
+                node.local_ae_title,
+                node.local_port,
+                storage_path,
+            )
+            # Surface fallback-mode activity in the log — without
+            # this the user has no feedback that images actually
+            # land in the folder.  Throttled in the handler (first
+            # image, then every 25th).  The signal is emitted from
+            # the pynetdicom reactor thread; Qt.AutoConnection
+            # queues the slot onto the GUI thread.
+            scp.image_received.connect(
+                lambda _ds, k=scp_key:
+                    self._on_fallback_image_received(k))
+            try:
+                scp.start()
+            except RuntimeError as e:
+                # Port already in use, permission denied, etc.  Drop
+                # the pending start so the engine doesn't fire C-MOVEs
+                # at a dead local SCP, and surface the failure in
+                # the log instead of leaking the traceback to stderr.
+                self._log(
+                    f"Storage SCP startup failed for {remote_key}: "
+                    f"{e}. Engine not started.")
+                self._pending_start_params.pop(remote_key, None)
+                return False
+            self.storage_scps[scp_key] = scp
+        else:
+            self._log(
+                f"Local PACS [{node.local_ae_title}:{node.local_port}] "
+                f"not reachable for {remote_key}. "
+                f"No fallback folder configured.")
+        return True
 
     def _schedule_auto_restart_retry(self, remote_key: str) -> None:
         """Re-run the reachability probe for *remote_key* after

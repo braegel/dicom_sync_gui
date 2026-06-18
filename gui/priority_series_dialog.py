@@ -77,7 +77,23 @@ class PrioritySeriesDialog(QDialog):
 
         # ── Table + side buttons ──
         body = QHBoxLayout()
+        body.addWidget(self._build_terms_table(), 1)
+        body.addLayout(self._build_side_buttons())
+        layout.addLayout(body, 1)
 
+        # ── Save / Cancel ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_save = QPushButton("  Save  ")
+        btn_save.setStyleSheet(BTN_GREEN_LARGE)
+        btn_save.clicked.connect(self._on_save)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+    def _build_terms_table(self) -> QTableWidget:
         self.terms_table = QTableWidget()
         self.terms_table.setColumnCount(2)
         self.terms_table.setHorizontalHeaderLabels(["Term", "Regex"])
@@ -90,8 +106,9 @@ class PrioritySeriesDialog(QDialog):
             QAbstractItemView.SelectRows)
         self.terms_table.setSelectionMode(
             QAbstractItemView.SingleSelection)
-        body.addWidget(self.terms_table, 1)
+        return self.terms_table
 
+    def _build_side_buttons(self) -> QVBoxLayout:
         side = QVBoxLayout()
         self.btn_add = QPushButton("Add")
         self.btn_add.setStyleSheet(BTN_BLUE)
@@ -131,21 +148,7 @@ class PrioritySeriesDialog(QDialog):
         side.addWidget(self.btn_reset)
 
         side.addStretch()
-        body.addLayout(side)
-
-        layout.addLayout(body, 1)
-
-        # ── Save / Cancel ──
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        btn_row.addWidget(btn_cancel)
-        btn_save = QPushButton("  Save  ")
-        btn_save.setStyleSheet(BTN_GREEN_LARGE)
-        btn_save.clicked.connect(self._on_save)
-        btn_row.addWidget(btn_save)
-        layout.addLayout(btn_row)
+        return side
 
     # ── Source switching ─────────────────────────────────────────────────
 
@@ -228,10 +231,7 @@ class PrioritySeriesDialog(QDialog):
     def _collect_table(self) -> List[Dict]:
         out = []
         for row in range(self.terms_table.rowCount()):
-            term_item = self.terms_table.item(row, 0)
-            term = term_item.text() if term_item is not None else ""
-            cb = self._regex_checkbox(row)
-            is_regex = bool(cb.isChecked()) if cb is not None else False
+            term, is_regex = self._row_payload(row)
             out.append({"term": term, "is_regex": is_regex})
         return out
 
