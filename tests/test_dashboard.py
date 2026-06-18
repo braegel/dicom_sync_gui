@@ -533,9 +533,10 @@ class TestLiveRefreshPerformance:
         assert self.dashboard.series_table.item(0, 6).text() == "150"
 
 
-class TestSlowTransferWatchdogSpuriousGuard:
-    """The stall watchdog must NOT auto-restart when its timer merely
-    fired late (GUI thread was busy) but real progress was recent."""
+class TestSeriesLevelWatchdog:
+    """The series-level stall watchdog fires only when a series both
+    overran its size-based deadline AND has shown no progress for a long
+    stretch — never on a merely large/slow series still making progress."""
 
     @pytest.fixture(autouse=True)
     def _create(self, populated_config, qapp):
@@ -543,26 +544,62 @@ class TestSlowTransferWatchdogSpuriousGuard:
             config=populated_config, remote_key="ct")
         self.dashboard._service_running = True
 
-    def test_recent_progress_does_not_restart(self):
+    def test_within_deadline_does_not_restart(self):
         import time as _t
         self.dashboard._active_series_uid = "u1"
-        # Last progress was 2s ago — well under the 10s timeout.
-        self.dashboard._last_progress_ts = _t.monotonic() - 2.0
+        # Deadline is still in the future — large series, plenty of time.
+        self.dashboard._watchdog_deadline_ts = _t.monotonic() + 300.0
+        self.dashboard._last_progress_ts = _t.monotonic() - 999.0
         with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
                 patch.object(self.dashboard, "_play_sound"):
             self.dashboard._on_slow_transfer_detected()
         restart.assert_not_called()
 
-    def test_genuine_stall_restarts(self):
+    def test_overran_but_progressing_does_not_restart(self):
         import time as _t
+        from gui.dashboard import _WATCHDOG_NO_PROGRESS_S
         self.dashboard._active_series_uid = "u1"
-        # Last progress was 20s ago — a real stall.
-        self.dashboard._last_progress_ts = _t.monotonic() - 20.0
+        # Past the deadline, but progress arrived recently → still alive.
+        self.dashboard._watchdog_deadline_ts = _t.monotonic() - 10.0
+        self.dashboard._last_progress_ts = (
+            _t.monotonic() - (_WATCHDOG_NO_PROGRESS_S / 2))
+        with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
+                patch.object(self.dashboard, "_play_sound"):
+            self.dashboard._on_slow_transfer_detected()
+        restart.assert_not_called()
+
+    def test_overran_and_no_progress_restarts(self):
+        import time as _t
+        from gui.dashboard import _WATCHDOG_NO_PROGRESS_S
+        self.dashboard._active_series_uid = "u1"
+        # Past the deadline AND no progress for well over the threshold.
+        self.dashboard._watchdog_deadline_ts = _t.monotonic() - 10.0
+        self.dashboard._last_progress_ts = (
+            _t.monotonic() - (_WATCHDOG_NO_PROGRESS_S + 30))
         with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
                 patch.object(self.dashboard, "_play_sound"), \
                 patch.object(self.dashboard, "_show_slow_transfer_notice"):
             self.dashboard._on_slow_transfer_detected()
         restart.assert_called_once()
+
+    def test_no_active_series_does_not_restart(self):
+        self.dashboard._active_series_uid = None
+        self.dashboard._watchdog_deadline_ts = 0.0
+        with patch.object(self.dashboard, "_on_restart_clicked") as restart:
+            self.dashboard._on_slow_transfer_detected()
+        restart.assert_not_called()
+
+    def test_large_series_gets_generous_deadline(self):
+        """A 300-image series must get a deadline far beyond the old 10s
+        — proportional to size when a rate is known, else the min floor."""
+        from gui.dashboard import (
+            _WATCHDOG_MIN_DEADLINE_S, _WATCHDOG_MAX_DEADLINE_S)
+        info = {"patient_name": "P", "series_description": "AX 3D",
+                "modality": "MR", "series_uid": "u1",
+                "remote_count": 300, "local_count": 0}
+        deadline = self.dashboard._series_deadline_s(info)
+        assert deadline >= _WATCHDOG_MIN_DEADLINE_S
+        assert deadline <= _WATCHDOG_MAX_DEADLINE_S
 
 
 class TestIncrementalQueueUpdate:

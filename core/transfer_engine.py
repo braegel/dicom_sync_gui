@@ -938,9 +938,9 @@ class TransferEngine:
                  job: SeriesJob) -> Tuple[bool, int, float]:
         """Run the C-MOVE.  Returns (success, images, elapsed).
 
-        Emits ``series_progress`` so the GUI's per-image stall watchdog
-        sees the transfer is alive and the live Pending/ETE counters
-        advance.  The emit is THROTTLED to one every
+        Emits ``series_progress`` so the GUI's stall watchdog sees the
+        transfer is alive (it resets its no-progress clock) and the live
+        Pending/ETE counters advance.  The emit is THROTTLED to one every
         ``PROGRESS_EMIT_INTERVAL_S``: pynetdicom yields a status per
         image, and emitting a queued cross-thread signal for each image
         of a large series floods the GUI event queue and freezes the UI.

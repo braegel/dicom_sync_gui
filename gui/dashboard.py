@@ -92,13 +92,32 @@ SPEED_BAND_RATIO = 0.2
 STATS_REFRESH_MS = 2000
 # Debounce window for coalescing config writes from UI events (ms)
 CONFIG_SAVE_DEBOUNCE_MS = 500
-# How long a single image may stall before the slow-transfer watchdog
-# fires a sad-sound + popup + auto-restart (ms).  The watchdog re-arms
-# on every per-image progress tick (series_progress), so this is a
-# per-image stall timeout, NOT a per-series budget: it only fires when
-# no single image arrives for this long, which means the transfer is
-# genuinely wedged rather than merely slow on a large series.
-_SLOW_TRANSFER_TIMEOUT_MS = 10_000
+# Series-level stall watchdog.  A "per-image, 10 s" stall timeout proved
+# wrong: C-MOVE on a large series (e.g. a 300-image 3D MR) often sends NO
+# per-image sub-operation status for well over 10 s even though the
+# transfer is perfectly healthy, so the watchdog fired spuriously and
+# restarted the service mid-download.  Instead the watchdog now arms a
+# single deadline per series, computed from the series' own size and the
+# measured throughput, and only fires when a series runs *implausibly*
+# long with no progress — a genuine wedge, not a merely slow series.
+#
+# The watchdog polls on this interval (ms); each tick re-checks the
+# active series against its deadline.
+_WATCHDOG_POLL_MS = 15_000
+# A series may take up to this multiple of its expected duration
+# (images ÷ measured images/sec) before it counts as wedged.
+_WATCHDOG_DURATION_FACTOR = 5.0
+# Absolute floor for the per-series deadline (s): no series is ever
+# flagged before this, regardless of size/rate — covers cold stats
+# (no rate yet) and small series whose expected duration is tiny.
+_WATCHDOG_MIN_DEADLINE_S = 180.0
+# Hard cap on the per-series deadline (s) so a pathological rate estimate
+# can't push it to effectively-never.
+_WATCHDOG_MAX_DEADLINE_S = 1800.0
+# The watchdog also requires this long with NO delivered progress before
+# firing — a transfer that is still reporting sub-operations is alive
+# even if it has blown its size-based estimate.
+_WATCHDOG_NO_PROGRESS_S = 120.0
 
 # How long the (non-blocking) slow-transfer auto-restart notice stays on
 # screen before it dismisses itself (ms).  It's informational only — the
@@ -289,12 +308,13 @@ class SourceDashboard(QWidget):
         self._restart_safety_timer.timeout.connect(
             self._on_restart_safety_timeout)
 
-        # Slow-transfer watchdog: fires when a single image download
-        # takes longer than _SLOW_TRANSFER_TIMEOUT_MS without completing.
-        # Plays the sad sound, shows a non-modal popup, and auto-restarts
-        # the service so a wedged C-MOVE doesn't block the queue forever.
+        # Series-level stall watchdog: a recurring poll that flags the
+        # active series only once it has run implausibly long with no
+        # progress (a genuine wedge), then auto-restarts the service.
+        # See the _WATCHDOG_* constants for the deadline model.
+        self._watchdog_deadline_ts: float = 0.0  # monotonic; 0 = disarmed
         self._slow_transfer_timer = QTimer(self)
-        self._slow_transfer_timer.setSingleShot(True)
+        self._slow_transfer_timer.setInterval(_WATCHDOG_POLL_MS)
         self._slow_transfer_timer.timeout.connect(
             self._on_slow_transfer_detected)
 
@@ -1299,25 +1319,52 @@ class SourceDashboard(QWidget):
             f"[{info.get('modality', '')}] {info['series_description']}")
         self._active_series_uid = info.get("series_uid")
         self._active_series_done = 0
-        self._last_progress_ts = time.monotonic()
-        self._slow_transfer_timer.start(_SLOW_TRANSFER_TIMEOUT_MS)
+        now = time.monotonic()
+        self._last_progress_ts = now
+        self._watchdog_deadline_ts = now + self._series_deadline_s(info)
+        if not self._slow_transfer_timer.isActive():
+            self._slow_transfer_timer.start()
         # Drive the per-second Pending / ETE countdown for as long as a
         # transfer is in flight.
         if not self._live_refresh_timer.isActive():
             self._live_refresh_timer.start()
 
+    def _series_deadline_s(self, info: dict) -> float:
+        """Plausible maximum wall time (s) for the series described by
+        *info* before it counts as wedged.
+
+        Based on the series' own image count and the measured throughput:
+        ``factor \u00d7 (images \u00f7 images_per_sec)``, clamped to a generous
+        [min, max] band.  With no rate yet (cold stats) the min floor
+        applies, so a large series at session start is never flagged
+        early."""
+        images = 0
+        try:
+            images = max(int(info.get("remote_count", 0))
+                         - int(info.get("local_count", 0)), 0)
+        except (TypeError, ValueError):
+            images = 0
+        rate = self._get_rate()  # images per second; 0 if unknown
+        if rate > 0 and images > 0:
+            expected = images / rate
+            deadline = _WATCHDOG_DURATION_FACTOR * expected
+        else:
+            deadline = _WATCHDOG_MIN_DEADLINE_S
+        return max(_WATCHDOG_MIN_DEADLINE_S,
+                   min(deadline, _WATCHDOG_MAX_DEADLINE_S))
+
     def on_series_progress(self, series_uid: str, completed: int,
                            total: int) -> None:
-        """Per-image progress tick during a C-MOVE \u2014 re-arm the stall
-        watchdog so a slow-but-alive transfer is not mistaken for a
-        wedged one, and record how many images have arrived so the
-        Pending / ETE columns can count down live.  Only acts while a
-        transfer is actually active."""
+        """Per-image progress tick during a C-MOVE \u2014 records that the
+        transfer is alive (resets the no-progress clock) and how many
+        images have arrived so the Pending / ETE columns count down
+        live.  The series-level watchdog deadline set at series start is
+        left intact; genuine progress simply proves the series is not
+        wedged.  Only acts while a transfer is actually active."""
         if self._active_series_uid is None or self._restart_pending:
             return
         self._active_series_done = max(completed, 0)
         self._last_progress_ts = time.monotonic()
-        self._slow_transfer_timer.start(_SLOW_TRANSFER_TIMEOUT_MS)
 
     def _disarm_active_transfer(self) -> None:
         """Tear down all per-transfer activity: stop the stall watchdog,
@@ -1330,6 +1377,7 @@ class SourceDashboard(QWidget):
         self._active_series_uid = None
         self._active_series_done = 0
         self._last_progress_ts = 0.0
+        self._watchdog_deadline_ts = 0.0
         self._live_refresh_timer.stop()
 
     def on_series_completed(self, series_uid: str, images: int) -> None:
@@ -1351,31 +1399,38 @@ class SourceDashboard(QWidget):
         self._pacs_connection_lost = False
 
     def _on_slow_transfer_detected(self) -> None:
-        """Watchdog fired: series download exceeded _SLOW_TRANSFER_TIMEOUT_MS.
+        """Watchdog poll tick: auto-restart only if the active series is
+        GENUINELY wedged.
 
-        Skipped when the engine already reported a PACS connection outage
-        (it recovers on its own). Otherwise plays the sad sound, shows a
-        non-modal warning, and auto-restarts to unblock a wedged C-MOVE."""
+        Two conditions must BOTH hold, so a merely large/slow series is
+        never restarted:
+          1. the series blew its size-based deadline (set at series start
+             from images ÷ measured rate, generously clamped), AND
+          2. no per-image progress for at least _WATCHDOG_NO_PROGRESS_S —
+             a transfer still reporting sub-operations is alive even if
+             it overran the estimate.
+        Skipped during a known PACS outage (the engine self-recovers) or
+        when no transfer is active."""
         if self._pacs_connection_lost:
             return
-        # Guard against a SPURIOUS firing: the watchdog is a GUI-thread
-        # QTimer, so if the GUI thread was busy (e.g. rendering a big
-        # queue) the timer can fire late even though images kept arriving
-        # — the queued ``on_series_progress`` re-arms just hadn't been
-        # delivered yet.  Re-check the real elapsed time since the last
-        # progress; if it's under the timeout the transfer is alive, so
-        # re-arm for the remainder instead of restarting.
-        if self._active_series_uid is not None and self._last_progress_ts:
-            elapsed_ms = (time.monotonic() - self._last_progress_ts) * 1000
-            if elapsed_ms < _SLOW_TRANSFER_TIMEOUT_MS:
-                remaining = int(_SLOW_TRANSFER_TIMEOUT_MS - elapsed_ms)
-                self._slow_transfer_timer.start(max(remaining, 100))
-                return
+        if self._active_series_uid is None or not self._watchdog_deadline_ts:
+            return
+        now = time.monotonic()
+        # Condition 1: still within the series' plausible duration.
+        if now < self._watchdog_deadline_ts:
+            return
+        # Condition 2: a transfer still reporting sub-operations is alive
+        # even if it overran the size-based estimate — only a long stretch
+        # with NO progress counts as wedged.
+        no_progress_s = (now - self._last_progress_ts
+                         if self._last_progress_ts else 0.0)
+        if no_progress_s < _WATCHDOG_NO_PROGRESS_S:
+            return
         uid = self._active_series_uid or "?"
         logger.warning(
-            f"[{self.remote_key}] Slow/stalled transfer detected "
-            f"(>{_SLOW_TRANSFER_TIMEOUT_MS // 1000}s) \u2014 series {uid} \u2014 "
-            f"triggering auto-restart")
+            f"[{self.remote_key}] Stalled transfer detected \u2014 series "
+            f"{uid} overran its expected duration with no progress for "
+            f"{int(no_progress_s)}s \u2014 triggering auto-restart")
         self._play_sound(_generate_default_sound(sad=True))
         self._show_slow_transfer_notice()
         if self._service_running and not self._restart_pending:
@@ -1393,8 +1448,8 @@ class SourceDashboard(QWidget):
         # title below) should move to core.i18n.tr(key, language) once the
         # corresponding translation keys exist in core/i18n.py.
         text = (
-            f"Ein Bild-Download bei <b>{self.remote_key}</b> hat l\u00e4nger als "
-            f"{_SLOW_TRANSFER_TIMEOUT_MS // 1000} Sekunden gedauert.\n\n"
+            f"Ein Download bei <b>{self.remote_key}</b> scheint zu h\u00e4ngen "
+            f"(kein Fortschritt seit l\u00e4ngerer Zeit).\n\n"
             f"Der Dienst wird automatisch neu gestartet.")
         existing = self._slow_transfer_notice
         if existing is not None:
