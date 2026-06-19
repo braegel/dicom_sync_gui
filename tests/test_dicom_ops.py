@@ -156,6 +156,27 @@ class TestDicomOperationsInit:
         assert ops.ae.dimse_timeout == DIMSE_TIMEOUT_S
         assert ops.ae.network_timeout == NETWORK_TIMEOUT_S
 
+    def test_associate_slows_dul_reactor(self, local_config, remote_config):
+        """_associate must raise the DUL reactor's poll delay above
+        pynetdicom's 1ms default so the reactor thread can't spin a core
+        at ~100% and starve the Qt GUI thread of the GIL during a busy
+        C-MOVE."""
+        from core.dicom_ops import DUL_RUN_LOOP_DELAY_S
+        ops = DicomOperations(local_config, remote_config)
+
+        mock_dul = MagicMock()
+        mock_dul._run_loop_delay = 0.001
+        mock_assoc = MagicMock()
+        mock_assoc.is_established = True
+        mock_assoc.dul = mock_dul
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            result = ops._associate(remote_config)
+
+        assert result is mock_assoc
+        assert mock_dul._run_loop_delay == DUL_RUN_LOOP_DELAY_S
+        assert DUL_RUN_LOOP_DELAY_S >= 0.01  # meaningfully above 1ms
+
     def test_move_dest_uses_local_config(self, local_config, remote_config):
         """C-MOVE destination should be the local_config (per-source)."""
         ops = DicomOperations(local_config, remote_config)

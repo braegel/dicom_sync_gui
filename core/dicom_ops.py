@@ -68,6 +68,16 @@ NETWORK_TIMEOUT_S = DIMSE_TIMEOUT_S + 30
 # healthy LAN/VPN round-trip while still failing fast on a dead host.
 CONNECTION_TIMEOUT_S = 10
 
+# DUL reactor poll interval (seconds).  pynetdicom's default is 0.001
+# (1 ms): during a busy C-MOVE the DUL reactor thread spins this tight,
+# burning ~100% CPU on one core.  Because of the Python GIL that starves
+# the Qt GUI thread, making the whole app unresponsive during large
+# downloads (confirmed by py-spy: the reactor thread was the only active
+# Python thread while the GUI main thread sat idle in app.exec()).
+# Raising it to 20 ms cuts the reactor's idle CPU ~20x and frees the GIL
+# for the GUI; the added per-PDU latency is negligible for image transfer.
+DUL_RUN_LOOP_DELAY_S = 0.02
+
 
 def parse_dicom_time(time_str: str) -> str:
     if not time_str:
@@ -184,6 +194,17 @@ class DicomOperations:
             raise PacsConnectionError(
                 f"Association with {target} was not established "
                 f"(rejected or timed out)")
+        # Slow the DUL reactor's poll loop (default 1 ms) so it doesn't
+        # spin a core at ~100% and starve the Qt GUI thread of the GIL
+        # during a busy C-MOVE.  Guarded with getattr/try so a future
+        # pynetdicom that renames/removes the attribute can't break the
+        # association.
+        try:
+            dul = getattr(assoc, "dul", None)
+            if dul is not None and hasattr(dul, "_run_loop_delay"):
+                dul._run_loop_delay = DUL_RUN_LOOP_DELAY_S
+        except Exception as e:  # never let tuning abort a good association
+            logger.debug(f"Could not set DUL run-loop delay: {e}")
         return assoc
 
     def c_echo(self, target: str = 'remote') -> bool:

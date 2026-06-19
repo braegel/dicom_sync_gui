@@ -615,18 +615,26 @@ class SourceDashboard(QWidget):
             "Series Created"
         ])
         header = self.series_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(10, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(11, QHeaderView.ResizeToContents)
+        # Resize strategy is performance-critical: QHeaderView.
+        # ResizeToContents recomputes a column's width by measuring EVERY
+        # row (sizeHintForColumn) on every dataChanged — i.e. on every
+        # setText/setItem.  With a few hundred queued series that turns
+        # each per-series update into an O(rows²) storm that pins the GUI
+        # thread at 100% and freezes the app.  So the data columns use
+        # fixed/Interactive widths (measured once, never re-measured on
+        # update); only the three text columns Stretch, which just
+        # distributes spare width and does NOT trigger per-row measuring.
+        header.setSectionResizeMode(0, QHeaderView.Fixed)       # checkbox
+        header.setSectionResizeMode(1, QHeaderView.Stretch)     # Patient
+        header.setSectionResizeMode(2, QHeaderView.Stretch)     # Study
+        header.setSectionResizeMode(3, QHeaderView.Stretch)     # Series
+        for col in (4, 5, 6, 7, 8, 9, 10, 11):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        # Sensible one-time default widths for the Interactive columns.
+        for col, width in (
+                (0, 28), (4, 70), (5, 70), (6, 80), (7, 70),
+                (8, 120), (9, 80), (10, 110), (11, 130)):
+            self.series_table.setColumnWidth(col, width)
         self.series_table.setAlternatingRowColors(True)
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.series_table.setSelectionBehavior(QTableWidget.SelectRows)
