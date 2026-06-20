@@ -2,6 +2,47 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.3.1] — 2026-06-20
+
+Stability patch: fixes the GUI freezing during downloads and the service
+occasionally stopping on its own.
+
+### Fixed
+- **GUI freeze during downloads (root cause).** pynetdicom's DUL reactor
+  thread polls every 1 ms; during a busy C-MOVE that pegged a CPU core,
+  and the Python GIL then starved the Qt GUI thread so the window became
+  unresponsive (confirmed with py-spy: the reactor was the only active
+  Python thread while the GUI sat idle in the event loop).  Each
+  association now raises the reactor poll delay to 20 ms, freeing the GIL
+  for the GUI; transfer latency is unaffected in practice.
+- **Stall watchdog restarted the service spuriously.** The old
+  "per-image, 10 s" model fired on healthy large series (a 300-image 3D
+  MR can send no per-image C-MOVE status for far longer than 10 s).
+  Replaced with a series-level deadline derived from the series' image
+  count and the measured rate (generously clamped); an auto-restart now
+  fires only when a series both overruns that deadline AND shows no
+  progress for two minutes.
+- **Fallback Storage SCP flooded the GUI.** When the built-in SCP
+  receives images to a folder, it emitted a cross-thread signal (with a
+  full dataset) per image; on a large transfer that flooded the GUI
+  event queue.  Throttled to the first image + every 25th, carrying just
+  the running count.
+- **Service could end up silently "Stopped"** after a watchdog restart if
+  the engine was still winding down a wedged C-MOVE: the 60 s restart
+  safety window expired before the engine's 300 s DIMSE timeout. The
+  safety window is now longer than the DIMSE timeout and forces a fresh
+  start instead of giving up; a transient reachability probe failure
+  during an auto-restart now retries instead of stopping.
+
+### Changed
+- The series queue table no longer auto-resizes data columns to their
+  contents on every update (fixed/interactive widths), removing a
+  needless per-update relayout cost on large queues.
+
+### Tests
+- 951 → 956 (DUL reactor delay, series-level watchdog, SCP throttle,
+  restart-safety forced start, table-update performance).
+
 ## [1.3.0] — 2026-06-18
 
 Transfer resilience, queue prioritization, and a full follow-up code
