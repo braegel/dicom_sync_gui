@@ -1722,6 +1722,29 @@ class TestSoundPerStudyNotPerSeries:
         self.engine.signals.study_completed.connect(
             self.dashboard.on_study_completed)
 
+    def test_study_completes_again_in_a_new_cycle(self):
+        """Across cycles a study completes (and chimes) again — there is
+        intentionally no cross-cycle de-dup, so the Download Completions
+        row and the chime both fire on every real completion.  Regression
+        guard: an earlier chime-dedup also suppressed the completions
+        entry, making finished studies silently disappear from the list."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
+        ]
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda uid, inst, full, imgs: received.append(full))
+        self.engine._check_study_complete("S1")
+        # New cycle: the per-cycle guard is cleared and the study is
+        # re-queued/re-completed.
+        self.engine._completed_studies.clear()
+        self.engine._check_study_complete("S1")
+        assert received == [True, True], (
+            "a study must report fully_complete=True on every cycle it "
+            "completes, not just the first")
+
     def test_no_sound_while_series_pending(self):
         """Study S1 has 3 series — only 1 done → no sound."""
         self.engine._queue = [
@@ -1753,8 +1776,13 @@ class TestSoundPerStudyNotPerSeries:
             self.engine._check_study_complete("S1")
         mock_play.assert_called_once()
 
-    def test_no_repeat_sound_on_second_check(self):
-        """Calling _check_study_complete again must not play a second sound."""
+    def test_no_repeat_sound_within_same_cycle(self):
+        """Within a single cycle, a study emits study_completed only once
+        — the per-cycle ``_completed_studies`` guard stops a second
+        _check_study_complete for the same study from re-firing.  (Across
+        cycles the study DOES complete again — both the chime and the
+        Download Completions row are intended to fire on every real
+        completion; _completed_studies is cleared each cycle.)"""
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha",

@@ -343,12 +343,6 @@ class TransferEngine:
         self._selected_uids: Set[str] = set()
         self._completed_patients: Set[str] = set()
         self._completed_studies: Set[str] = set()
-        # study_uids that have ALREADY played their completion chime.
-        # Unlike ``_completed_studies`` (cleared every cycle), this
-        # persists for the engine's lifetime so a study that gets
-        # re-queried and re-completes (local-PACS count lag) chimes only
-        # once.
-        self._chimed_studies: Set[str] = set()
         self._transfer_log = (transfer_log if transfer_log is not None
                               else TransferLog(default_db_path()))
         # study_uid → accumulated transfer seconds of the study's OWN
@@ -1050,7 +1044,7 @@ class TransferEngine:
         """Emit study_completed once all series of a study are terminal.
 
         Thin orchestrator: detect completion → persist the study record →
-        decide fully_complete (with one-shot chime de-dup) → emit."""
+        decide fully_complete → emit."""
         if study_uid in self._completed_studies:
             return
         # Read the queue under the lock, per the class contract (see the
@@ -1112,32 +1106,26 @@ class TransferEngine:
 
     def _compute_fully_complete(self, study_uid: str,
                                 study_series: List[SeriesJob]) -> bool:
-        """Decide whether the study counts as fully complete, applying
-        the one-shot chime de-dup.
+        """Whether the study counts as fully complete.
 
-        fully_complete requires every queued series to be ``done``,
-        except small series (< SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION
-        remote images) and "unavailable" series (retry budget exhausted,
-        can never arrive) may also be error/skipped without blocking.
-        Filter-rejected series are not in study_series at all.
+        Requires every queued series to be ``done``, except small series
+        (< SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION remote images) and
+        "unavailable" series (retry budget exhausted, can never arrive)
+        may also be error/skipped without blocking.  Filter-rejected
+        series are not in study_series at all.
 
-        Chime de-dup: a study fully downloaded in an earlier cycle can be
-        re-queried (the local PACS lags in reporting its counts) or re-run
-        after an auto-restart and complete instantly with a no-op C-MOVE;
-        it would otherwise chime every cycle.  We report fully_complete
-        only the FIRST time — ``_chimed_studies`` persists across cycles,
-        unlike ``_completed_studies`` which is cleared each cycle."""
+        ``fully_complete`` drives BOTH the completion chime and the
+        Download Completions row, and the user wants both to fire on
+        every completion — so there is deliberately NO cross-cycle
+        de-dup here.  A no-op re-query of an already-local study produces
+        no ``done`` series, so the GUI handlers (which require done
+        series) naturally skip it without needing a dedup flag."""
         def _ok_for_completion(j: SeriesJob) -> bool:
             if j.status in ("done", "unavailable"):
                 return True
             return j.remote_count < SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION
 
-        if not all(_ok_for_completion(j) for j in study_series):
-            return False
-        if study_uid in self._chimed_studies:
-            return False
-        self._chimed_studies.add(study_uid)
-        return True
+        return all(_ok_for_completion(j) for j in study_series)
 
     def _check_patient_complete(self, patient_id: str):
         """Emit patient_studies_completed if all series for this patient
