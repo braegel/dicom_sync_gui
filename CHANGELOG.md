@@ -2,6 +2,23 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.3.2] — 2026-06-28
+
+Bugfix: the Download Completions "Copy" button kept the timestamp of a
+study's first completion even when more images of that study arrived
+later.
+
+### Fixed
+- **Copy button timestamp now advances to the last image arrival.**
+  A study was only ever signalled complete once per cycle, so its
+  Download Completions row — and the per-row Copy button behind it —
+  froze on the first completion's time.  When a late-arriving series
+  (or a small series crossing the entry threshold) brings in more
+  images, the study now re-signals completion: the row's "Download
+  Completed" time advances, the Copy button captures the latest
+  timestamp, and the completion chime sounds again.  Cumulative totals
+  replace the row's image/duration values instead of double-counting.
+
 ## [1.3.1] — 2026-06-20
 
 Stability patch: fixes the GUI freezing during downloads and the service
