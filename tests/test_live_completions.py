@@ -1249,6 +1249,80 @@ class TestAggregateByStudyUid:
         assert "08:15:30" not in text
 
 
+class TestCumulativeAggregation:
+    """With ``cumulative=True`` a repeat ``study_uid`` emit carries the
+    study's running totals, so they REPLACE the row's values instead of
+    being summed.  This matches the transfer engine, which re-emits the
+    full study (cumulative image count) on every new image arrival."""
+
+    def test_cumulative_image_count_replaces_not_sums(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=599,
+            download_duration_seconds=120.0, cumulative=True,
+        )
+        # Re-emit: the engine now reports the cumulative total 605
+        # (6 more images landed), NOT an increment of 6.
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=605,
+            download_duration_seconds=130.0, cumulative=True,
+        )
+        images_col = _column_index_for_header(window, "images")
+        assert window.completions_table.item(0, images_col).text() == "605"
+
+    def test_cumulative_completed_time_advances(self, window):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=599, cumulative=True,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=605, cumulative=True,
+        )
+        comp_col = _column_index_for_header(window, "completed")
+        assert "08:20:00" in window.completions_table.item(0, comp_col).text()
+
+    def test_cumulative_copy_button_uses_latest_time(self, window, qapp):
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=599, cumulative=True,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=605, cumulative=True,
+        )
+        QApplication.clipboard().clear()
+        _find_copy_button(window, row=0).click()
+        text = QApplication.clipboard().text()
+        assert "08:20:00" in text
+        assert "08:15:30" not in text
+
+    def test_cumulative_does_not_shrink_on_smaller_reemit(self, window):
+        """A re-emit with a smaller/absent count (e.g. a no-op re-query)
+        must not shrink the row."""
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=605,
+            download_duration_seconds=130.0, cumulative=True,
+        )
+        window.add_completion(
+            study_uid="S1", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=3,
+            download_duration_seconds=5.0, cumulative=True,
+        )
+        images_col = _column_index_for_header(window, "images")
+        assert window.completions_table.item(0, images_col).text() == "605"
+
+
 class TestMinImagesThreshold:
     """``add_completion`` honours an optional ``min_images_threshold``
     that suppresses tiny entries.  The threshold is applied against

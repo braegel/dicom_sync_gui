@@ -274,6 +274,7 @@ class LiveCompletionsWindow(QWidget):
                        download_duration_seconds: Optional[float] = None,
                        image_count: Optional[int] = None,
                        min_images_threshold: Optional[int] = None,
+                       cumulative: bool = False,
                        source: str = "") -> None:
         """Add (or aggregate) a completed-study entry.
 
@@ -303,6 +304,15 @@ class LiveCompletionsWindow(QWidget):
         is a no-op.  This is checked AFTER aggregation lookup so a
         first-wave 8-image emit can still be followed by a 50-image
         second wave that crosses the threshold and creates the row.
+
+        *cumulative* controls how a repeat ``study_uid`` folds into an
+        existing row.  When ``False`` (default, the legacy / unit-test
+        path) ``image_count`` and ``download_duration_seconds`` are
+        *added* to the row's running totals.  When ``True`` the caller
+        is already passing the study's cumulative totals (the
+        transfer-engine re-emits the full study on every new image
+        arrival), so the values *replace* the row's totals instead of
+        double-counting.
         """
         acq = _parse_time(study_time)
         comp = _parse_time(completed_time)
@@ -356,6 +366,7 @@ class LiveCompletionsWindow(QWidget):
                     new_image_count=image_count,
                     new_duration=download_duration_seconds,
                     delay_seconds=delay_seconds,
+                    cumulative=cumulative,
                 )
                 return
 
@@ -462,14 +473,18 @@ class LiveCompletionsWindow(QWidget):
                              comp_sort: str,
                              new_image_count: Optional[int],
                              new_duration: Optional[float],
-                             delay_seconds: Optional[float]) -> None:
+                             delay_seconds: Optional[float],
+                             cumulative: bool = False) -> None:
         """Fold a repeat ``study_completed`` emit into the existing row.
 
-        Sums ``image_count`` and ``download_duration_seconds`` against
-        what's already on the cells (stored in ``Qt.UserRole``),
-        advances completed_time to the latest, re-derives delay and
-        img/min from the new totals, and re-installs the Copy button
-        so it grabs the latest timestamp.
+        With ``cumulative=False`` (default) the new ``image_count`` and
+        ``download_duration_seconds`` are *added* to what's already on
+        the cells (stored in ``Qt.UserRole``).  With ``cumulative=True``
+        the caller already passes the study's running totals, so the
+        values *replace* the cells instead of double-counting.  Either
+        way completed_time advances to the latest, delay and img/min are
+        re-derived from the resulting totals, and the Copy button is
+        re-installed so it grabs the latest timestamp.
 
         Reads/writes go through the items directly (not parallel
         lists), so this is sort-stable.
@@ -490,11 +505,18 @@ class LiveCompletionsWindow(QWidget):
 
         dur_item = t.item(row, _COL_DURATION)
         existing_dur = dur_item.data(Qt.UserRole) or 0.0
-        total_dur = existing_dur + (new_duration or 0.0)
-
         img_item = t.item(row, _COL_IMAGES)
         existing_images = img_item.data(Qt.UserRole) or 0
-        total_images = existing_images + (new_image_count or 0)
+        if cumulative:
+            # Caller passes running totals — replace, don't add.  A
+            # re-emit with a smaller/absent value (e.g. a no-op re-query)
+            # must not shrink the row, so keep the larger of the two.
+            total_dur = (max(existing_dur, new_duration)
+                         if new_duration is not None else existing_dur)
+            total_images = max(existing_images, new_image_count or 0)
+        else:
+            total_dur = existing_dur + (new_duration or 0.0)
+            total_images = existing_images + (new_image_count or 0)
 
         texts = self._format_row_strings(
             total_images if total_images > 0 else None,

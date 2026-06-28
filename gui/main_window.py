@@ -428,6 +428,7 @@ class MainWindow(QMainWindow):
             download_duration_seconds=wall_clock,
             image_count=total_images,
             min_images_threshold=MIN_IMAGES_FOR_COMPLETIONS_ENTRY,
+            cumulative=True,
             source=source,
         )
 

@@ -342,7 +342,12 @@ class TransferEngine:
         self._selection_event = threading.Event()
         self._selected_uids: Set[str] = set()
         self._completed_patients: Set[str] = set()
-        self._completed_studies: Set[str] = set()
+        # study_uid → image count at the moment study_completed last fired.
+        # A re-check with MORE images (a late-arriving series, or a small
+        # series that crossed the threshold) re-emits study_completed so the
+        # Download Completions row's timestamp (and the Copy button behind it)
+        # advances to the latest image arrival.  An equal count is a no-op.
+        self._completed_studies: Dict[str, int] = {}
         self._transfer_log = (transfer_log if transfer_log is not None
                               else TransferLog(default_db_path()))
         # study_uid → accumulated transfer seconds of the study's OWN
@@ -1044,9 +1049,13 @@ class TransferEngine:
         """Emit study_completed once all series of a study are terminal.
 
         Thin orchestrator: detect completion → persist the study record →
-        decide fully_complete → emit."""
-        if study_uid in self._completed_studies:
-            return
+        decide fully_complete → emit.
+
+        Re-emits on later completions that carry MORE images than the last
+        emit (a late-arriving series, or a small series that crossed the
+        threshold).  That advances the Download Completions row's timestamp
+        to the latest image arrival and re-fires the completion chime.  A
+        re-check with no new images is a no-op."""
         # Read the queue under the lock, per the class contract (see the
         # _queue_lock docstring): whole-list reassignment is guarded, so
         # snapshotting here keeps this consistent with that invariant
@@ -1059,10 +1068,14 @@ class TransferEngine:
         if not all(j.status in TERMINAL_STATUSES for j in study_series):
             return
 
-        self._completed_studies.add(study_uid)
-        institution = study_series[0].institution_name
         done_series = [j for j in study_series if j.status == "done"]
         total_images = sum(j.transferred_images for j in done_series)
+        # Already signalled with this image count (or more)?  Nothing new
+        # arrived since the last emit — stay quiet.
+        if self._completed_studies.get(study_uid, -1) >= total_images:
+            return
+        self._completed_studies[study_uid] = total_images
+        institution = study_series[0].institution_name
         self._persist_study_record(study_uid, done_series, total_images)
 
         fully_complete = self._compute_fully_complete(study_uid, study_series)

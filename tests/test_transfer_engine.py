@@ -1001,6 +1001,78 @@ class TestPatientStudiesCompleted:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — study_completed re-emits when more images arrive
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStudyCompletedReEmit:
+    """``_check_study_complete`` must fire again when a later completion
+    carries MORE images than the previous emit (a late-arriving series,
+    or a small series that crossed the threshold), so the Download
+    Completions row's timestamp — and the Copy button behind it —
+    advances to the latest image arrival.  A re-check with no new images
+    stays silent."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.filter_groups_enabled = False
+        self.engine = TransferEngine(self.config, "ct")
+
+    def _received(self):
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda uid, inst, full, images: received.append(images))
+        return received
+
+    def test_reemits_when_more_images_arrive(self):
+        """All series terminal at 100 images → emit.  Then a previously
+        non-done series completes (total 150) → emit again."""
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.1", status="done",
+                      transferred_images=100, remote_count=100),
+            SeriesJob(study_uid="S1", series_uid="1.2", status="error",
+                      transferred_images=0, remote_count=3),
+        ]
+        received = self._received()
+
+        self.engine._check_study_complete("S1")
+        assert received == [100]
+
+        # Late series finally lands.
+        self.engine._queue[1].status = "done"
+        self.engine._queue[1].transferred_images = 50
+        self.engine._check_study_complete("S1")
+        assert received == [100, 150]
+
+    def test_no_reemit_when_image_count_unchanged(self):
+        """A second check with the same image count is a no-op."""
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.1", status="done",
+                      transferred_images=100, remote_count=100),
+        ]
+        received = self._received()
+
+        self.engine._check_study_complete("S1")
+        self.engine._check_study_complete("S1")
+        assert received == [100]
+
+    def test_cleared_at_cycle_start(self):
+        """A fresh cycle clears the per-study image memory so the first
+        completion of the new cycle emits again."""
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.1", status="done",
+                      transferred_images=100, remote_count=100),
+        ]
+        received = self._received()
+        self.engine._check_study_complete("S1")
+        assert received == [100]
+
+        self.engine._completed_studies.clear()
+        self.engine._check_study_complete("S1")
+        assert received == [100, 100]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TransferEngine — priors must respect institution filter
 # ═══════════════════════════════════════════════════════════════════════════
 
