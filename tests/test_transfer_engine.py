@@ -1006,11 +1006,12 @@ class TestPatientStudiesCompleted:
 
 class TestStudyCompletedReEmit:
     """``_check_study_complete`` must fire again when a later completion
-    carries MORE images than the previous emit (a late-arriving series,
-    or a small series that crossed the threshold), so the Download
-    Completions row's timestamp — and the Copy button behind it —
-    advances to the latest image arrival.  A re-check with no new images
-    stays silent."""
+    adds MORE THAN ``MIN_IMAGES_TO_REFRESH_COMPLETION`` new images (a
+    late-arriving series, or a small series that crossed the threshold),
+    so the Download Completions row's timestamp — and the Copy button
+    behind it — advances to the latest image arrival.  A re-check with no
+    new images, or with only a handful of straggler images (retries /
+    re-sends), stays silent so it does not falsify the completion time."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, populated_config, qapp):
@@ -1055,6 +1056,47 @@ class TestStudyCompletedReEmit:
         self.engine._check_study_complete("S1")
         self.engine._check_study_complete("S1")
         assert received == [100]
+
+    def test_no_reemit_for_straggler_images(self):
+        """A handful of late straggler images (≤ the threshold) must NOT
+        re-fire — single-image retries / re-sends would otherwise move
+        the completion time."""
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.1", status="done",
+                      transferred_images=100, remote_count=100),
+            SeriesJob(study_uid="S1", series_uid="1.2", status="error",
+                      transferred_images=0, remote_count=3),
+        ]
+        received = self._received()
+
+        self.engine._check_study_complete("S1")
+        assert received == [100]
+
+        # Exactly 5 more images land — at the threshold, NOT above it.
+        self.engine._queue[1].status = "done"
+        self.engine._queue[1].transferred_images = 5
+        self.engine._check_study_complete("S1")
+        assert received == [100], (
+            "a straggler wave of 5 images (≤ threshold) must not re-fire")
+
+    def test_reemits_when_new_wave_exceeds_threshold(self):
+        """More than the threshold of new images re-fires."""
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.1", status="done",
+                      transferred_images=100, remote_count=100),
+            SeriesJob(study_uid="S1", series_uid="1.2", status="error",
+                      transferred_images=0, remote_count=6),
+        ]
+        received = self._received()
+
+        self.engine._check_study_complete("S1")
+        assert received == [100]
+
+        # 6 more images (> threshold of 5) → re-fire.
+        self.engine._queue[1].status = "done"
+        self.engine._queue[1].transferred_images = 6
+        self.engine._check_study_complete("S1")
+        assert received == [100, 106]
 
     def test_cleared_at_cycle_start(self):
         """A fresh cycle clears the per-study image memory so the first

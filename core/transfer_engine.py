@@ -117,6 +117,13 @@ SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION = 6
 # every cycle forever.
 MAX_SERIES_TRANSFER_ATTEMPTS = 3
 
+# Minimum number of NEW images a re-completion must add before
+# study_completed re-fires and advances the Download Completions
+# "Download Completed" timestamp.  Single-image retries and re-sends
+# (1–5 images) are stragglers that should not move the row's completion
+# time — only a real wave of new images does.
+MIN_IMAGES_TO_REFRESH_COMPLETION = 5
+
 # Minimum wall-clock gap between two ``series_progress`` emits during a
 # single C-MOVE.  pynetdicom yields one sub-operation status PER IMAGE;
 # emitting a queued cross-thread signal for every image of a large
@@ -1051,11 +1058,14 @@ class TransferEngine:
         Thin orchestrator: detect completion → persist the study record →
         decide fully_complete → emit.
 
-        Re-emits on later completions that carry MORE images than the last
-        emit (a late-arriving series, or a small series that crossed the
-        threshold).  That advances the Download Completions row's timestamp
-        to the latest image arrival and re-fires the completion chime.  A
-        re-check with no new images is a no-op."""
+        Re-emits on later completions only when they add more than
+        MIN_IMAGES_TO_REFRESH_COMPLETION new images (a late-arriving
+        series, or a small series that crossed the threshold).  That
+        advances the Download Completions row's timestamp to the latest
+        image arrival and re-fires the completion chime.  Single-image
+        retries / re-sends (1–5 images) are stragglers that must NOT move
+        the completion time, so they are ignored.  The FIRST completion
+        always fires regardless of count."""
         # Read the queue under the lock, per the class contract (see the
         # _queue_lock docstring): whole-list reassignment is guarded, so
         # snapshotting here keeps this consistent with that invariant
@@ -1070,10 +1080,13 @@ class TransferEngine:
 
         done_series = [j for j in study_series if j.status == "done"]
         total_images = sum(j.transferred_images for j in done_series)
-        # Already signalled with this image count (or more)?  Nothing new
-        # arrived since the last emit — stay quiet.
-        if self._completed_studies.get(study_uid, -1) >= total_images:
-            return
+        last_emitted = self._completed_studies.get(study_uid)
+        if last_emitted is not None:
+            # Already signalled once: only refresh when a real wave of new
+            # images arrived.  A handful of straggler images (retries /
+            # re-sends) must not advance the completion time.
+            if total_images - last_emitted <= MIN_IMAGES_TO_REFRESH_COMPLETION:
+                return
         self._completed_studies[study_uid] = total_images
         institution = study_series[0].institution_name
         self._persist_study_record(study_uid, done_series, total_images)
