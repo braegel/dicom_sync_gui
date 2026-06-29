@@ -2,6 +2,20 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.3.3] — 2026-06-29
+
+Follow-up to 1.3.2: keeps straggler images from falsifying the Download
+Completions timestamp.
+
+### Fixed
+- **"Download Completed" time only advances on a real wave of new
+  images.** 1.3.2 re-signalled a study's completion whenever *any* new
+  image arrived, so single-image retries and re-sends (1–5 images)
+  moved the row's completion time — and the Copy button behind it — to
+  the straggler's arrival, falsifying it.  A re-completion now refreshes
+  the timestamp only when more than 5 new images have arrived since the
+  last update; the first completion of a study still always registers.
+
 ## [1.3.2] — 2026-06-28
 
 Bugfix: the Download Completions "Copy" button kept the timestamp of a
