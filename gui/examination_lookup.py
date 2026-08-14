@@ -14,8 +14,10 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QWidget,
 )
 
+from core.dicom_time import format_hhmmss
 from core.transfer_log import TransferLog
 from gui.async_helpers import run_in_background
+from gui.styles import COLOR_DANGER
 
 logger = logging.getLogger("dicom_sync")
 
@@ -59,7 +61,8 @@ class ExaminationLookupDialog(QDialog):
 
         self.lbl_resend_warning = QLabel("")
         self.lbl_resend_warning.setWordWrap(True)
-        self.lbl_resend_warning.setStyleSheet("color: #e74c3c; font-weight: bold;")
+        self.lbl_resend_warning.setStyleSheet(
+            f"color: {COLOR_DANGER}; font-weight: bold;")
         layout.addWidget(self.lbl_resend_warning)
 
         self.results_table = QTableWidget()
@@ -133,8 +136,7 @@ class ExaminationLookupDialog(QDialog):
         """Return the ordered cell strings for one result row,
         matching the column order in ``_populate_table``."""
         # Acquisition time from DICOM StudyTime (HHMMSS)
-        st = r["study_time"]
-        acq = f"{st[:2]}:{st[2:4]}:{st[4:6]}" if len(st) >= 6 else st
+        acq = format_hhmmss(r["study_time"])
         # Download end = timestamp from DB
         end_str = r["timestamp"]
         # Download start = end - duration

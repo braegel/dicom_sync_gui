@@ -7,7 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PySide6.QtCore import Qt
 
-from gui.settings_dialog import SettingsDialog, PacsNodeEditor
+from gui.settings_dialog import (
+    AE_TITLE_MAX_LEN, SettingsDialog, PacsNodeEditor, is_valid_host,
+)
 from core.config import AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES
 
 
@@ -96,8 +98,10 @@ class TestPacsNodeEditorRemote:
 
     def test_no_retrieve_combo(self):
         # The retrieve-method combo was removed together with the
-        # never-implemented C-GET option; C-MOVE is the only path.
-        assert self.editor.retrieve_combo is None
+        # never-implemented C-GET option; C-MOVE is the only path.  The
+        # placeholder attribute that outlived it is gone too, so the
+        # editor no longer advertises a widget it does not have.
+        assert not hasattr(self.editor, "retrieve_combo")
 
     def test_has_service_param_spinboxes(self):
         assert self.editor.hours_spin is not None
@@ -490,3 +494,123 @@ class TestSettingsDialogLanguage:
         with open(tmp_config_path) as f:
             data = json.load(f)
         assert data["language"] == "es"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SettingsDialog — network field validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestIsValidHost:
+    """``is_valid_host`` is purely syntactic — it must accept anything
+    a PACS could legitimately be reached at and reject the classic
+    typos that otherwise only surface as a failed association."""
+
+    @pytest.mark.parametrize("value", [
+        "192.168.1.10",
+        "10.0.0.1",
+        "255.255.255.255",
+        "::1",
+        "2001:db8::1",
+        "pacs",
+        "pacs-01",
+        "pacs_01",                      # Windows-domain hosts do this
+        "pacs.hospital.example.com",
+        "PACS.Hospital.Example",
+    ])
+    def test_accepts_valid_hosts(self, value):
+        assert is_valid_host(value) is True
+
+    @pytest.mark.parametrize("value", [
+        "192.168.1.300",                # octet out of range
+        "10.0.0",                       # truncated address
+        "192.168..1",                   # empty label
+        "192.168.1.10 ",                # trailing space (unstripped)
+        "pacs host",                    # space in the middle
+        "-pacs",                        # leading hyphen
+        "pacs-",                        # trailing hyphen
+        "pacs..local",
+        "a" * 254,
+        "",
+    ])
+    def test_rejects_invalid_hosts(self, value):
+        assert is_valid_host(value) is False
+
+
+class TestSettingsDialogNetworkValidation:
+
+    @pytest.fixture(autouse=True)
+    def _create(self, default_config, qapp):
+        self.dialog = SettingsDialog(default_config)
+
+    def _fill_minimum(self, key="ct", ae="CT_AE"):
+        self.dialog.key_edit.setText(key)
+        self.dialog.remote_editor.name_edit.setText("CT")
+        self.dialog.remote_editor.ae_title_edit.setText(ae)
+
+    @patch("gui.settings_dialog.QMessageBox.warning")
+    def test_add_rejects_overlong_ae_title(self, mock_warning):
+        self._fill_minimum(ae="A" * (AE_TITLE_MAX_LEN + 1))
+        self.dialog._add_remote()
+        mock_warning.assert_called_once()
+        assert self.dialog.remote_list.count() == 0
+
+    def test_add_accepts_ae_title_at_the_limit(self):
+        self._fill_minimum(ae="A" * AE_TITLE_MAX_LEN)
+        self.dialog._add_remote()
+        assert self.dialog.remote_list.count() == 1
+
+    @patch("gui.settings_dialog.QMessageBox.warning")
+    def test_add_rejects_overlong_local_ae_title(self, mock_warning):
+        self._fill_minimum()
+        self.dialog.remote_editor.local_ae_edit.setText(
+            "L" * (AE_TITLE_MAX_LEN + 1))
+        self.dialog._add_remote()
+        mock_warning.assert_called_once()
+        assert self.dialog.remote_list.count() == 0
+
+    @patch("gui.settings_dialog.QMessageBox.warning")
+    def test_add_rejects_malformed_ip(self, mock_warning):
+        self._fill_minimum()
+        self.dialog.remote_editor.ip_edit.setText("192.168.1.300")
+        self.dialog._add_remote()
+        mock_warning.assert_called_once()
+        assert self.dialog.remote_list.count() == 0
+
+    def test_add_accepts_hostname(self):
+        self._fill_minimum()
+        self.dialog.remote_editor.ip_edit.setText("pacs.hospital.local")
+        self.dialog._add_remote()
+        assert self.dialog.remote_list.count() == 1
+
+    def test_add_accepts_empty_ip(self):
+        """The IP is optional at entry time — the dialog is built
+        around filling entries in gradually, so an empty field must
+        not block the add."""
+        self._fill_minimum()
+        self.dialog.remote_editor.ip_edit.setText("")
+        self.dialog._add_remote()
+        assert self.dialog.remote_list.count() == 1
+
+    @patch("gui.settings_dialog.QMessageBox.warning")
+    def test_save_changes_rejects_malformed_ip(self, mock_warning):
+        self._fill_minimum()
+        self.dialog.remote_editor.ip_edit.setText("192.168.1.10")
+        self.dialog._add_remote()
+
+        self.dialog.remote_editor.ip_edit.setText("192.168.1.300")
+        self.dialog._save_changes_to_selected()
+
+        mock_warning.assert_called_once()
+        # The stored node keeps the last good value.
+        assert self.dialog._remote_nodes["ct"].ip_address == "192.168.1.10"
+
+    @patch("gui.settings_dialog.QMessageBox.warning")
+    def test_save_changes_rejects_overlong_ae_title(self, mock_warning):
+        self._fill_minimum()
+        self.dialog._add_remote()
+
+        self.dialog.remote_editor.ae_title_edit.setText("A" * 20)
+        self.dialog._save_changes_to_selected()
+
+        mock_warning.assert_called_once()
+        assert self.dialog._remote_nodes["ct"].ae_title == "CT_AE"

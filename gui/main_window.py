@@ -33,8 +33,9 @@ to hop back to the GUI thread with the result.
 import logging
 import os
 import threading
+import time
 from datetime import datetime
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox,
@@ -44,7 +45,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtMultimedia import QSoundEffect
 
-from core.config import AppConfig
+from core.config import AppConfig, PacsNode
 from core.dicom_ops import DicomOperations
 from core.storage_scp import StorageSCP
 from core.transfer_engine import TransferEngine, TERMINAL_STATUSES
@@ -102,10 +103,11 @@ class MainWindow(QMainWindow):
         # instead of stacking a duplicate.  Entries are removed in the
         # popup's ``finished`` handler.
         self._open_institution_popups: Dict[str, UnknownInstitutionPopup] = {}
-        # remote_keys whose connection-lost popup is currently on screen,
-        # so a second queued signal for the same source can't stack a
-        # duplicate modal dialog behind the first.
-        self._connection_lost_open: Set[str] = set()
+        # Non-modal warning dialogs currently on screen, keyed by a
+        # caller-chosen dedupe token (see _show_nonmodal_warning).  A
+        # second signal for the same token raises the existing dialog
+        # instead of stacking a duplicate.
+        self._open_warnings: Dict[str, QMessageBox] = {}
         # remote_key → QTimer driving the auto-restart reachability
         # retry loop: when a watchdog-triggered restart hits an
         # unreachable PACS, we keep probing every
@@ -310,7 +312,7 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=self._run_echo_thread, daemon=True).start()
 
-    def _echo_one(self, key: str, node, target: str) -> bool:
+    def _echo_one(self, key: str, node: PacsNode, target: str) -> bool:
         local_config = self.config.get_local_dict_for(key)
         ops = DicomOperations(local_config, node.to_dict(), key)
         # ``finally`` so the AE's threads are shut down before the
@@ -392,13 +394,20 @@ class MainWindow(QMainWindow):
             total_pending, total_ipm)
 
     def _on_study_completed_live(self, engine: TransferEngine, study_uid: str,
-                                   fully_complete: bool,
-                                   source: str = "") -> None:
+                                 fully_complete: bool, total_images: int,
+                                 source: str = "") -> None:
         """Add a completion entry to the live completions window.
 
         *source* is the remote_key of the source PACS the engine
         serves; the completions window separates its delay / duration
         statistics (colour bands, median readout) by it.
+
+        *total_images* comes straight from the ``study_completed``
+        signal — the engine already summed it when it decided the study
+        was complete, so re-deriving it here could only ever disagree
+        with the count the engine acted on.  The queue snapshot is still
+        needed for the study's descriptive fields (and as the "did
+        anything actually finish" guard).
 
         Threshold filtering (``MIN_IMAGES_FOR_COMPLETIONS_ENTRY``) is
         applied inside ``add_completion`` against the *cumulative*
@@ -409,12 +418,11 @@ class MainWindow(QMainWindow):
         if not fully_complete:
             return
         study_jobs = [j for j in engine.queue_snapshot()
-                       if j.study_uid == study_uid and j.status == "done"]
+                      if j.study_uid == study_uid and j.status == "done"]
         if not study_jobs:
             return
         first = study_jobs[0]
         wall_clock = engine.pop_study_wall_clock(study_uid)
-        total_images = sum(j.transferred_images for j in study_jobs)
         now = datetime.now()
         self.completions_window.add_completion(
             study_uid=study_uid,
@@ -538,30 +546,63 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Service stopped: {remote_key}")
         self._update_completions_progress()
 
+    def _show_nonmodal_warning(self, dedupe_key: str, title: str,
+                               text: str) -> None:
+        """Show a NON-modal warning dialog, at most one per *dedupe_key*.
+
+        Never use the static ``QMessageBox.warning`` from a slot that
+        engines emit into: it spins a nested event loop inside the slot,
+        so every further queued signal (queue updates, progress, other
+        sources' completions) is processed re-entrantly while the user
+        stares at the dialog, and a second warning stacks another nested
+        loop behind the first.  ``show()`` returns immediately; the
+        dialog cleans itself up in ``_on_warning_closed``.
+
+        Same pattern as ``_on_unknown_institution`` — a repeat call for a
+        key that is already on screen just raises the existing dialog.
+        """
+        existing = self._open_warnings.get(dedupe_key)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setStandardButtons(QMessageBox.Ok)
+        # Explicitly non-modal so it can never block the event loop.
+        msg.setWindowModality(Qt.NonModal)
+        msg.setModal(False)
+        msg.finished.connect(
+            lambda _result, k=dedupe_key: self._on_warning_closed(k))
+        self._open_warnings[dedupe_key] = msg
+        msg.show()
+
+    def _on_warning_closed(self, dedupe_key: str) -> None:
+        """Free the dedupe slot once the user dismisses the dialog, so a
+        later outage can warn again."""
+        msg = self._open_warnings.pop(dedupe_key, None)
+        if msg is not None:
+            msg.deleteLater()
+
     def _on_connection_lost(self, remote_key: str, detail: str) -> None:
         """A running engine reported the PACS became unreachable during
         a query or download.  Tell the user once per outage; the engine
         keeps retrying and recovers on its own when the PACS returns.
 
-        The engine already latches one emit per outage; the
-        ``_connection_lost_open`` guard additionally prevents a modal
-        from stacking if a second source drops while this dialog is up
-        for the same key."""
+        The engine already latches one emit per outage; the dedupe key
+        additionally prevents a second dialog for the same source while
+        the first is still on screen."""
         node = self.config.remote_nodes.get(remote_key)
         name = node.name if node and node.name else remote_key
         self._log(
             f"Connection to PACS lost for {remote_key}: {detail}")
-        if remote_key in self._connection_lost_open:
-            return
-        self._connection_lost_open.add(remote_key)
         lang = getattr(self.config, "language", "en")
-        try:
-            QMessageBox.warning(
-                self,
-                tr("pacs_connection_lost_title", lang),
-                tr("pacs_connection_lost_msg", lang, name=name))
-        finally:
-            self._connection_lost_open.discard(remote_key)
+        self._show_nonmodal_warning(
+            f"connection_lost:{remote_key}",
+            tr("pacs_connection_lost_title", lang),
+            tr("pacs_connection_lost_msg", lang, name=name))
 
     def _on_connection_restored(self, remote_key: str) -> None:
         """The engine re-established contact after a connection_lost.
@@ -630,33 +671,27 @@ class MainWindow(QMainWindow):
             self._handle_unreachable_remote(remote_key, node)
             return
 
-        if not local_reachable:
-            # Snapshot the auto_restart flag BEFORE _ensure_fallback_scp,
-            # which pops the pending-start params on failure.
-            was_auto_restart = self._pending_start_params.get(
-                remote_key, {}).get("auto_restart", False)
-            saved_params = dict(
-                self._pending_start_params.get(remote_key, {}))
-            if not self._ensure_fallback_scp(remote_key, node):
-                # SCP startup failed (e.g. the local port is still
-                # transiently bound during the restart window).  A
-                # watchdog auto-restart must not die silently on
-                # "Stopped" — re-queue the start and retry with the
-                # siren, mirroring the unreachable-remote path.
-                if was_auto_restart:
-                    self._pending_start_params[remote_key] = saved_params
-                    self._log(
-                        f"Built-in SCP for {remote_key} not ready — "
-                        f"auto-restart retrying in "
-                        f"{_AUTO_RESTART_RETRY_MS // 1000}s.")
-                    self._play_siren()
-                    dashboard = self.dashboards.get(remote_key)
-                    if dashboard:
-                        dashboard.show_awaiting_pacs(
-                            f"PACS nicht erreichbar — neuer Versuch in "
-                            f"{_AUTO_RESTART_RETRY_MS // 1000}s…")
-                    self._schedule_auto_restart_retry(remote_key)
-                return
+        if not local_reachable and not self._ensure_fallback_scp(
+                remote_key, node):
+            # SCP startup failed (e.g. the local port is still
+            # transiently bound during the restart window).  A watchdog
+            # auto-restart must not die silently on "Stopped" — leave the
+            # start queued and retry with the siren, mirroring the
+            # unreachable-remote path.  This branch owns the pending
+            # params outright: ``_ensure_fallback_scp`` no longer touches
+            # them, so there is nothing to snapshot and restore.
+            if self._pending_start_params.get(
+                    remote_key, {}).get("auto_restart"):
+                self._log(
+                    f"Built-in SCP for {remote_key} not ready — "
+                    f"auto-restart retrying in "
+                    f"{_AUTO_RESTART_RETRY_MS // 1000}s.")
+                self._play_siren()
+                self._show_awaiting_pacs(remote_key)
+                self._schedule_auto_restart_retry(remote_key)
+            else:
+                self._abort_start_scp_failed(remote_key, node)
+            return
 
         # PACS answered — cancel any pending auto-restart retry loop and
         # silence the siren before bringing the engine up.
@@ -665,7 +700,34 @@ class MainWindow(QMainWindow):
         params = self._pending_start_params.pop(remote_key, {})
         self._start_engine(remote_key, params)
 
-    def _handle_unreachable_remote(self, remote_key: str, node) -> None:
+    def _abort_start_scp_failed(self, remote_key: str,
+                                node: PacsNode) -> None:
+        """A manual start whose built-in receiver could not bind.
+
+        Mirrors ``_handle_unreachable_remote``'s manual-start branch:
+        drop the queued start, tell the user, and put the dashboard back
+        to "Stopped".  Without the reset the dashboard kept showing
+        "Starting service…" indefinitely for a service that was never
+        going to start, with the only evidence in the log window — the
+        UI reported a state that was simply not true.
+        """
+        self._pending_start_params.pop(remote_key, None)
+        self._log(
+            f"Service for {remote_key} not started — the built-in "
+            f"Storage SCP could not bind on port {node.local_port}.")
+        self._show_nonmodal_warning(
+            f"scp_bind_failed:{remote_key}",
+            tr("scp_bind_failed_title",
+               getattr(self.config, "language", "en")),
+            tr("scp_bind_failed_msg",
+               getattr(self.config, "language", "en"),
+               name=node.name or remote_key, port=node.local_port))
+        dashboard = self.dashboards.get(remote_key)
+        if dashboard:
+            dashboard.set_service_running(False)
+
+    def _handle_unreachable_remote(self, remote_key: str,
+                                   node: PacsNode) -> None:
         """The source PACS did not answer the reachability probe.
 
         Auto-restart (watchdog) starts keep retrying with the siren;
@@ -683,11 +745,7 @@ class MainWindow(QMainWindow):
                 f"auto-restart retrying in "
                 f"{_AUTO_RESTART_RETRY_MS // 1000}s.")
             self._play_siren()
-            dashboard = self.dashboards.get(remote_key)
-            if dashboard:
-                dashboard.show_awaiting_pacs(
-                    f"PACS nicht erreichbar — neuer Versuch in "
-                    f"{_AUTO_RESTART_RETRY_MS // 1000}s…")
+            self._show_awaiting_pacs(remote_key)
             self._schedule_auto_restart_retry(remote_key)
             return
         # Manual start: abort, tell the user, and leave the dashboard
@@ -698,8 +756,11 @@ class MainWindow(QMainWindow):
             f"{node.port}] not reachable for {remote_key}. "
             f"Service not started.")
         lang = getattr(self.config, "language", "en")
-        QMessageBox.warning(
-            self,
+        # Non-modal: this runs in the ``_scp_check_done`` slot, and on a
+        # multi-source setup the other engines keep emitting into the
+        # GUI thread while the dialog is up.
+        self._show_nonmodal_warning(
+            f"pacs_unreachable:{remote_key}",
             tr("pacs_unreachable_title", lang),
             tr("pacs_unreachable_msg", lang,
                name=node.name or remote_key,
@@ -708,13 +769,20 @@ class MainWindow(QMainWindow):
         if dashboard:
             dashboard.set_service_running(False)
 
-    def _ensure_fallback_scp(self, remote_key: str, node) -> bool:
+    def _ensure_fallback_scp(self, remote_key: str,
+                             node: PacsNode) -> bool:
         """Local PACS is unreachable — bring up the built-in StorageSCP
         if a fallback folder is configured.
 
         Returns ``True`` when the caller may proceed to start the engine
         (SCP started, or no fallback configured), ``False`` when SCP
-        startup failed and the engine must not be started."""
+        startup failed and the engine must not be started.
+
+        Deliberately does NOT touch ``_pending_start_params``.  It used
+        to pop them on failure, which forced the caller to snapshot and
+        restore the queued start before every call just to survive that
+        side effect; the caller owns them now.
+        """
         fallback = node.fallback_folder
         if fallback:
             storage_path = os.path.join(fallback, remote_key)
@@ -740,14 +808,14 @@ class MainWindow(QMainWindow):
             try:
                 scp.start()
             except RuntimeError as e:
-                # Port already in use, permission denied, etc.  Drop
-                # the pending start so the engine doesn't fire C-MOVEs
-                # at a dead local SCP, and surface the failure in
-                # the log instead of leaking the traceback to stderr.
+                # Port already in use, permission denied, etc.  Report
+                # the failure so the engine doesn't fire C-MOVEs at a
+                # dead local SCP, and surface it in the log instead of
+                # leaking the traceback to stderr.  Whether the queued
+                # start is dropped or retried is the caller's call.
                 self._log(
                     f"Storage SCP startup failed for {remote_key}: "
                     f"{e}. Engine not started.")
-                self._pending_start_params.pop(remote_key, None)
                 return False
             self.storage_scps[scp_key] = scp
         else:
@@ -756,6 +824,21 @@ class MainWindow(QMainWindow):
                 f"not reachable for {remote_key}. "
                 f"No fallback folder configured.")
         return True
+
+    def _show_awaiting_pacs(self, remote_key: str) -> None:
+        """Put the source's dashboard into the "waiting for the PACS"
+        state while the auto-restart retry loop keeps probing.
+
+        The wording goes through ``tr()`` like every other user-facing
+        string here — it used to be a German literal, so an English UI
+        showed German at exactly the moment something was wrong.
+        """
+        dashboard = self.dashboards.get(remote_key)
+        if not dashboard:
+            return
+        dashboard.show_awaiting_pacs(tr(
+            "pacs_retry_status", getattr(self.config, "language", "en"),
+            seconds=_AUTO_RESTART_RETRY_MS // 1000))
 
     def _schedule_auto_restart_retry(self, remote_key: str) -> None:
         """Re-run the reachability probe for *remote_key* after
@@ -810,7 +893,8 @@ class MainWindow(QMainWindow):
             dashboard.on_study_completed)
         e.signals.study_completed.connect(
             lambda uid, inst, full, images, eng=engine, rk=remote_key:
-                self._on_study_completed_live(eng, uid, full, source=rk))
+                self._on_study_completed_live(
+                    eng, uid, full, images, source=rk))
         e.signals.series_started.connect(dashboard.on_series_started)
         e.signals.series_progress.connect(dashboard.on_series_progress)
         e.signals.series_completed.connect(dashboard.on_series_completed)
@@ -936,10 +1020,30 @@ class MainWindow(QMainWindow):
                 "Waiting for current downloads to finish...")
             self._join_engines_responsive(total_timeout=30)
 
+        self._teardown_resources()
+        event.accept()
+
+    def _teardown_resources(self) -> None:
+        """Release everything the window owns, in dependency order.
+
+        Split out of ``closeEvent`` because the two halves have different
+        contracts: the engine wind-down up there can still ABORT the
+        close (the user answers "No" to the quit prompt), while
+        everything here runs only once the close is certain and must not
+        be able to refuse it.
+        """
         # Stop any auto-restart retry loops and silence the siren so a
         # pending QTimer can't fire into a half-torn-down window.
         for rk in list(self._auto_restart_retry_timers):
             self._stop_auto_restart_retry(rk)
+
+        # Non-modal warnings are independent top-level windows; close
+        # them explicitly so none is left floating after the main window
+        # goes away.
+        for key in list(self._open_warnings):
+            msg = self._open_warnings.pop(key)
+            msg.close()
+            msg.deleteLater()
 
         for scp in self.storage_scps.values():
             if scp.running:
@@ -950,8 +1054,13 @@ class MainWindow(QMainWindow):
         for dashboard in self.dashboards.values():
             dashboard.flush_pending_save()
 
+        # The stats window keeps one SQLite connection for as long as we
+        # hold it (it survives being closed and re-shown), so release it
+        # here — the window's own closeEvent deliberately does not.
+        if self._stats_window is not None:
+            self._stats_window.shutdown()
+
         self.log_window.close()
-        event.accept()
 
     def _join_engines_responsive(self, total_timeout: float) -> None:
         """Wait up to *total_timeout* seconds per engine while keeping the
@@ -966,7 +1075,6 @@ class MainWindow(QMainWindow):
         Iterates over a snapshot: ``processEvents`` can deliver a
         queued ``service_stopped`` whose handler prunes the engine from
         ``self.engines`` — mutating the dict mid-iteration otherwise."""
-        import time
         for engine in list(self.engines.values()):
             end = time.monotonic() + total_timeout
             while time.monotonic() < end:

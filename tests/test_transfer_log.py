@@ -11,6 +11,7 @@ the original identifiers are known, without storing PII locally.
 import hashlib
 import os
 import sqlite3
+import statistics
 import threading
 import time
 from datetime import datetime
@@ -719,6 +720,49 @@ class TestMbpsStats:
         var = sum((v - mean) ** 2 for v in vals) / len(vals)  # population
         assert stats["mean"] == pytest.approx(mean)
         assert stats["stddev"] == pytest.approx(var ** 0.5)
+
+    def test_stddev_precise_for_large_mean_small_spread(
+            self, log, sample_series_kwargs):
+        """stddev must stay accurate when the spread is tiny compared to
+        the mean (a fast link: ~1000 Mbps ± 0.5).
+
+        The old one-pass form E[X²] − E[X]² subtracts two numbers around
+        1e6 to get a variance around 0.1 — most of the mantissa cancels
+        away, leaving ~1e-10 relative error (and, on unluckier data, a
+        negative variance that only a max(…, 0.0) clamp hid).  The
+        two-pass form averages the squared deviations instead, which
+        never subtracts anything large, so it lands within a few ulps
+        of statistics.pstdev.  Hence the deliberately tight rel=1e-12:
+        a regression to the old formula fails here.
+        """
+        # 100-image CT series → 419.4304 Mb; pick durations that put the
+        # resulting estimated_mbps at 999.5 … 1000.5 in 0.1 steps.
+        total_mbits = estimate_bytes("CT", 100) * 8 / 1_000_000
+        durations = [total_mbits / (1000.0 + 0.1 * k)
+                     for k in range(-5, 6)]
+        self._record(log, sample_series_kwargs, *durations)
+
+        # Compare against the values SQLite actually stored, so the test
+        # measures the aggregation and not our restatement of the mbps
+        # formula.
+        vals = [r["estimated_mbps"] for r in log.query_series()]
+        assert len(vals) == len(durations)
+        assert min(vals) > 999.0 and max(vals) < 1001.0
+
+        stats = log.mbps_stats()
+        assert stats["mean"] == pytest.approx(
+            statistics.fmean(vals), rel=1e-12)
+        assert stats["stddev"] == pytest.approx(
+            statistics.pstdev(vals), rel=1e-12)
+
+    def test_stddev_zero_for_identical_values(
+            self, log, sample_series_kwargs):
+        """Identical rows have zero spread — the variance must come out
+        exactly 0.0, never a negative float that the clamp turns into a
+        silent 0 (or, unclamped, a math-domain error in the sqrt)."""
+        self._record(log, sample_series_kwargs, 0.4, 0.4, 0.4, 0.4)
+        stats = log.mbps_stats()
+        assert stats["stddev"] == 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -16,6 +16,22 @@ DEFAULT_LANGUAGE = "en"
 
 _TRANSLATIONS: Dict[str, Dict[str, str]] = {
     "en": {
+        "scp_bind_failed_title": "Local receiver could not start",
+        "scp_bind_failed_msg": (
+            "The local PACS for '{name}' did not respond, and the "
+            "built-in receiver could not be started either "
+            "(port {port} is unavailable).\n\nThe service was not "
+            "started. Free the port or correct the local settings, "
+            "then try again."),
+        "copy": "Copy",
+        "clear": "Clear",
+        "slow_transfer_title": "Slow download detected",
+        "slow_transfer_msg": (
+            "A download from '{name}' appears to be stuck (no progress "
+            "for some time).\n\nThe service is restarting "
+            "automatically."),
+        "pacs_retry_status": (
+            "PACS not reachable \u2014 retrying in {seconds}s\u2026"),
         "image_transfer_completed": "Image transfer completed",
         "pacs_unreachable_title": "PACS not reachable",
         "pacs_unreachable_msg": (
@@ -30,6 +46,24 @@ _TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "automatically once the PACS is reachable again."),
     },
     "de": {
+        "scp_bind_failed_title": "Lokaler Empf\u00e4nger konnte nicht starten",
+        "scp_bind_failed_msg": (
+            "Das lokale PACS f\u00fcr '{name}' hat nicht geantwortet, und "
+            "der integrierte Empf\u00e4nger konnte ebenfalls nicht "
+            "gestartet werden (Port {port} ist belegt).\n\nDer Dienst "
+            "wurde nicht gestartet. Bitte den Port freigeben oder die "
+            "lokalen Einstellungen korrigieren und es erneut "
+            "versuchen."),
+        "copy": "Kopieren",
+        "clear": "Leeren",
+        "slow_transfer_title": "Langsamer Download erkannt",
+        "slow_transfer_msg": (
+            "Ein Download bei '{name}' scheint zu h\u00e4ngen (kein "
+            "Fortschritt seit l\u00e4ngerer Zeit).\n\nDer Dienst wird "
+            "automatisch neu gestartet."),
+        "pacs_retry_status": (
+            "PACS nicht erreichbar \u2014 neuer Versuch in "
+            "{seconds}s\u2026"),
         "image_transfer_completed": "Abschluss Bildeingang",
         "pacs_unreachable_title": "PACS nicht erreichbar",
         "pacs_unreachable_msg": (
@@ -45,6 +79,23 @@ _TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "auf, sobald das PACS wieder erreichbar ist."),
     },
     "fr": {
+        "scp_bind_failed_title": "Le r\u00e9cepteur local n'a pas pu d\u00e9marrer",
+        "scp_bind_failed_msg": (
+            "Le PACS local pour '{name}' n'a pas r\u00e9pondu, et le "
+            "r\u00e9cepteur int\u00e9gr\u00e9 n'a pas pu d\u00e9marrer non plus "
+            "(le port {port} est occup\u00e9).\n\nLe service n'a pas "
+            "\u00e9t\u00e9 d\u00e9marr\u00e9. Lib\u00e9rez le port ou corrigez les "
+            "param\u00e8tres locaux, puis r\u00e9essayez."),
+        "copy": "Copier",
+        "clear": "Effacer",
+        "slow_transfer_title": "T\u00e9l\u00e9chargement lent d\u00e9tect\u00e9",
+        "slow_transfer_msg": (
+            "Un t\u00e9l\u00e9chargement depuis '{name}' semble bloqu\u00e9 "
+            "(aucune progression depuis un certain temps).\n\nLe service "
+            "red\u00e9marre automatiquement."),
+        "pacs_retry_status": (
+            "PACS injoignable \u2014 nouvel essai dans "
+            "{seconds}s\u2026"),
         "image_transfer_completed": "Transfert d'images terminé",
         "pacs_unreachable_title": "PACS injoignable",
         "pacs_unreachable_msg": (
@@ -60,6 +111,23 @@ _TRANSLATIONS: Dict[str, Dict[str, str]] = {
             "joignable."),
     },
     "es": {
+        "scp_bind_failed_title": "El receptor local no pudo iniciarse",
+        "scp_bind_failed_msg": (
+            "El PACS local de '{name}' no respondi\u00f3, y el receptor "
+            "integrado tampoco pudo iniciarse (el puerto {port} no "
+            "est\u00e1 disponible).\n\nEl servicio no se inici\u00f3. Libere "
+            "el puerto o corrija la configuraci\u00f3n local y vuelva a "
+            "intentarlo."),
+        "copy": "Copiar",
+        "clear": "Borrar",
+        "slow_transfer_title": "Descarga lenta detectada",
+        "slow_transfer_msg": (
+            "Una descarga desde '{name}' parece bloqueada (sin progreso "
+            "durante un tiempo).\n\nEl servicio se est\u00e1 reiniciando "
+            "autom\u00e1ticamente."),
+        "pacs_retry_status": (
+            "PACS no accesible \u2014 reintentando en "
+            "{seconds}s\u2026"),
         "image_transfer_completed": "Transferencia de imágenes completada",
         "pacs_unreachable_title": "PACS no accesible",
         "pacs_unreachable_msg": (

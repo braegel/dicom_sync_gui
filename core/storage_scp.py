@@ -7,7 +7,6 @@ import inspect
 import logging
 import os
 import threading
-from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
@@ -70,8 +69,6 @@ class StorageSCP(QObject):
         self._run_lock = threading.Lock()
         self._lock = threading.Lock()  # protects _images_received
         self._images_received = 0
-        self._thread: Optional[threading.Thread] = None
-        self._ready = threading.Event()
         os.makedirs(storage_path, exist_ok=True)
 
     @property
@@ -91,7 +88,7 @@ class StorageSCP(QObject):
         with self._lock:
             return self._images_received
 
-    def handle_store(self, event):
+    def handle_store(self, event: evt.Event) -> int:
         ds = event.dataset
         ds.file_meta = event.file_meta
         try:
@@ -115,56 +112,60 @@ class StorageSCP(QObject):
             return 0xC000
 
     def start(self):
+        """Bind the SCP's listening socket and serve in the background.
+
+        ``block=False`` binds in the CALLING thread and raises
+        synchronously if the port is unavailable, then hands serving to
+        pynetdicom's own daemon thread.  That matters because the only
+        caller (``MainWindow._ensure_fallback_scp``) runs on the GUI
+        thread: the previous ``block=True``-in-a-worker design had no way
+        to learn whether the bind had succeeded, so it slept a fixed
+        200 ms on the GUI thread and then guessed from a flag — a wait
+        that both froze the UI and raced under load.
+        """
         # Compare-and-set under the lock so two callers can't both start.
         with self._run_lock:
             if self._running_flag:
                 return
             self._running_flag = True
-        self.ae = AE(ae_title=self.ae_title)
-        self.ae.supported_contexts = StoragePresentationContexts
-        self.ae.add_supported_context(Verification)
-        self._ready.clear()
-
-        def run():
-            try:
-                self._ready.set()
-                self.ae.start_server(
-                    (self.bind_address, self.port), block=True,
-                    evt_handlers=[(evt.EVT_C_STORE, self.handle_store)])
-            except Exception as e:
-                logger.error(f"SCP error: {e}")
-            finally:
-                with self._run_lock:
-                    self._running_flag = False
-
-        self._thread = threading.Thread(target=run, daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=5.0)
-        # ``_ready`` is set immediately before ``start_server``.  On
-        # success that call blocks forever; on failure it raises
-        # synchronously and the worker exits.  Give the worker a beat
-        # to either settle into start_server (success path) or finish
-        # raising + run its ``finally`` (failure path) before we trust
-        # ``_running_flag``.  The previous pure-flag check raced under
-        # heavy suite load.
-        self._thread.join(timeout=0.2)
-        if not self.running:
+        ae = AE(ae_title=self.ae_title)
+        ae.supported_contexts = StoragePresentationContexts
+        ae.add_supported_context(Verification)
+        self.ae = ae
+        try:
+            ae.start_server(
+                (self.bind_address, self.port), block=False,
+                evt_handlers=[(evt.EVT_C_STORE, self.handle_store)])
+        except Exception as e:
+            # Port already in use, permission denied, bad bind address …
+            # Release the claim so a later retry can start cleanly.
+            logger.error(f"SCP error: {e}")
+            with self._run_lock:
+                self._running_flag = False
+            self._shutdown_ae(ae)
+            self.ae = None
             raise RuntimeError(
-                f"Storage SCP failed to bind on port {self.port}")
+                f"Storage SCP failed to bind on port {self.port}: {e}"
+            ) from e
         logger.info(f"Storage SCP started on port {self.port}")
 
     def stop(self):
-        # Atomically claim the shutdown so a concurrent stop() or the
-        # reactor's own finally clause cannot race us into calling
-        # ae.shutdown() twice on the same (already-torn-down) AE.
+        # Atomically claim the shutdown so a concurrent stop() cannot
+        # race us into calling ae.shutdown() twice on the same
+        # (already-torn-down) AE.
         with self._run_lock:
             if not self._running_flag or self.ae is None:
                 return
             self._running_flag = False
+            ae = self.ae
+        self._shutdown_ae(ae)
+        logger.info("Storage SCP stopped")
+
+    @staticmethod
+    def _shutdown_ae(ae: AE) -> None:
+        """Shut an AE down without letting a teardown error escape —
+        ``ae.shutdown()`` also stops the server threads it spawned."""
         try:
-            self.ae.shutdown()
+            ae.shutdown()
         except Exception as e:
             logger.warning(f"SCP shutdown failed: {e}")
-        if self._thread:
-            self._thread.join(timeout=5.0)
-        logger.info("Storage SCP stopped")

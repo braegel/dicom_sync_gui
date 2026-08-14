@@ -79,21 +79,6 @@ CONNECTION_TIMEOUT_S = 10
 DUL_RUN_LOOP_DELAY_S = 0.02
 
 
-def parse_dicom_time(time_str: str) -> str:
-    if not time_str:
-        return ""
-    # Strip the fractional part and pad to HHMMSS; slicing a too-short
-    # string just yields a shorter string, so no error handling needed.
-    time_str = time_str.split('.')[0].ljust(6, '0')
-    return f"{time_str[0:2]}:{time_str[2:4]}"
-
-
-def parse_dicom_date(date_str: str) -> str:
-    if not date_str or len(date_str) != 8:
-        return date_str or ""
-    return f"{date_str[6:8]}.{date_str[4:6]}.{date_str[0:4]}"
-
-
 class DicomOperations:
     """Handles all DICOM network operations."""
 
@@ -247,6 +232,19 @@ class DicomOperations:
         return self._execute_find(ds)
 
     def c_find_series(self, study_uid: str) -> List[Dataset]:
+        return self.c_find_series_checked(study_uid)[1]
+
+    def c_find_series_checked(self,
+                              study_uid: str) -> Tuple[bool, List[Dataset]]:
+        """Series-level C-FIND that also reports whether the query ran
+        to completion — ``(complete, series)``.
+
+        Same query as :py:meth:`c_find_series`, which stays list-only
+        for the GUI call sites.  The engine uses this variant because a
+        truncated series list is indistinguishable from a genuinely
+        short study once the flag is dropped, and it would then declare
+        a study "fully complete" from series it never even enumerated.
+        """
         ds = Dataset()
         ds.QueryRetrieveLevel = 'SERIES'
         ds.StudyInstanceUID = study_uid
@@ -258,7 +256,7 @@ class DicomOperations:
         ds.SeriesTime = ''
         ds.NumberOfSeriesRelatedInstances = ''
         ds.InstitutionName = ''
-        return self._execute_find(ds)
+        return self._execute_find_checked(ds)
 
     def c_find_institution_names(self, study_date: Optional[str] = None
                                   ) -> List[str]:
@@ -321,14 +319,36 @@ class DicomOperations:
         ds.SOPInstanceUID = ''
         return self._execute_find(ds, target='local')
 
-    def _execute_find(self, query_ds: Dataset, target: str = 'remote') -> List[Dataset]:
+    def _execute_find(self, query_ds: Dataset,
+                      target: str = 'remote') -> List[Dataset]:
+        """Run a C-FIND and return its result datasets.
+
+        Drops the completeness flag of
+        :py:meth:`_execute_find_checked` — use that one wherever a
+        truncated result list would be mistaken for an authoritative
+        one (see its docstring)."""
+        return self._execute_find_checked(query_ds, target)[1]
+
+    def _execute_find_checked(self, query_ds: Dataset, target: str = 'remote'
+                              ) -> Tuple[bool, List[Dataset]]:
+        """Run a C-FIND and return ``(complete, results)``.
+
+        *complete* is False when the iteration aborted mid-stream, i.e.
+        *results* holds only the datasets that arrived before the
+        association broke.  Callers that treat the result list as the
+        full truth (the engine's study-completion decision) must check
+        it; callers that only aggregate what they got (institution
+        discovery) can ignore it via :py:meth:`_execute_find`.
+        """
         config = self.local_config if target == 'local' else self.remote_config
         results = []
         # ``_associate`` raises PacsConnectionError when the PACS is
         # unreachable; that propagates to the engine (which surfaces
         # the "not reachable" popup).  A DIMSE error mid-iteration is a
         # different beast — the association WAS established — so it's
-        # caught below and yields whatever partial results arrived.
+        # caught below and yields whatever partial results arrived,
+        # flagged as incomplete.
+        complete = True
         assoc = self._associate(config)
         try:
             # Suppress pydicom's "VR UI value length exceeds maximum"
@@ -346,9 +366,10 @@ class DicomOperations:
                         results.append(dataset)
         except Exception as e:
             logger.error(f"C-FIND error: {e}")
+            complete = False
         finally:
             assoc.release()
-        return results
+        return complete, results
 
     def c_move_series(self, study_uid: str, series_uid: str,
                       progress_cb: Optional[ProgressCB] = None) -> Tuple[bool, int]:
@@ -378,30 +399,55 @@ class DicomOperations:
         # See _execute_find: PacsConnectionError (PACS unreachable)
         # propagates to the engine; a mid-stream DIMSE error is caught
         # below and reported as a normal (False, images) failure.
+        #
+        # ``success`` is deliberately NOT cleared by that except clause.
+        # 0x0000 is the FINAL C-MOVE status: if it arrived, the remote
+        # finished the operation, and an exception raised afterwards
+        # (tearing the generator down) does not undo that.  Clearing it
+        # would make the engine record a failure for a series that did
+        # transfer, and re-fetch the whole thing next cycle.
         assoc = self._associate(self.remote_config)
         try:
             for status, _ in assoc.send_c_move(
                     query_ds, move_dest, StudyRootQueryRetrieveInformationModelMove):
-                if status is None:
-                    continue
-                if getattr(status, "Status", None) == 0x0000:
-                    success = True
-                completed = getattr(
-                    status, 'NumberOfCompletedSuboperations', None)
-                if completed is not None:
-                    images = completed
-                    if progress_cb is not None:
-                        remaining = getattr(
-                            status, 'NumberOfRemainingSuboperations', 0) or 0
-                        total = completed + remaining
-                        try:
-                            progress_cb(completed, total)
-                        except Exception:
-                            # A misbehaving callback must never abort an
-                            # in-flight transfer.
-                            pass
+                done, images = self._read_move_status(
+                    status, images, progress_cb)
+                success = success or done
         except Exception as e:
             logger.error(f"C-MOVE error: {e}")
         finally:
             assoc.release()
         return success, images
+
+    @staticmethod
+    def _read_move_status(status: Optional[Dataset], images: int,
+                          progress_cb: Optional[ProgressCB]
+                          ) -> Tuple[bool, int]:
+        """Interpret one C-MOVE status message.
+
+        Returns ``(is_final_success, images)`` — *images* is carried
+        through unchanged when this particular status carries no
+        sub-operation count, so the caller keeps the last known value.
+
+        Split out of the send loop purely for depth: with the callback
+        guard inline the loop nested five levels, which is where the
+        "does this ``if`` belong to the status or to the callback?"
+        reading errors start.
+        """
+        if status is None:
+            return False, images
+        is_final_success = getattr(status, "Status", None) == 0x0000
+        completed = getattr(
+            status, 'NumberOfCompletedSuboperations', None)
+        if completed is None:
+            return is_final_success, images
+        if progress_cb is not None:
+            remaining = getattr(
+                status, 'NumberOfRemainingSuboperations', 0) or 0
+            try:
+                progress_cb(completed, completed + remaining)
+            except Exception:
+                # A misbehaving callback must never abort an in-flight
+                # transfer.
+                pass
+        return is_final_success, completed

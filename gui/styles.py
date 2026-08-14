@@ -51,6 +51,68 @@ BTN_AMBER_LARGE = _button_style(
 LBL_HINT_STYLE = "QLabel { color: #969696; }"
 
 
+# ── Accent palette ───────────────────────────────────────────────────────
+# Foreground accents for status text and table cells.  Green / yellow /
+# red live in gui.study_rate (single source of truth, shared with the
+# studies-per-hour colour bands); these are the remaining accents, kept
+# here so gui.dashboard and gui.queue_table can share them without one
+# importing the other.
+COLOR_ORANGE = "#f39c12"
+COLOR_BLUE_ACCENT = "#3498db"
+COLOR_MUTED = "#969696"
+# Warning / error text (the completions outlier band, the resend
+# warning in the examination lookup).
+COLOR_DANGER = "#e74c3c"
+# The theme's link/heading blue, used for section headings and
+# "what am I editing" hints inside dialogs.
+COLOR_LINK = "#2980b9"
+
+
+# ── Shared surface colours ───────────────────────────────────────────────
+# These mirror values baked into DARK_THEME below.  They live here as
+# named constants because widgets that build an inline stylesheet (the
+# dashboard's throughput readouts, its filter dropdown and its restart
+# banner) used to hardcode the same hex strings, so a theme change had to
+# be chased across several files to stay consistent.
+
+SURFACE_BG = "#2c2c2c"
+SURFACE_BORDER = "#555"
+TEXT_DEFAULT = "#d4d4d4"
+TEXT_ON_ACCENT = "#ffffff"
+
+# Tinted backgrounds behind the colour-coded throughput readouts —
+# a dark wash of the same hue as the foreground colour.
+STAT_BG_GOOD = "#1a3a1a"
+STAT_BG_BAD = "#3a1a1a"
+
+# Amber banner for the "settings changed, restart the service" hint.
+BANNER_WARN_BG = "#7f6000"
+
+
+def stat_label_style(color: str, background: str) -> str:
+    """QSS for one colour-coded throughput readout (images/minute)."""
+    return (
+        f"QLabel {{ color: {color}; background: {background}; "
+        f"border: 1px solid {SURFACE_BORDER}; border-radius: 6px; "
+        f"padding: 6px; }}"
+    )
+
+
+# Multi-select dropdown button in the dashboard's Institution Filter box.
+TOOLBTN_FILTER = (
+    f"QToolButton {{ padding: 5px 12px; "
+    f"border: 1px solid {SURFACE_BORDER}; border-radius: 4px; "
+    f"background: {SURFACE_BG}; min-width: 200px; text-align: left; }}"
+    f"QToolButton::menu-indicator {{ subcontrol-position: right center; }}"
+)
+
+# "Settings changed — restart the service" banner.
+LBL_RESTART_BANNER = (
+    f"QLabel {{ background: {BANNER_WARN_BG}; color: {TEXT_ON_ACCENT}; "
+    f"padding: 8px; border-radius: 4px; font-weight: bold; }}"
+)
+
+
 # ── Application-wide dark theme ──────────────────────────────────────────
 
 DARK_THEME = """

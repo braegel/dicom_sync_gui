@@ -13,8 +13,8 @@ import logging
 from typing import List, Optional
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QWidget,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QComboBox, QWidget,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -33,7 +33,6 @@ _LABEL_PADDING = "4px"
 def _play_alert() -> None:
     """Play system beep / alert sound."""
     try:
-        from PySide6.QtWidgets import QApplication
         app = QApplication.instance()
         if app:
             app.beep()

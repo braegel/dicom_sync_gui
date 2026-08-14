@@ -236,13 +236,15 @@ def merge_filter_group_data(
                 new_group_names.append(g)
                 summary["groups_added"] += 1
         for inst, grp in imported_assignments.items():
-            if inst in new_assignments:
-                if new_assignments[inst] != grp:
-                    new_assignments[inst] = grp
-                    summary["institutions_updated"] += 1
-            else:
+            if inst not in new_assignments:
                 new_assignments[inst] = grp
                 summary["institutions_added"] += 1
+                continue
+            # Already known: only an actual change counts as an update,
+            # so re-importing the same file reports zero changes.
+            if new_assignments[inst] != grp:
+                new_assignments[inst] = grp
+                summary["institutions_updated"] += 1
     else:
         # Replace mode: everything imported counts as "added".
         summary["groups_added"] = len(imported_groups)
@@ -280,12 +282,15 @@ class AppConfig:
         # UI language (en, de, fr, es)
         self.language: str = "en"
 
-        # Legacy fields — kept for backward-compatible config loading.
-        # New code reads per-source values from PacsNode directly.
+        # DEPRECATED state — the old *global* service parameters and the
+        # old global C-MOVE destination, kept only so pre-per-source
+        # config files still load.  New code reads the per-source values
+        # off PacsNode instead.  See the "DEPRECATED COMPATIBILITY
+        # SURFACE" section further down for the full rationale and for
+        # the migration helpers that consume these.
         self.default_hours: int = 3
         self.max_images: int = 0
         self.sync_interval: int = 60
-        # Legacy local node (used only during migration)
         self._legacy_local_node: Optional[Dict[str, Any]] = None
         self._legacy_fallback_enabled: bool = False
         self._legacy_fallback_path: str = ""
@@ -313,7 +318,14 @@ class AppConfig:
         if not os.path.exists(self.config_path):
             return False
         try:
-            with open(self.config_path, "r") as f:
+            # Explicit UTF-8: the platform default encoding is cp1252 on
+            # a German Windows box, which throws UnicodeDecodeError on a
+            # config that was hand-edited (or written by any other tool)
+            # as UTF-8.  load() would then report failure, the app would
+            # re-run the first-run wizard, and the next save() would
+            # start from an empty _raw_data — silently dropping the
+            # unknown-key round-tripping save() promises.
+            with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self._raw_data = dict(data)
 
@@ -347,23 +359,6 @@ class AppConfig:
         if "remote" in data and "remotes" not in data:
             self.remote_nodes["default"] = PacsNode.from_dict(data["remote"])
 
-    def _capture_legacy(self, data: Dict[str, Any]) -> None:
-        """Read legacy global values and the legacy local node / fallback
-        storage, stashing them for use by ``_migrate_legacy_into_nodes``."""
-        # Read legacy global values (needed for migration below)
-        self.default_hours = data.get("default_hours", 3)
-        self.max_images = data.get("max_images", 0)
-        self.sync_interval = data.get("sync_interval", 60)
-
-        # Legacy local node + fallback storage
-        legacy_local = data.get("local", {})
-        legacy_fallback_enabled = data.get("fallback_storage_enabled", False)
-        legacy_fallback_path = data.get(
-            "fallback_storage_path", os.path.expanduser("~/DICOM_Incoming"))
-        self._legacy_local_node = legacy_local
-        self._legacy_fallback_enabled = legacy_fallback_enabled
-        self._legacy_fallback_path = legacy_fallback_path
-
     def _read_filter_settings(self, data: Dict[str, Any]) -> None:
         """Read prior-studies, filter-group, alert and language settings."""
         self.prior_studies_count = data.get("prior_studies_count", 0)
@@ -382,27 +377,6 @@ class AppConfig:
         self.high_load_alert_enabled = data.get(
             "high_load_alert_enabled", True)
         self.language = data.get("language", "en")
-
-    def _migrate_legacy_into_nodes(self, data: Dict[str, Any]) -> None:
-        """Inject per-source fields from the legacy globals captured by
-        ``_capture_legacy`` into any node that predates them."""
-        remotes_raw = data.get("remotes", {})
-        legacy_local = self._legacy_local_node or {}
-        for key, node in self.remote_nodes.items():
-            raw = remotes_raw.get(key, {})
-            # Migrate service parameters
-            if "hours" not in raw:
-                node.hours = self.default_hours
-                node.max_images = self.max_images
-                node.sync_interval = self.sync_interval
-            # Migrate local destination from old global local_node
-            if "local_ae_title" not in raw and legacy_local:
-                node.local_ae_title = legacy_local.get("ae_title", DEFAULT_LOCAL_AE_TITLE)
-                node.local_port = legacy_local.get("port", DEFAULT_LOCAL_PORT)
-                node.local_syntax = legacy_local.get(
-                    "transfer_syntax", DEFAULT_TRANSFER_SYNTAX)
-                if self._legacy_fallback_enabled:
-                    node.fallback_folder = self._legacy_fallback_path
 
     def save(self) -> bool:
         """Save configuration to file atomically.
@@ -434,7 +408,8 @@ class AppConfig:
             "filter_small_series_max": self.filter_small_series_max,
             "high_load_alert_enabled": self.high_load_alert_enabled,
             "language": self.language,
-            # Legacy globals (kept for downgrade compatibility)
+            # Legacy globals (kept for downgrade compatibility — see the
+            # DEPRECATED COMPATIBILITY SURFACE section)
             "default_hours": self.default_hours,
             "max_images": self.max_images,
             "sync_interval": self.sync_interval,
@@ -442,7 +417,11 @@ class AppConfig:
         tmp_path = self.config_path + ".tmp"
         try:
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(tmp_path, "w") as f:
+            # UTF-8 to match load().  json.dump escapes non-ASCII by
+            # default so today's writes are pure ASCII either way, but
+            # pinning the encoding keeps the two ends in lockstep should
+            # that default ever change.
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
@@ -464,6 +443,14 @@ class AppConfig:
         until ``update_local_ip()`` has populated the cache."""
         return self._local_ip or get_local_ip()
 
+    def update_local_ip(self):
+        """Refresh the cached local IP for all per-source local destinations.
+
+        Called once at startup so that ``get_local_dict_for`` always returns
+        the current LAN address.
+        """
+        self._local_ip = get_local_ip()
+
     def get_local_dict_for(self, remote_key: str) -> Dict[str, Any]:
         """Return the local destination dict for a specific source PACS.
 
@@ -483,7 +470,72 @@ class AppConfig:
             "transfer_syntax": node.local_syntax,
         }
 
-    # ── Kept for backward compatibility with tests ────────────────────
+    # ══ DEPRECATED COMPATIBILITY SURFACE ═════════════════════════════════
+    #
+    # Everything below this banner and above the "Filter groups" section
+    # is *deprecated*.  It exists for exactly two reasons:
+    #
+    #   1. Old config files must keep loading.  Before the per-source
+    #      rewrite, hours / max_images / sync_interval and the C-MOVE
+    #      destination ("local" node + fallback storage) were single
+    #      GLOBAL settings.  A config written by such a build still has
+    #      to come up with every source configured correctly, so those
+    #      globals are read into the ``_legacy_*`` / ``default_hours`` /
+    #      ``max_images`` / ``sync_interval`` attributes declared in
+    #      ``__init__`` and then folded into the individual PacsNodes.
+    #      save() also keeps writing the globals back so downgrading to
+    #      an older build doesn't lose them.
+    #   2. ``local_node`` and ``get_local_dict()`` predate the per-source
+    #      destination and are still referenced by tests.
+    #
+    # NEW CODE MUST NOT USE ANY OF THIS.  The current API is:
+    #   - per-source service params  → ``node.hours`` / ``node.max_images``
+    #                                  / ``node.sync_interval`` on the
+    #                                  PacsNode from ``remote_nodes``
+    #   - per-source C-MOVE target   → ``get_local_dict_for(remote_key)``
+    #
+    # The migration helpers are called from ``load()`` (``_capture_legacy``
+    # before ``_migrate_legacy_into_nodes``, which depends on it) — they
+    # live down here rather than next to load() so the live load path
+    # reads as four named steps without the legacy bulk in between.
+
+    def _capture_legacy(self, data: Dict[str, Any]) -> None:
+        """Read legacy global values and the legacy local node / fallback
+        storage, stashing them for use by ``_migrate_legacy_into_nodes``."""
+        # Read legacy global values (needed for migration below)
+        self.default_hours = data.get("default_hours", 3)
+        self.max_images = data.get("max_images", 0)
+        self.sync_interval = data.get("sync_interval", 60)
+
+        # Legacy local node + fallback storage
+        legacy_local = data.get("local", {})
+        legacy_fallback_enabled = data.get("fallback_storage_enabled", False)
+        legacy_fallback_path = data.get(
+            "fallback_storage_path", os.path.expanduser("~/DICOM_Incoming"))
+        self._legacy_local_node = legacy_local
+        self._legacy_fallback_enabled = legacy_fallback_enabled
+        self._legacy_fallback_path = legacy_fallback_path
+
+    def _migrate_legacy_into_nodes(self, data: Dict[str, Any]) -> None:
+        """Inject per-source fields from the legacy globals captured by
+        ``_capture_legacy`` into any node that predates them."""
+        remotes_raw = data.get("remotes", {})
+        legacy_local = self._legacy_local_node or {}
+        for key, node in self.remote_nodes.items():
+            raw = remotes_raw.get(key, {})
+            # Migrate service parameters
+            if "hours" not in raw:
+                node.hours = self.default_hours
+                node.max_images = self.max_images
+                node.sync_interval = self.sync_interval
+            # Migrate local destination from old global local_node
+            if "local_ae_title" not in raw and legacy_local:
+                node.local_ae_title = legacy_local.get("ae_title", DEFAULT_LOCAL_AE_TITLE)
+                node.local_port = legacy_local.get("port", DEFAULT_LOCAL_PORT)
+                node.local_syntax = legacy_local.get(
+                    "transfer_syntax", DEFAULT_TRANSFER_SYNTAX)
+                if self._legacy_fallback_enabled:
+                    node.fallback_folder = self._legacy_fallback_path
 
     @property
     def local_node(self):
@@ -505,17 +557,20 @@ class AppConfig:
         )
 
     @local_node.setter
-    def local_node(self, value):
-        """Legacy setter — ignored. Local config is now per-source."""
-        pass
+    def local_node(self, value: Any) -> None:
+        """Rejects the assignment.
 
-    def update_local_ip(self):
-        """Refresh the cached local IP for all per-source local destinations.
-
-        Called once at startup so that ``get_local_dict_for`` always returns
-        the current LAN address.
+        There is no global local node any more — the C-MOVE destination
+        is per source (``PacsNode.local_ae_title`` / ``local_port`` /
+        ``local_syntax``).  This used to accept the assignment and
+        silently discard it, so code written against the old API kept
+        "working" while configuring nothing at all.  Failing loudly is
+        the whole point.
         """
-        self._local_ip = get_local_ip()
+        raise AttributeError(
+            "AppConfig.local_node is read-only: the C-MOVE destination "
+            "is configured per source PACS. Set local_ae_title / "
+            "local_port / local_syntax on the PacsNode instead.")
 
     def get_local_dict(self) -> Dict[str, Any]:
         """Legacy — returns the first source's local config."""
@@ -526,6 +581,8 @@ class AppConfig:
         return {"ae_title": DEFAULT_LOCAL_AE_TITLE, "ip_address": ip,
                 "port": DEFAULT_LOCAL_PORT,
                 "transfer_syntax": DEFAULT_TRANSFER_SYNTAX}
+
+    # ══ END DEPRECATED COMPATIBILITY SURFACE ═════════════════════════════
 
     # ── Filter groups export / import ────────────────────────────────────
 

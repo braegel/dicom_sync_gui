@@ -145,3 +145,29 @@ class TestTranslationFormatting:
         # Extra kwargs on a placeholder-free string are harmless.
         assert tr("image_transfer_completed", "en",
                   unused="x") == "Image transfer completed"
+
+
+class TestSharedUIKeys:
+    """Keys shared by the dashboard, the main window and the
+    completions window.  Every supported language must define them —
+    these replaced hardcoded German literals, so a missing entry would
+    reintroduce the exact bug they were added to fix."""
+
+    def test_every_language_has_the_shared_ui_keys(self):
+        for lang in SUPPORTED_LANGUAGES:
+            for key in ("copy", "clear", "slow_transfer_title",
+                        "slow_transfer_msg", "pacs_retry_status"):
+                result = tr(key, lang)
+                assert result != key and len(result) > 0, (
+                    f"language {lang!r} is missing the {key!r} "
+                    f"translation")
+
+    def test_slow_transfer_msg_substitutes_the_source_name(self):
+        for lang in SUPPORTED_LANGUAGES:
+            msg = tr("slow_transfer_msg", lang, name="ct")
+            assert "ct" in msg and "{" not in msg
+
+    def test_pacs_retry_status_substitutes_the_delay(self):
+        for lang in SUPPORTED_LANGUAGES:
+            msg = tr("pacs_retry_status", lang, seconds=5)
+            assert "5" in msg and "{" not in msg

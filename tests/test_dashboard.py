@@ -486,8 +486,8 @@ class TestLiveRefreshPerformance:
         self.dashboard.on_queue_updated(queue)
         pending_before = self.dashboard.series_table.item(0, 6)
         ete_before = self.dashboard.series_table.item(0, 9)
-        self.dashboard._active_series_uid = "u1"
-        self.dashboard._active_series_done = 50
+        self.dashboard._active.series_uid = "u1"
+        self.dashboard._active.images_done = 50
         self.dashboard._refresh_pending_and_ete()
         # Same item objects, just updated text — not reallocated.
         assert self.dashboard.series_table.item(0, 6) is pending_before
@@ -499,8 +499,8 @@ class TestLiveRefreshPerformance:
         queue = [self._make_job_dict(
             series_uid="u1", remote_count=200, local_count=0)]
         self.dashboard.on_queue_updated(queue)
-        self.dashboard._active_series_uid = "u1"
-        self.dashboard._active_series_done = 60
+        self.dashboard._active.series_uid = "u1"
+        self.dashboard._active.images_done = 60
         self.dashboard._refresh_pending_and_ete()
         assert self.dashboard.series_table.item(0, 6).text() == "140"
 
@@ -509,8 +509,8 @@ class TestLiveRefreshPerformance:
         queue = [self._make_job_dict(series_uid="u1")]
         self.dashboard.on_queue_updated(queue)
         self.dashboard.hide()
-        self.dashboard._active_series_uid = "u1"
-        self.dashboard._active_series_done = 99
+        self.dashboard._active.series_uid = "u1"
+        self.dashboard._active.images_done = 99
         # Should be a no-op: pending text stays at the queue-rendered value.
         before = self.dashboard.series_table.item(0, 6).text()
         self.dashboard._refresh_pending_and_ete()
@@ -546,10 +546,10 @@ class TestSeriesLevelWatchdog:
 
     def test_within_deadline_does_not_restart(self):
         import time as _t
-        self.dashboard._active_series_uid = "u1"
+        self.dashboard._active.series_uid = "u1"
         # Deadline is still in the future — large series, plenty of time.
-        self.dashboard._watchdog_deadline_ts = _t.monotonic() + 300.0
-        self.dashboard._last_progress_ts = _t.monotonic() - 999.0
+        self.dashboard._active.deadline_ts = _t.monotonic() + 300.0
+        self.dashboard._active.last_progress_ts = _t.monotonic() - 999.0
         with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
                 patch.object(self.dashboard, "_play_sound"):
             self.dashboard._on_slow_transfer_detected()
@@ -558,10 +558,10 @@ class TestSeriesLevelWatchdog:
     def test_overran_but_progressing_does_not_restart(self):
         import time as _t
         from gui.dashboard import _WATCHDOG_NO_PROGRESS_S
-        self.dashboard._active_series_uid = "u1"
+        self.dashboard._active.series_uid = "u1"
         # Past the deadline, but progress arrived recently → still alive.
-        self.dashboard._watchdog_deadline_ts = _t.monotonic() - 10.0
-        self.dashboard._last_progress_ts = (
+        self.dashboard._active.deadline_ts = _t.monotonic() - 10.0
+        self.dashboard._active.last_progress_ts = (
             _t.monotonic() - (_WATCHDOG_NO_PROGRESS_S / 2))
         with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
                 patch.object(self.dashboard, "_play_sound"):
@@ -571,10 +571,10 @@ class TestSeriesLevelWatchdog:
     def test_overran_and_no_progress_restarts(self):
         import time as _t
         from gui.dashboard import _WATCHDOG_NO_PROGRESS_S
-        self.dashboard._active_series_uid = "u1"
+        self.dashboard._active.series_uid = "u1"
         # Past the deadline AND no progress for well over the threshold.
-        self.dashboard._watchdog_deadline_ts = _t.monotonic() - 10.0
-        self.dashboard._last_progress_ts = (
+        self.dashboard._active.deadline_ts = _t.monotonic() - 10.0
+        self.dashboard._active.last_progress_ts = (
             _t.monotonic() - (_WATCHDOG_NO_PROGRESS_S + 30))
         with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
                 patch.object(self.dashboard, "_play_sound"), \
@@ -583,8 +583,8 @@ class TestSeriesLevelWatchdog:
         restart.assert_called_once()
 
     def test_no_active_series_does_not_restart(self):
-        self.dashboard._active_series_uid = None
-        self.dashboard._watchdog_deadline_ts = 0.0
+        self.dashboard._active.series_uid = None
+        self.dashboard._active.deadline_ts = 0.0
         with patch.object(self.dashboard, "_on_restart_clicked") as restart:
             self.dashboard._on_slow_transfer_detected()
         restart.assert_not_called()
@@ -1723,27 +1723,44 @@ class TestSoundPerStudyNotPerSeries:
             self.dashboard.on_study_completed)
 
     def test_study_completes_again_in_a_new_cycle(self):
-        """Across cycles a study completes (and chimes) again — there is
-        intentionally no cross-cycle de-dup, so the Download Completions
-        row and the chime both fire on every real completion.  Regression
-        guard: an earlier chime-dedup also suppressed the completions
-        entry, making finished studies silently disappear from the list."""
+        """Across cycles a study completes (and chimes) again as soon as a
+        real wave of new images arrived — the Download Completions row and
+        the chime both fire on every such completion.  Regression guard:
+        an earlier chime-dedup also suppressed the completions entry,
+        making finished studies silently disappear from the list."""
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha",
                       transferred_images=100),
         ]
+        self.engine._study_images_transferred["S1"] = 100
         received = []
         self.engine.signals.study_completed.connect(
             lambda uid, inst, full, imgs: received.append(full))
         self.engine._check_study_complete("S1")
-        # New cycle: the per-cycle guard is cleared and the study is
+        # New cycle: a late series lands 60 more images and the study is
         # re-queued/re-completed.
-        self.engine._completed_studies.clear()
+        self.engine._study_images_transferred["S1"] = 160
         self.engine._check_study_complete("S1")
         assert received == [True, True], (
-            "a study must report fully_complete=True on every cycle it "
-            "completes, not just the first")
+            "a study must report fully_complete=True on every cycle in "
+            "which new images actually arrived, not just the first")
+
+    def test_no_repeat_chime_for_retry_cycle_without_new_images(self):
+        """A new cycle that only RE-ATTEMPTS the study's failed series
+        (nothing new arrives) must not chime again — the chime and the
+        Download Completions timestamp track real image arrivals."""
+        self.engine._queue = [
+            SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
+                      status="done", institution_name="Hospital Alpha",
+                      transferred_images=100),
+        ]
+        self.engine._study_images_transferred["S1"] = 100
+        with patch.object(self.dashboard, "_play_sound") as mock_play:
+            self.engine._check_study_complete("S1")
+            # Next cycle: retry attempt moved zero images.
+            self.engine._check_study_complete("S1")
+        mock_play.assert_called_once()
 
     def test_no_sound_while_series_pending(self):
         """Study S1 has 3 series — only 1 done → no sound."""
@@ -1778,11 +1795,13 @@ class TestSoundPerStudyNotPerSeries:
 
     def test_no_repeat_sound_within_same_cycle(self):
         """Within a single cycle, a study emits study_completed only once
-        — the per-cycle ``_completed_studies`` guard stops a second
-        _check_study_complete for the same study from re-firing.  (Across
-        cycles the study DOES complete again — both the chime and the
-        Download Completions row are intended to fire on every real
-        completion; _completed_studies is cleared each cycle.)"""
+        — the ``_completed_studies`` guard stops a second
+        _check_study_complete for the same study from re-firing.  (The
+        study DOES complete again once more than
+        MIN_IMAGES_TO_REFRESH_COMPLETION further images have arrived —
+        both the chime and the Download Completions row are intended to
+        fire on every such real completion, in this cycle or a later
+        one.)"""
         self.engine._queue = [
             SeriesJob(patient_id="P1", study_uid="S1", series_uid="1.1",
                       status="done", institution_name="Hospital Alpha",

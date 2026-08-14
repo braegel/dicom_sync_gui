@@ -17,6 +17,8 @@ Source PACS workflow
 - "Remove" deletes the selected entry.
 """
 
+import ipaddress
+import re
 from typing import Optional, Tuple
 
 from PySide6.QtWidgets import (
@@ -29,12 +31,51 @@ from PySide6.QtWidgets import (
 from core.config import AppConfig, PacsNode
 from core.i18n import SUPPORTED_LANGUAGES
 from gui.pacs_node_editor import PacsNodeEditor  # noqa: F401 — re-export
-from gui.styles import BTN_GREEN, BTN_BLUE
+from gui.styles import BTN_GREEN, BTN_BLUE, COLOR_LINK
 
 # Localised display names for the language combo.  Module-level so
 # the dict is built once at import time, not on every dialog open.
 _LANG_LABELS = {"en": "English", "de": "Deutsch",
                 "fr": "Français", "es": "Español"}
+
+# DICOM defines an AE title as an AE-string of at most 16 characters
+# (PS3.5 §6.2).  Longer titles are rejected or silently truncated by
+# the peer, and the user only ever sees "association rejected" hours
+# later — so refuse them at entry time instead.
+AE_TITLE_MAX_LEN = 16
+
+# One DNS label: letters/digits, inner hyphens, no leading/trailing
+# hyphen.  Underscores are tolerated because Windows-domain PACS hosts
+# in the field really do use them, even though RFC 1123 does not.
+_HOSTNAME_LABEL_RE = re.compile(
+    r"^[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?$")
+
+
+def is_valid_host(value: str) -> bool:
+    """True if *value* is a syntactically valid IPv4/IPv6 address or
+    hostname.
+
+    Purely syntactic — nothing here resolves or pings the host; the
+    point is only to catch the typo (``192.168.1.300``, ``10.0.0``,
+    a stray space) at the moment it is entered rather than at the
+    next association attempt.
+    """
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    # RFC 1035 caps a fully-qualified name at 255 octets, i.e. 253
+    # characters in the usual dotted presentation form.
+    if len(value) > 253:
+        return False
+    labels = value.split(".")
+    # An all-numeric dotted string is a mistyped IP address, not a
+    # hostname someone meant: DNS syntax would happily accept
+    # "192.168.1.300", so reject it here where we still have context.
+    if all(label.isdigit() for label in labels):
+        return False
+    return all(_HOSTNAME_LABEL_RE.match(label) for label in labels)
 
 
 class SettingsDialog(QDialog):
@@ -103,7 +144,8 @@ class SettingsDialog(QDialog):
         # Mode label — tells user what they are doing
         self.mode_label = QLabel("Fill in the fields and click \"Add New\".")
         self.mode_label.setStyleSheet(
-            "QLabel { color: #2980b9; font-weight: bold; padding: 4px; }")
+            f"QLabel {{ color: {COLOR_LINK}; font-weight: bold; "
+            f"padding: 4px; }}")
         right.addWidget(self.mode_label)
 
         key_layout = QFormLayout()
@@ -239,6 +281,9 @@ class SettingsDialog(QDialog):
                 "Please fill in at least \"Name\" and \"AE Title\".")
             return
 
+        if self._warn_about_network_fields():
+            return
+
         key = self.key_edit.text().strip()
         if not key:
             QMessageBox.warning(
@@ -273,6 +318,9 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(
                 self, "Incomplete",
                 "Please fill in at least \"Name\" and \"AE Title\".")
+            return
+
+        if self._warn_about_network_fields():
             return
 
         new_key = self.key_edit.text().strip()
@@ -374,3 +422,49 @@ class SettingsDialog(QDialog):
                         node.local_ae_title, node.local_port)
             seen[endpoint] = key
         return None
+
+    # ── Editor field validation ──────────────────────────────────────────
+
+    def _find_network_field_problem(self) -> Optional[Tuple[str, str]]:
+        """Return ``(title, message)`` for the first invalid network
+        field in the editor, or ``None`` if they all pass.
+
+        Only *syntax* is checked, and only on fields the user actually
+        filled in — an empty IP or local AE title is a legitimate
+        half-configured entry, and blocking it would break the
+        fill-in-later workflow the dialog is built around.
+        """
+        for label, ae in (
+            ("AE Title", self.remote_editor.ae_title_edit.text().strip()),
+            ("Local AE Title",
+             self.remote_editor.local_ae_edit.text().strip()),
+        ):
+            if len(ae) > AE_TITLE_MAX_LEN:
+                return (
+                    "AE Title Too Long",
+                    f"\"{label}\" is {len(ae)} characters long.\n\n"
+                    f"DICOM allows at most {AE_TITLE_MAX_LEN} characters "
+                    f"for an AE title. A longer title is rejected or "
+                    f"truncated by the peer, which shows up much later "
+                    f"as a failed association. Shorten it before saving.")
+
+        ip = self.remote_editor.ip_edit.text().strip()
+        if ip and not is_valid_host(ip):
+            return (
+                "Invalid IP Address",
+                f"\"{ip}\" is not a valid IP address or hostname.\n\n"
+                f"Enter an IPv4 address (e.g. 192.168.1.10), an IPv6 "
+                f"address, or a resolvable hostname. A typo here only "
+                f"surfaces later as a connection that never succeeds.")
+        return None
+
+    def _warn_about_network_fields(self) -> bool:
+        """Show a warning for the first invalid network field and
+        return ``True`` if the caller must abort; ``False`` if the
+        editor's fields are usable."""
+        problem = self._find_network_field_problem()
+        if problem is None:
+            return False
+        title, message = problem
+        QMessageBox.warning(self, title, message)
+        return True

@@ -7,6 +7,7 @@ accessible via the View menu.
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from PySide6.QtCore import Qt
@@ -16,13 +17,44 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QGroupBox, QGridLayout, QHeaderView,
     QPushButton, QComboBox, QTabWidget,
 )
-from PySide6.QtGui import QCloseEvent, QFont, QPainter
+from PySide6.QtGui import QFont, QPainter
 
 from core.stats_utils import median, tukey_quartiles
 from core.transfer_log import TransferLog
 from gui.async_helpers import run_in_background
 
 logger = logging.getLogger("dicom_sync")
+
+# Cap on the rows rendered into the two browsable detail tables.
+#
+# ``_refresh`` runs the QUERY on a worker thread, but the table
+# population below is unavoidably GUI-thread work: one QTableWidgetItem
+# per cell.  After months of 24/7 logging the log holds >10^5 series
+# rows, so rendering all of them allocated ~10^6 items in a single event
+# loop slice and froze the window on every filter change.
+#
+# Only these two tables are capped, and they show the MOST RECENT rows.
+# The summary, the boxplot, and the per-source / per-modality breakdowns
+# keep aggregating the FULL result set, so no statistic changes.
+MAX_DETAIL_ROWS = 500
+
+
+@dataclass
+class _SourceTotals:
+    """Per-source accumulator for the "By Source" table.
+
+    Deliberately a fixed shape: the study rows and the series rows are
+    accumulated in two separate loops, and when this was a plain dict
+    grown key-by-key a source that only ever appeared in one of the two
+    loops ended up without the other loop's keys.  Every read then had
+    to guess a fallback (``d.get("series", 0)``), and the guess was the
+    only thing keeping the render loop from a KeyError.  One dataclass
+    means every source carries all four fields from the start.
+    """
+    studies: int = 0
+    images: int = 0
+    series: int = 0
+    mbps_vals: list[float] = field(default_factory=list)
 
 
 class TransferStatsWindow(QWidget):
@@ -43,13 +75,23 @@ class TransferStatsWindow(QWidget):
         self._setup_ui()
         self._refresh()
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def shutdown(self) -> None:
+        """Release the SQLite connection.  Call this when the window is
+        really finished with — NOT from ``closeEvent``.
+
+        The owner (``MainWindow``) keeps one instance and re-``show()``s
+        it, so closing the log on every window close left the cached
+        window pointing at a dead connection: each later query raised
+        ``sqlite3.ProgrammingError``, which ``_refresh``'s worker catches
+        and turns into empty results — the user saw blank statistics with
+        no error.  Closing is therefore tied to the owner's lifetime, not
+        to the window being hidden.
+        """
         try:
             self._log.close()
         except Exception:
             logger.debug("TransferStatsWindow: closing log failed",
                          exc_info=True)
-        super().closeEvent(event)
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -141,6 +183,11 @@ class TransferStatsWindow(QWidget):
         self.study_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.study_table.setAlternatingRowColors(True)
         stl.addWidget(self.study_table)
+        # Tells the user when the table is a capped view (see
+        # MAX_DETAIL_ROWS) so a truncated list is never mistaken for the
+        # whole history.
+        self.lbl_study_rows = QLabel("—")
+        stl.addWidget(self.lbl_study_rows)
         tabs.addTab(study_tab, "Studies")
 
         series_tab = QWidget()
@@ -149,9 +196,29 @@ class TransferStatsWindow(QWidget):
         self.series_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.series_table.setAlternatingRowColors(True)
         sel.addWidget(self.series_table)
+        self.lbl_series_rows = QLabel("—")
+        sel.addWidget(self.lbl_series_rows)
         tabs.addTab(series_tab, "Series")
 
         layout.addWidget(tabs, 1)
+
+    # ── Detail-table row capping ─────────────────────────────────────
+
+    @staticmethod
+    def _detail_rows(rows: list[dict]) -> list[dict]:
+        """The most recent ``MAX_DETAIL_ROWS`` of *rows*.
+
+        ``TransferLog._query`` orders by ``id`` ascending, so the tail is
+        the newest.  The slice keeps that ascending order — the newest
+        row stays at the bottom, exactly where it was before the cap.
+        """
+        return rows[-MAX_DETAIL_ROWS:]
+
+    @staticmethod
+    def _row_count_text(shown: int, total: int) -> str:
+        if shown >= total:
+            return f"{total} rows"
+        return f"Showing the {shown} most recent of {total} rows"
 
     # ── Data loading ─────────────────────────────────────────────────
 
@@ -175,7 +242,7 @@ class TransferStatsWindow(QWidget):
                     "TransferStatsWindow: filter rebuild query failed")
                 return []
 
-        def apply(all_series):
+        def apply(all_series: list[dict]) -> None:
             self._populate_filter_combos(all_series)
             self._refresh()
 
@@ -247,7 +314,7 @@ class TransferStatsWindow(QWidget):
                     "TransferStatsWindow: refresh query failed")
                 return [], []
 
-        def apply(payload):
+        def apply(payload: tuple[list[dict], list[dict]]) -> None:
             if seq != self._refresh_seq:
                 return  # superseded by a newer refresh
             series, studies = payload
@@ -351,35 +418,35 @@ class TransferStatsWindow(QWidget):
     def _update_source_table(self, series: list[dict],
                              studies: list[dict]) -> None:
         headers = ["Source", "Studies", "Series", "Images", "Median Mbit/s"]
-        sources = {}
+        sources: dict[str, _SourceTotals] = defaultdict(_SourceTotals)
         for r in studies:
-            s = r["source_pacs"]
-            if s not in sources:
-                sources[s] = {"studies": 0, "images": 0}
-            sources[s]["studies"] += 1
-            sources[s]["images"] += r["total_images"]
+            totals = sources[r["source_pacs"]]
+            totals.studies += 1
+            totals.images += r["total_images"]
         for r in series:
-            s = r["source_pacs"]
-            if s not in sources:
-                sources[s] = {"studies": 0, "images": 0}
-            sources[s].setdefault("series", 0)
-            sources[s]["series"] = sources[s].get("series", 0) + 1
-            sources[s].setdefault("mbps_vals", [])
+            totals = sources[r["source_pacs"]]
+            totals.series += 1
+            # A zero rate means the series was too small / too fast to
+            # time — keep it out of the median instead of dragging it
+            # towards zero.
             if r["estimated_mbps"] > 0:
-                sources[s]["mbps_vals"].append(r["estimated_mbps"])
+                totals.mbps_vals.append(r["estimated_mbps"])
 
         self.source_table.setColumnCount(len(headers))
         self.source_table.setHorizontalHeaderLabels(headers)
         self.source_table.setRowCount(len(sources))
-        for row, (src, d) in enumerate(sorted(sources.items())):
+        for row, src in enumerate(sorted(sources)):
+            totals = sources[src]
             self.source_table.setItem(row, 0, QTableWidgetItem(src))
-            self.source_table.setItem(row, 1, QTableWidgetItem(str(d["studies"])))
-            self.source_table.setItem(row, 2, QTableWidgetItem(str(d.get("series", 0))))
-            self.source_table.setItem(row, 3, QTableWidgetItem(str(d["images"])))
-            vals = d.get("mbps_vals", [])
-            if vals:
+            self.source_table.setItem(
+                row, 1, QTableWidgetItem(str(totals.studies)))
+            self.source_table.setItem(
+                row, 2, QTableWidgetItem(str(totals.series)))
+            self.source_table.setItem(
+                row, 3, QTableWidgetItem(str(totals.images)))
+            if totals.mbps_vals:
                 self.source_table.setItem(
-                    row, 4, QTableWidgetItem(f"{median(vals):.1f}"))
+                    row, 4, QTableWidgetItem(f"{median(totals.mbps_vals):.1f}"))
             else:
                 self.source_table.setItem(row, 4, QTableWidgetItem("—"))
 
@@ -416,10 +483,13 @@ class TransferStatsWindow(QWidget):
     def _update_study_table(self, studies: list[dict]) -> None:
         headers = ["Date", "Time", "Source", "Modality", "Description",
                     "Series", "Images", "Wall Clock (s)", "Mbit/s"]
+        shown = self._detail_rows(studies)
+        self.lbl_study_rows.setText(
+            self._row_count_text(len(shown), len(studies)))
         self.study_table.setColumnCount(len(headers))
         self.study_table.setHorizontalHeaderLabels(headers)
-        self.study_table.setRowCount(len(studies))
-        for row, r in enumerate(studies):
+        self.study_table.setRowCount(len(shown))
+        for row, r in enumerate(shown):
             self.study_table.setItem(row, 0, QTableWidgetItem(r["study_date"]))
             self.study_table.setItem(row, 1, QTableWidgetItem(r["study_time"]))
             self.study_table.setItem(row, 2, QTableWidgetItem(r["source_pacs"]))
@@ -435,10 +505,13 @@ class TransferStatsWindow(QWidget):
     def _update_series_table(self, series: list[dict]) -> None:
         headers = ["Date", "Time", "Source", "Modality", "Study",
                     "Series", "Images", "Duration (s)", "img/min", "Mbit/s"]
+        shown = self._detail_rows(series)
+        self.lbl_series_rows.setText(
+            self._row_count_text(len(shown), len(series)))
         self.series_table.setColumnCount(len(headers))
         self.series_table.setHorizontalHeaderLabels(headers)
-        self.series_table.setRowCount(len(series))
-        for row, r in enumerate(series):
+        self.series_table.setRowCount(len(shown))
+        for row, r in enumerate(shown):
             self.series_table.setItem(row, 0, QTableWidgetItem(r["study_date"]))
             self.series_table.setItem(row, 1, QTableWidgetItem(r["study_time"]))
             self.series_table.setItem(row, 2, QTableWidgetItem(r["source_pacs"]))

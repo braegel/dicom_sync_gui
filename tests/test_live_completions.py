@@ -1659,6 +1659,129 @@ class TestCopyButtonLocalization:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Button LABELS are localized too — not just the copied clipboard text
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestButtonLabelLocalization:
+    """The per-row "Copy" caption and the window's "Clear" caption go
+    through core.i18n.tr, so a German user sees "Kopieren" / "Leeren"
+    instead of English buttons next to German cell content."""
+
+    def _add_row(self, win):
+        win.add_completion(
+            patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X",
+        )
+
+    def test_english_labels(self, window):
+        self._add_row(window)
+        assert _find_copy_button(window, row=0).text() == "Copy"
+        assert window.btn_clear.text() == "Clear"
+
+    def test_german_labels(self, qapp):
+        win = LiveCompletionsWindow(language="de")
+        try:
+            self._add_row(win)
+            assert _find_copy_button(win, row=0).text() == "Kopieren"
+            assert win.btn_clear.text() == "Leeren"
+        finally:
+            win.close()
+
+    def test_french_and_spanish_labels(self, qapp):
+        for lang, copy_label, clear_label in (
+                ("fr", "Copier", "Effacer"),
+                ("es", "Copiar", "Borrar")):
+            win = LiveCompletionsWindow(language=lang)
+            try:
+                self._add_row(win)
+                assert _find_copy_button(win, row=0).text() == copy_label
+                assert win.btn_clear.text() == clear_label
+            finally:
+                win.close()
+
+    def test_unknown_language_falls_back_to_english_labels(self, qapp):
+        win = LiveCompletionsWindow(language="xx")
+        try:
+            self._add_row(win)
+            assert _find_copy_button(win, row=0).text() == "Copy"
+            assert win.btn_clear.text() == "Clear"
+        finally:
+            win.close()
+
+    def test_set_language_relabels_clear_button(self, window):
+        window.set_language("de")
+        assert window.btn_clear.text() == "Leeren"
+
+    def test_set_language_relabels_existing_copy_buttons(self, window):
+        """Labels are set at build time, so a language switch must
+        re-label the rows that already exist — otherwise the window
+        would sit half-translated until new completions arrive."""
+        self._add_row(window)
+        self._add_row(window)
+        window.set_language("de")
+        assert _find_copy_button(window, row=0).text() == "Kopieren"
+        assert _find_copy_button(window, row=1).text() == "Kopieren"
+
+    def test_rows_added_after_set_language_use_new_label(self, window):
+        window.set_language("de")
+        self._add_row(window)
+        assert _find_copy_button(window, row=0).text() == "Kopieren"
+
+    def test_set_language_on_empty_table_does_not_raise(self, window):
+        window.set_language("es")
+        assert window.btn_clear.text() == "Borrar"
+
+    def test_aggregation_reinstalled_button_keeps_language(self, window):
+        """_update_existing_row rebuilds the Copy button; it must come
+        back in the current language, not the build-time one."""
+        window.add_completion(
+            study_uid="1.2.3", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:15:30",
+            institution_name="X", image_count=10,
+        )
+        window.set_language("de")
+        window.add_completion(
+            study_uid="1.2.3", patient_name="A", study_description="CT",
+            study_time="080000", completed_time="08:20:00",
+            institution_name="X", image_count=5,
+        )
+        assert window.completions_table.rowCount() == 1
+        assert _find_copy_button(window, row=0).text() == "Kopieren"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Time / delay computation extracted from add_completion
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestComputeRowTiming:
+    """add_completion delegates time parsing, sort-key building and the
+    midnight-normalized delay to _compute_row_timing.  These lock the
+    contract of that helper so the extraction can't silently drift."""
+
+    def test_formats_and_sort_keys(self):
+        from gui.live_completions import _compute_row_timing
+        t = _compute_row_timing("080000", "081530", "20250101", "20250101")
+        assert t.formatted_acq == "08:00:00"
+        assert t.formatted_comp == "08:15:30"
+        assert t.acq_sort == "20250101080000"
+        assert t.comp_sort == "20250101081530"
+        assert t.delay_seconds == 930
+
+    def test_midnight_crossing_wraps_forward(self):
+        from gui.live_completions import _compute_row_timing
+        t = _compute_row_timing("235500", "000500", "", "")
+        assert t.delay_seconds == 600
+
+    def test_unparseable_times_pass_through_with_no_delay(self):
+        from gui.live_completions import _compute_row_timing
+        t = _compute_row_timing("n/a", "", "", "")
+        assert t.formatted_acq == "n/a"
+        assert t.formatted_comp == ""
+        assert t.delay_seconds is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Images and img/min columns — per-study throughput at a glance
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1884,3 +2007,50 @@ class TestTransferProgressCountdown:
         window._clear()
         assert "—" in window.lbl_remaining_time.text()
         assert "—" in window.lbl_expected_completion.text()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Row cap — the window must not grow without bound
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRowCap:
+    """The completions window stays open for a whole shift on a 24/7
+    service.  Without a cap the table grew forever AND every completion
+    re-scanned all of it, so both memory and per-completion cost were
+    unbounded."""
+
+    @staticmethod
+    def _add(window, n: int, *, start_hour: int = 0) -> None:
+        for i in range(n):
+            h, rest = divmod(i, 3600)
+            m, s = divmod(rest, 60)
+            window.add_completion(
+                study_uid=f"S{i}",
+                patient_name=f"P{i}",
+                study_description="Study",
+                study_time="080000",
+                study_date="20260101",
+                completed_time=f"{start_hour + h:02d}:{m:02d}:{s:02d}",
+                completed_date="20260101",
+                image_count=100,
+                download_duration_seconds=10.0,
+            )
+
+    def test_row_count_is_capped(self, window):
+        from gui.live_completions import MAX_COMPLETION_ROWS
+        self._add(window, MAX_COMPLETION_ROWS + 25)
+        assert window.completions_table.rowCount() == MAX_COMPLETION_ROWS
+
+    def test_oldest_completions_are_dropped_first(self, window):
+        from gui.live_completions import MAX_COMPLETION_ROWS, _COL_PATIENT
+        self._add(window, MAX_COMPLETION_ROWS + 10)
+        t = window.completions_table
+        kept = {t.item(r, _COL_PATIENT).text()
+                for r in range(t.rowCount())}
+        # P0..P9 completed earliest (00:00:00 … 00:00:09) → evicted.
+        assert not (kept & {f"P{i}" for i in range(10)})
+        assert f"P{MAX_COMPLETION_ROWS + 9}" in kept
+
+    def test_under_the_cap_nothing_is_dropped(self, window):
+        self._add(window, 20)
+        assert window.completions_table.rowCount() == 20

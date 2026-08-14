@@ -187,25 +187,48 @@ class TestStorageSCPStartFailure:
         # subsequent stop() is a clean no-op.
         assert scp.running is False
 
-    def test_start_succeeds_when_start_server_blocks(
-            self, qapp, tmp_path, monkeypatch):
+    def test_start_succeeds_when_bind_succeeds(self, qapp, tmp_path):
+        """A successful bind returns the server object and leaves the
+        SCP running — without the caller ever blocking."""
         scp = StorageSCP("TEST_AE", 11112, str(tmp_path))
-        gate = threading.Event()
-
-        def block(*_a, **_kw):
-            # Simulate a successful bind by blocking the reactor thread
-            # the way pynetdicom's real start_server(block=True) does.
-            gate.wait(timeout=2.0)
 
         with patch("core.storage_scp.AE") as ae_cls:
             ae_instance = MagicMock()
-            ae_instance.start_server.side_effect = block
+            ae_instance.start_server.return_value = MagicMock()
             ae_cls.return_value = ae_instance
-            try:
-                scp.start()  # must NOT raise
-                assert scp.running is True
-            finally:
-                gate.set()
-                # Let the daemon thread observe the gate flip and exit.
-                if scp._thread is not None:
-                    scp._thread.join(timeout=2.0)
+
+            scp.start()  # must NOT raise
+
+            assert scp.running is True
+            assert scp.ae is ae_instance
+
+    def test_start_requests_a_non_blocking_server(self, qapp, tmp_path):
+        """``block=False`` is what makes the bind happen (and fail)
+        synchronously in the caller's thread — the caller is the GUI
+        thread, so a blocking server plus a fixed sleep would freeze the
+        UI on every service start."""
+        scp = StorageSCP("TEST_AE", 11112, str(tmp_path))
+
+        with patch("core.storage_scp.AE") as ae_cls:
+            ae_instance = MagicMock()
+            ae_cls.return_value = ae_instance
+            scp.start()
+
+        _args, kwargs = ae_instance.start_server.call_args
+        assert kwargs["block"] is False
+
+    def test_failed_bind_shuts_the_ae_down(self, qapp, tmp_path):
+        """A half-constructed AE must not be left behind — its threads
+        would outlive the failed start."""
+        scp = StorageSCP("TEST_AE", 11112, str(tmp_path))
+
+        with patch("core.storage_scp.AE") as ae_cls:
+            ae_instance = MagicMock()
+            ae_instance.start_server.side_effect = OSError("port in use")
+            ae_cls.return_value = ae_instance
+
+            with pytest.raises(RuntimeError, match="failed to bind"):
+                scp.start()
+
+        ae_instance.shutdown.assert_called_once()
+        assert scp.ae is None

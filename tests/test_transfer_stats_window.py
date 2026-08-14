@@ -282,6 +282,67 @@ class TestPerSourceBreakdown:
         assert data.get("mri_unit") == "1"
 
 
+class TestPerSourceAccumulatorShape:
+    """Regression: the per-source accumulator must have the same shape
+    for every source regardless of which of the two aggregation loops
+    (studies / series) saw it first.  A source appearing only in the
+    study rows still needs a Series and a Median column, and a source
+    appearing only in the series rows still needs Studies and Images."""
+
+    @staticmethod
+    def _row_texts(table):
+        return {
+            table.item(row, 0).text(): [
+                table.item(row, col).text() for col in range(1, 5)
+            ]
+            for row in range(table.rowCount())
+        }
+
+    def test_source_only_in_studies_renders_all_columns(self, empty_window):
+        empty_window._update_source_table(
+            series=[],
+            studies=[{"source_pacs": "study_only", "total_images": 42}],
+        )
+        rows = self._row_texts(empty_window.source_table)
+        # Studies, Series, Images, Median Mbit/s
+        assert rows["study_only"] == ["1", "0", "42", "—"]
+
+    def test_source_only_in_series_renders_all_columns(self, empty_window):
+        empty_window._update_source_table(
+            series=[{"source_pacs": "series_only", "estimated_mbps": 10.0},
+                    {"source_pacs": "series_only", "estimated_mbps": 20.0}],
+            studies=[],
+        )
+        rows = self._row_texts(empty_window.source_table)
+        assert rows["series_only"] == ["0", "2", "0", "15.0"]
+
+    def test_zero_rate_series_excluded_from_median(self, empty_window):
+        """A 0 Mbit/s row means "not measurable", not "very slow" — it
+        must not drag the median down."""
+        empty_window._update_source_table(
+            series=[{"source_pacs": "ct", "estimated_mbps": 0.0},
+                    {"source_pacs": "ct", "estimated_mbps": 8.0}],
+            studies=[],
+        )
+        rows = self._row_texts(empty_window.source_table)
+        assert rows["ct"] == ["0", "2", "0", "8.0"]
+
+    def test_mixed_sources_sorted_and_complete(self, empty_window):
+        empty_window._update_source_table(
+            series=[{"source_pacs": "mri", "estimated_mbps": 4.0},
+                    {"source_pacs": "ct", "estimated_mbps": 6.0}],
+            studies=[{"source_pacs": "ct", "total_images": 100},
+                     {"source_pacs": "xray", "total_images": 5}],
+        )
+        table = empty_window.source_table
+        assert [table.item(r, 0).text() for r in range(table.rowCount())] == [
+            "ct", "mri", "xray"]
+        rows = self._row_texts(table)
+        assert rows["ct"] == ["1", "1", "100", "6.0"]
+        assert rows["mri"] == ["0", "1", "0", "4.0"]
+        assert rows["xray"] == ["1", "0", "5", "—"]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Per-modality breakdown
 # ═══════════════════════════════════════════════════════════════════════════
@@ -714,6 +775,57 @@ class TestBoxplotEmpty:
         win.close()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Reopen after close — the log connection must survive
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestReopenAfterClose:
+    """``MainWindow`` caches ONE stats window and re-``show()``s it, so
+    closing the window must not close its SQLite connection: every later
+    query would raise ``ProgrammingError``, the worker's ``except`` would
+    swallow it, and the user would see blank statistics with no error."""
+
+    def test_refresh_still_works_after_close_and_reopen(
+            self, populated_log, db_path, qapp):
+        win = TransferStatsWindow(db_path)
+        assert win.series_table.rowCount() > 0
+        rows_before = win.series_table.rowCount()
+
+        win.close()
+        win.show()
+        win._on_refresh_clicked()
+
+        assert win.series_table.rowCount() == rows_before, (
+            "the cached window must still read the log after a "
+            "close/reopen cycle")
+        win.shutdown()
+        win.close()
+
+    def test_shutdown_closes_the_connection(self, populated_log, db_path,
+                                            qapp):
+        win = TransferStatsWindow(db_path)
+        win.shutdown()
+        with pytest.raises(Exception):
+            win._log.query_series()
+        win.close()
+
+    def test_main_window_close_shuts_the_stats_window_down(
+            self, populated_log, db_path, qapp, tmp_path):
+        config = AppConfig(str(tmp_path / "cfg.json"))
+        config.remote_nodes["ct"] = PacsNode(name="CT", ae_title="CT")
+        win = MainWindow(config)
+        stats = TransferStatsWindow(db_path)
+        win._stats_window = stats
+
+        event = MagicMock()
+        win.closeEvent(event)
+
+        with pytest.raises(Exception):
+            stats._log.query_series()
+        stats.close()
+        win.close()
+
+
 # ── Boxplot test helpers ─────────────────────────────────────────────────
 
 def _set_aggregation(window, keyword: str):
@@ -733,3 +845,57 @@ def _get_boxplot_series(window):
         if isinstance(s, QBoxPlotSeries):
             return s
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Detail-table row cap
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDetailRowCap:
+    """The detail tabs build one QTableWidgetItem per cell on the GUI
+    thread.  Months of 24/7 logging would otherwise render >10^5 rows in
+    a single event-loop slice.  Statistics stay full-fidelity — only the
+    two browsable tables are capped."""
+
+    def test_series_table_is_capped(self, log, db_path, qapp):
+        from gui.transfer_stats_window import MAX_DETAIL_ROWS
+        total = MAX_DETAIL_ROWS + 40
+        for i in range(total):
+            log.record_series(
+                source_pacs="ct", study_uid=f"S{i}", series_uid=f"S{i}.1",
+                patient_id="P", accession_number="A",
+                study_date="20260401", study_time="120000",
+                modality="CT", study_description="Test",
+                series_description=f"Series {i}", series_number="1",
+                image_count=100, duration_seconds=10.0)
+
+        win = TransferStatsWindow(db_path)
+        assert win.series_table.rowCount() == MAX_DETAIL_ROWS
+        assert str(total) in win.lbl_series_rows.text()
+        # Summary still counts EVERY row — the cap is display-only.
+        assert win.lbl_total_series.text() == str(total)
+        win.shutdown()
+        win.close()
+
+    def test_capped_table_shows_the_newest_rows(self, log, db_path, qapp):
+        from gui.transfer_stats_window import MAX_DETAIL_ROWS
+        total = MAX_DETAIL_ROWS + 5
+        for i in range(total):
+            log.record_series(
+                source_pacs="ct", study_uid=f"S{i}", series_uid=f"S{i}.1",
+                patient_id="P", accession_number="A",
+                study_date="20260401", study_time="120000",
+                modality="CT", study_description="Test",
+                series_description=f"Series {i}", series_number="1",
+                image_count=100, duration_seconds=10.0)
+
+        win = TransferStatsWindow(db_path)
+        last = win.series_table.rowCount() - 1
+        assert win.series_table.item(last, 5).text() == f"Series {total - 1}"
+        assert win.series_table.item(0, 5).text() == "Series 5"
+        win.shutdown()
+        win.close()
+
+    def test_uncapped_label_reports_plain_count(self, window):
+        assert "most recent" not in window.lbl_series_rows.text()
+        assert "rows" in window.lbl_series_rows.text()

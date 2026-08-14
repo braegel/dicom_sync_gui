@@ -60,9 +60,13 @@ class TestMainWindowInit:
         assert win.completions_window._language == "de"
 
     def test_study_completed_live_passes_image_count(self):
-        """_on_study_completed_live must sum transferred_images across
-        all done series of the study and pass it to add_completion
-        so the Images and img/min columns can be populated."""
+        """_on_study_completed_live must forward the image count that
+        arrived WITH the study_completed signal to add_completion, so
+        the Images and img/min columns can be populated.
+
+        The engine already summed it when it decided the study was
+        complete; re-deriving it here could only ever disagree with the
+        count the engine actually acted on."""
         engine = MagicMock()
         engine.queue_snapshot.return_value = [
             MagicMock(study_uid="S1", status="done",
@@ -82,14 +86,12 @@ class TestMainWindowInit:
 
         with patch.object(
                 self.win.completions_window, "add_completion") as mock_add:
-            self.win._on_study_completed_live(
-                engine, "S1", fully_complete=True)
+            self.win._on_study_completed_live(engine, "S1", True, 450)
 
         mock_add.assert_called_once()
         kwargs = mock_add.call_args.kwargs
         assert kwargs["image_count"] == 450, (
-            "image_count must be the sum of transferred_images "
-            "for done series of this study only")
+            "image_count must be the count the engine emitted")
         assert kwargs["download_duration_seconds"] == 30.0
 
     def test_study_completed_live_forwards_threshold_below_min_images(self):
@@ -113,8 +115,7 @@ class TestMainWindowInit:
 
         with patch.object(
                 self.win.completions_window, "add_completion") as mock_add:
-            self.win._on_study_completed_live(
-                engine, "S1", fully_complete=True)
+            self.win._on_study_completed_live(engine, "S1", True, 9)
 
         mock_add.assert_called_once()
         kwargs = mock_add.call_args.kwargs
@@ -135,8 +136,7 @@ class TestMainWindowInit:
 
         with patch.object(
                 self.win.completions_window, "add_completion") as mock_add:
-            self.win._on_study_completed_live(
-                engine, "S1", fully_complete=True)
+            self.win._on_study_completed_live(engine, "S1", True, 9)
 
         mock_add.assert_called_once()
         kwargs = mock_add.call_args.kwargs
@@ -156,8 +156,7 @@ class TestMainWindowInit:
 
         with patch.object(
                 self.win.completions_window, "add_completion") as mock_add:
-            self.win._on_study_completed_live(
-                engine, "S1", fully_complete=True)
+            self.win._on_study_completed_live(engine, "S1", True, 10)
 
         mock_add.assert_called_once()
         kwargs = mock_add.call_args.kwargs
@@ -178,8 +177,7 @@ class TestMainWindowInit:
 
         with patch.object(
                 self.win.completions_window, "add_completion") as mock_add:
-            self.win._on_study_completed_live(
-                engine, "S1", fully_complete=True)
+            self.win._on_study_completed_live(engine, "S1", True, 100)
 
         mock_add.assert_called_once()
         assert mock_add.call_args.kwargs["study_uid"] == "S1"
@@ -200,7 +198,7 @@ class TestMainWindowInit:
         with patch.object(
                 self.win.completions_window, "add_completion") as mock_add:
             self.win._on_study_completed_live(
-                engine, "S1", fully_complete=True, source="PACS-Nord")
+                engine, "S1", True, 100, source="PACS-Nord")
 
         mock_add.assert_called_once()
         assert mock_add.call_args.kwargs["source"] == "PACS-Nord"
@@ -220,7 +218,7 @@ class TestMainWindowInit:
                     .call_args_list:
                 call.args[0]("UID1", "Inst", True, 42)
 
-        live.assert_called_once_with(engine, "UID1", True,
+        live.assert_called_once_with(engine, "UID1", True, 42,
                                      source="PACS-Nord")
 
     def test_min_images_for_completions_entry_is_ten(self):
@@ -941,13 +939,16 @@ class TestAutoRestartRetry:
         assert "ct" not in self.win._auto_restart_retry_timers
         assert "ct" not in self.win._pending_start_params
 
-    @patch("gui.main_window.QMessageBox.warning")
     @patch.object(MainWindow, "_start_engine")
     def test_remote_unreachable_aborts_start_and_warns(
-            self, mock_start_engine, mock_warning):
+            self, mock_start_engine):
         """When the source PACS does not answer the C-ECHO probe, the
         engine must NOT start, the user must get a warning popup, and
-        the pending-start params must be dropped."""
+        the pending-start params must be dropped.
+
+        The popup must be NON-modal — this runs in a signal slot, and a
+        nested event loop there would re-enter every other queued engine
+        signal."""
         node = self.win.config.remote_nodes["ct"]
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
         self.win._pending_start_params = {"ct": params}
@@ -955,8 +956,10 @@ class TestAutoRestartRetry:
         self.win._on_scp_check_done("ct", False, False, node.to_dict())
 
         mock_start_engine.assert_not_called()
-        mock_warning.assert_called_once()
         assert "ct" not in self.win._pending_start_params
+        dialogs = self.win._open_warnings
+        assert "pacs_unreachable:ct" in dialogs
+        assert not dialogs["pacs_unreachable:ct"].isModal()
 
     @patch("gui.main_window.QMessageBox.warning")
     @patch("gui.main_window.StorageSCP")
@@ -986,6 +989,54 @@ class TestAutoRestartRetry:
                 "ct", False, False, node.to_dict())
 
         mock_set.assert_called_once_with(False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MainWindow — non-modal warnings
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestNonModalWarnings:
+    """Warnings raised from engine-signal slots must never spin a nested
+    event loop: the slot runs on the GUI thread while every engine keeps
+    emitting into it, so a modal dialog re-enters all of those signals
+    and a second warning stacks another loop behind the first."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.win = MainWindow(populated_config)
+        yield
+        self.win.close()
+
+    def test_connection_lost_shows_non_modal_dialog(self):
+        self.win._on_connection_lost("ct", "timeout")
+        dialogs = self.win._open_warnings
+        assert "connection_lost:ct" in dialogs
+        assert not dialogs["connection_lost:ct"].isModal()
+
+    def test_second_emit_for_same_source_does_not_stack(self):
+        self.win._on_connection_lost("ct", "timeout")
+        first = self.win._open_warnings["connection_lost:ct"]
+        self.win._on_connection_lost("ct", "timeout again")
+        assert self.win._open_warnings["connection_lost:ct"] is first
+        assert len(self.win._open_warnings) == 1
+
+    def test_different_sources_get_their_own_dialog(self):
+        self.win._on_connection_lost("ct", "timeout")
+        self.win._on_connection_lost("mri", "timeout")
+        assert set(self.win._open_warnings) == {
+            "connection_lost:ct", "connection_lost:mri"}
+
+    def test_dismissing_frees_the_dedupe_slot(self):
+        self.win._on_connection_lost("ct", "timeout")
+        self.win._on_warning_closed("connection_lost:ct")
+        assert "connection_lost:ct" not in self.win._open_warnings
+        self.win._on_connection_lost("ct", "again")
+        assert "connection_lost:ct" in self.win._open_warnings
+
+    def test_close_event_dismisses_open_warnings(self):
+        self.win._on_connection_lost("ct", "timeout")
+        self.win.closeEvent(MagicMock())
+        assert self.win._open_warnings == {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1067,3 +1118,65 @@ class TestMainWindowClose:
         self.win.closeEvent(event)
         mock_scp.stop.assert_called_once()
         event.accept.assert_called_once()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MainWindow — fallback SCP bind failure
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFallbackScpBindFailure:
+    """A manual start whose built-in receiver cannot bind must not leave
+    the dashboard claiming "Starting service…" for a service that will
+    never come up — the failure has to reach the user, not just the log."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp, tmp_path):
+        populated_config.remote_nodes["ct"].fallback_folder = str(tmp_path)
+        self.win = MainWindow(populated_config)
+        self.node = populated_config.remote_nodes["ct"]
+        yield
+        self.win.close()
+
+    def _fail_scp(self):
+        self.win._pending_start_params["ct"] = {
+            "hours": 3, "max_images": 0, "sync_interval": 60}
+        with patch("gui.main_window.StorageSCP") as MockSCP:
+            MockSCP.return_value.start.side_effect = RuntimeError(
+                "port already in use")
+            self.win._on_scp_check_done(
+                "ct", True, False, self.node.to_dict())
+
+    def test_dashboard_returns_to_stopped(self):
+        dashboard = self.win.dashboards["ct"]
+        dashboard._on_start_clicked()
+        assert "Starting" in dashboard.lbl_status.text()
+
+        self._fail_scp()
+
+        assert dashboard.lbl_status.text() == "Stopped", (
+            "the dashboard must not keep advertising a start that failed")
+
+    def test_user_gets_a_non_modal_warning(self):
+        self._fail_scp()
+        dialogs = self.win._open_warnings
+        assert "scp_bind_failed:ct" in dialogs
+        assert not dialogs["scp_bind_failed:ct"].isModal()
+
+    def test_engine_is_not_started_and_params_are_dropped(self):
+        self._fail_scp()
+        assert "ct" not in self.win.engines
+        assert "ct" not in self.win._pending_start_params
+
+    def test_auto_restart_still_retries_instead_of_aborting(self):
+        """The watchdog path must keep its retry-with-siren behaviour —
+        only the manual path aborts."""
+        self.win._pending_start_params["ct"] = {
+            "hours": 3, "auto_restart": True}
+        with patch("gui.main_window.StorageSCP") as MockSCP, \
+                patch.object(MainWindow, "_play_siren"):
+            MockSCP.return_value.start.side_effect = RuntimeError("busy")
+            self.win._on_scp_check_done(
+                "ct", True, False, self.node.to_dict())
+
+        assert "ct" in self.win._auto_restart_retry_timers
+        assert "scp_bind_failed:ct" not in self.win._open_warnings

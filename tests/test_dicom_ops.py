@@ -6,69 +6,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
-from core.dicom_ops import (
-    DicomOperations, parse_dicom_time, parse_dicom_date, TRANSFER_SYNTAXES,
-)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# parse_dicom_time
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestParseDicomTime:
-
-    def test_normal_time(self):
-        assert parse_dicom_time("143052") == "14:30"
-
-    def test_time_with_fractional(self):
-        assert parse_dicom_time("143052.123") == "14:30"
-
-    def test_short_time(self):
-        # "0900" → "09:00"
-        result = parse_dicom_time("0900")
-        assert result == "09:00"
-
-    def test_empty_string(self):
-        assert parse_dicom_time("") == ""
-
-    def test_none_like_empty(self):
-        # The function only expects str, but test with empty
-        assert parse_dicom_time("") == ""
-
-    def test_very_short_time(self):
-        result = parse_dicom_time("12")
-        assert result == "12:00"
-
-    def test_midnight(self):
-        assert parse_dicom_time("000000") == "00:00"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# parse_dicom_date
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestParseDicomDate:
-
-    def test_normal_date(self):
-        assert parse_dicom_date("20260308") == "08.03.2026"
-
-    def test_empty_string(self):
-        assert parse_dicom_date("") == ""
-
-    def test_none(self):
-        assert parse_dicom_date(None) == ""
-
-    def test_short_date_returns_unchanged(self):
-        assert parse_dicom_date("2026") == "2026"
-
-    def test_long_date_returns_unchanged(self):
-        assert parse_dicom_date("202603080") == "202603080"
-
-    def test_new_year(self):
-        assert parse_dicom_date("20260101") == "01.01.2026"
-
-    def test_end_of_year(self):
-        assert parse_dicom_date("20261231") == "31.12.2026"
+from core.dicom_ops import DicomOperations, TRANSFER_SYNTAXES
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -553,3 +491,107 @@ class TestAssociationReleaseOnException:
                 ops.c_find_studies()
             # Nothing to release on a non-established association.
             mock_assoc.release.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DicomOperations — C-FIND completeness flag
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCFindCompleteness:
+    """A C-FIND that breaks off mid-iteration returns partial results.
+    Callers that treat the list as authoritative (the engine's study
+    completion decision) must be able to tell that apart from a short
+    but complete answer."""
+
+    @pytest.fixture
+    def ops(self):
+        local = {"ae_title": "L_AE", "ip_address": "127.0.0.1", "port": 11112}
+        remote = {"ae_title": "R_AE", "ip_address": "10.0.0.1", "port": 104,
+                   "transfer_syntax": "JPEG2000Lossless"}
+        return DicomOperations(local, remote)
+
+    def _assoc_yielding(self, datasets, then_raise=None):
+        """Association whose send_c_find yields *datasets* and then
+        optionally raises mid-iteration."""
+        mock_assoc = MagicMock()
+        mock_assoc.is_established = True
+
+        def _gen(*_a, **_kw):
+            for ds in datasets:
+                status = MagicMock()
+                status.Status = 0xFF00
+                yield status, ds
+            if then_raise is not None:
+                raise then_raise
+            final = MagicMock()
+            final.Status = 0x0000
+            yield final, None
+
+        mock_assoc.send_c_find.side_effect = _gen
+        return mock_assoc
+
+    def test_complete_query_flagged_complete(self, ops, mock_series_dataset):
+        s1 = mock_series_dataset(series_uid="1.1.1.1")
+        mock_assoc = self._assoc_yielding([s1])
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            complete, results = ops.c_find_series_checked("1.1.1")
+        assert complete is True
+        assert len(results) == 1
+
+    def test_empty_result_is_still_complete(self, ops):
+        """Zero results is a legitimate answer, not a failure."""
+        mock_assoc = self._assoc_yielding([])
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            complete, results = ops.c_find_series_checked("1.1.1")
+        assert complete is True
+        assert results == []
+
+    def test_mid_iteration_error_flagged_incomplete(
+            self, ops, mock_series_dataset):
+        """The partial results still come back — but flagged."""
+        s1 = mock_series_dataset(series_uid="1.1.1.1")
+        s2 = mock_series_dataset(series_uid="1.1.1.2")
+        mock_assoc = self._assoc_yielding(
+            [s1, s2], then_raise=RuntimeError("DIMSE timeout"))
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            complete, results = ops.c_find_series_checked("1.1.1")
+        assert complete is False
+        assert len(results) == 2
+        mock_assoc.release.assert_called_once()
+
+    def test_c_find_series_stays_list_only(self, ops, mock_series_dataset):
+        """The public method keeps its plain-list signature for the GUI
+        call sites, even when the query was truncated."""
+        s1 = mock_series_dataset(series_uid="1.1.1.1")
+        mock_assoc = self._assoc_yielding(
+            [s1], then_raise=RuntimeError("DIMSE timeout"))
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            results = ops.c_find_series("1.1.1")
+        assert isinstance(results, list)
+        assert len(results) == 1
+
+    def test_connection_failure_still_raises(self, ops):
+        """PacsConnectionError must keep propagating — the completeness
+        flag is for established-but-broken associations only."""
+        from core.dicom_ops import PacsConnectionError
+        with patch.object(ops.ae, 'associate',
+                          side_effect=Exception("Connection refused")):
+            with pytest.raises(PacsConnectionError):
+                ops.c_find_series_checked("1.1.1")
+
+    def test_execute_find_drops_the_flag(self, ops, mock_series_dataset):
+        """_execute_find is the list-only convenience wrapper used by
+        callers that only aggregate what they got."""
+        s1 = mock_series_dataset(series_uid="1.1.1.1")
+        mock_assoc = self._assoc_yielding([s1])
+        from pydicom import Dataset
+        query = Dataset()
+        query.QueryRetrieveLevel = 'SERIES'
+
+        with patch.object(ops.ae, 'associate', return_value=mock_assoc):
+            results = ops._execute_find(query)
+        assert [r for r in results] == [s1]

@@ -137,6 +137,39 @@ class TestPrioritySeriesDialogSourceSwitching:
         committed = self.dialog.terms_table.item(0, 0).text()
         assert committed == "perfusion-mid-edit"
 
+    def test_close_pending_edit_commits_and_leaves_editing_state(self):
+        """``_close_pending_edit`` hands the editor back to the *view*
+        (``commitData`` / ``closeEditor``) rather than emitting the
+        delegate's signals by hand, so the table must both take over
+        the typed text AND drop out of ``EditingState``."""
+        from PySide6.QtWidgets import (
+            QAbstractItemView, QApplication, QLineEdit)
+
+        self._select_source("ct")
+        self.dialog.terms_table.editItem(self.dialog.terms_table.item(0, 0))
+        QApplication.processEvents()
+        editor = self.dialog.terms_table.findChild(QLineEdit)
+        assert editor is not None, "no transient editor opened"
+        editor.setText("typed-not-yet-committed")
+
+        self.dialog._close_pending_edit()
+
+        assert self.dialog.terms_table.item(0, 0).text() == \
+            "typed-not-yet-committed"
+        assert (self.dialog.terms_table.state()
+                != QAbstractItemView.EditingState)
+
+    def test_close_pending_edit_is_a_noop_without_an_open_editor(self):
+        """No editor open → nothing to commit, and nothing may blow up
+        (the method runs on every source switch)."""
+        self._select_source("ct")
+        before = [self.dialog.terms_table.item(r, 0).text()
+                  for r in range(self.dialog.terms_table.rowCount())]
+        self.dialog._close_pending_edit()
+        after = [self.dialog.terms_table.item(r, 0).text()
+                 for r in range(self.dialog.terms_table.rowCount())]
+        assert after == before
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Row operations

@@ -29,7 +29,11 @@ from core.config import (
 )
 from core.dicom_ops import DicomOperations
 from gui.async_helpers import run_in_background
-from gui.styles import BTN_GREEN, BTN_GREEN_LARGE, BTN_RED, BTN_BLUE, BTN_BLUE_LARGE
+from gui.styles import (
+    BTN_BLUE, BTN_BLUE_LARGE, BTN_GREEN, BTN_GREEN_LARGE, BTN_RED,
+    COLOR_MUTED,
+)
+from gui.study_rate import COLOR_GREEN
 
 logger = logging.getLogger("dicom_sync")
 
@@ -310,6 +314,24 @@ class FilterGroupsDialog(QDialog):
     # ── Institution tree ──────────────────────────────────────────────────
 
     def _refresh_institution_tree(self) -> None:
+        """Rebuild the whole tree from ``_assignments``.
+
+        Every caller rebuilds, even assign/unassign where only the
+        selected rows changed.  That is deliberate, not an oversight:
+        ``_assignments`` is the single source of truth, and row order
+        (case-insensitive sort), the green/grey colouring and the
+        "(unassigned)" placeholder are all derived from it right here.
+        A targeted update path would have to restate those rules in a
+        second place — and would drift the moment one of them changes.
+
+        The cost is a few dozen to a few hundred QTreeWidgetItems on an
+        explicit button click, i.e. invisible.  Revisit only if a site
+        ever accumulates institution counts where the rebuild becomes
+        noticeable; until then the simpler shape wins.  Note also that
+        unassigning *removes* the institution from ``_assignments``
+        entirely, so its row disappears — an in-place edit of the
+        selected rows would not reproduce that.
+        """
         self.institution_tree.clear()
         # Collect all known institutions (from assignments + discovered)
         all_institutions = sorted(
@@ -320,9 +342,9 @@ class FilterGroupsDialog(QDialog):
             group = self._assignments.get(inst, "")
             item = QTreeWidgetItem([inst, group])
             if group:
-                item.setForeground(1, QColor("#2ecc71"))
+                item.setForeground(1, QColor(COLOR_GREEN))
             else:
-                item.setForeground(1, QColor("#969696"))
+                item.setForeground(1, QColor(COLOR_MUTED))
                 item.setText(1, "(unassigned)")
             self.institution_tree.addTopLevelItem(item)
 

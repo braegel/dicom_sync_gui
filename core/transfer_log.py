@@ -403,22 +403,44 @@ class TransferLog:
         query and the median stream the lock is released so the
         engine's writers don't pile up behind a slow median scan.
         """
-        # Phase 1: aggregate stats — short, fixed-cost query.
+        # Phase 1: count + mean — short, fixed-cost query.
         with self._lock:
             row = self._conn.execute(
                 "SELECT COUNT(*) AS n, "
-                "AVG(estimated_mbps) AS avg, "
-                "AVG(estimated_mbps * estimated_mbps) AS avg_sq "
+                "AVG(estimated_mbps) AS avg "
                 "FROM series_transfer "
                 "WHERE estimated_mbps > 0").fetchone()
         if not row or row["n"] is None or row["n"] < 2:
             return None
         n = int(row["n"])
         mean = float(row["avg"])
-        var = max(float(row["avg_sq"]) - mean * mean, 0.0)
+
+        # Phase 2: variance as the mean of squared deviations, in a
+        # second pass with the mean from phase 1.  The one-pass form
+        # E[X²] − E[X]² is algebraically identical but catastrophically
+        # cancels when the spread is small relative to the mean (think
+        # 1000.0 ± 0.5 Mbps on a fast link): both terms are ~1e6 and the
+        # difference is ~0.25, so most of the mantissa is lost and the
+        # result can even come out negative.  The deviations here are
+        # already O(spread), so nothing large is subtracted.
+        # Population variance (÷ n, i.e. statistics.pstdev) to match
+        # core/stats_utils.py, which the rest of the project uses.
+        with self._lock:
+            var_row = self._conn.execute(
+                "SELECT AVG((estimated_mbps - :mean) "
+                "         * (estimated_mbps - :mean)) AS var "
+                "FROM series_transfer "
+                "WHERE estimated_mbps > 0", {"mean": mean}).fetchone()
+        # Still clamped: a sum of squares can only go negative through
+        # float noise, but AVG over the same rows is not guaranteed to
+        # be bit-identical if a writer slipped in between the passes.
+        if not var_row or var_row["var"] is None:
+            var = 0.0
+        else:
+            var = max(float(var_row["var"]), 0.0)
         stddev = var ** 0.5
 
-        # Phase 2: median stream.  Re-acquire the lock for the cursor
+        # Phase 3: median stream.  Re-acquire the lock for the cursor
         # but release as soon as we've consumed the row(s) we need.
         # For even n the median is the AVERAGE of the two middle rows
         # (indices mid-1 and mid) — the statistics.median convention

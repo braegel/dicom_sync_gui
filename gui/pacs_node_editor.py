@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.config import PacsNode, TRANSFER_SYNTAXES_NAMES
+from gui.styles import COLOR_LINK
 
 
 class PacsNodeEditor(QWidget):
@@ -60,10 +61,6 @@ class PacsNodeEditor(QWidget):
         layout.addRow("Port:", self.port_spin)
         layout.addRow("Transfer Syntax:", self.syntax_combo)
 
-        # Retrieve-method combo removed: C-GET was offered but never
-        # implemented (the engine always issues C-MOVE).  The attribute
-        # stays so existing callers/tests can still check for it.
-        self.retrieve_combo = None
 
     def _build_service_section(self, layout: QFormLayout) -> None:
         # ── Per-source service parameters ──
@@ -146,7 +143,7 @@ class PacsNodeEditor(QWidget):
         layout.addRow("", sep)
         lbl = QLabel(title)
         lbl.setFont(QFont("", -1, QFont.Bold))
-        lbl.setStyleSheet("QLabel { color: #2980b9; }")
+        lbl.setStyleSheet(f"QLabel {{ color: {COLOR_LINK}; }}")
         layout.addRow("", lbl)
 
     def _browse_fallback(self) -> None:

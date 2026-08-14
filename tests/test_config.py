@@ -414,6 +414,57 @@ class TestAppConfigPersistence:
         config = AppConfig(config_path=tmp_config_path)
         assert config.load() is False
 
+    def test_load_utf8_non_ascii_config(self, tmp_config_path):
+        """A UTF-8 config file with non-ASCII text (German / French
+        institution names) must load with the strings intact."""
+        with open(tmp_config_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "remotes": {"ct": {"name": "Krankenhaus Süd",
+                                   "ae_title": "SÜD_AE"}},
+                "institution_assignments": {"Hôpital Béziers": "Gruppe Ä"},
+            }, f, ensure_ascii=False)
+
+        config = AppConfig(config_path=tmp_config_path)
+        assert config.load() is True
+        assert config.remote_nodes["ct"].name == "Krankenhaus Süd"
+        assert config.institution_assignments["Hôpital Béziers"] == "Gruppe Ä"
+
+    def test_load_utf8_when_platform_default_is_not_utf8(
+            self, tmp_config_path, monkeypatch):
+        """load() must pass encoding="utf-8" explicitly rather than rely
+        on the platform default (cp1252 on a German Windows box).
+
+        Without it, a hand-edited / externally written UTF-8 config
+        raises UnicodeDecodeError there, load() returns False, the app
+        re-runs the first-run wizard, and the next save() starts from an
+        empty _raw_data — silently dropping unknown-key round-tripping.
+        """
+        with open(tmp_config_path, "w", encoding="utf-8") as f:
+            json.dump({"remotes": {"ct": {"name": "Krankenhaus Süd"}},
+                       "future_unknown_key": "keep me"},
+                      f, ensure_ascii=False)
+
+        real_open = open
+
+        def cp1252_default_open(path, *args, **kwargs):
+            # Simulate a non-UTF-8 locale: any text-mode open() that
+            # does NOT name its encoding gets cp1252, which cannot
+            # decode the UTF-8 "ü" byte pair.
+            mode = kwargs.get("mode", args[0] if args else "r")
+            if "b" not in mode and not kwargs.get("encoding"):
+                kwargs["encoding"] = "cp1252"
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", cp1252_default_open)
+        config = AppConfig(config_path=tmp_config_path)
+        assert config.load() is True
+        assert config.remote_nodes["ct"].name == "Krankenhaus Süd"
+
+        # And the unknown key survives a save() under the same locale.
+        assert config.save() is True
+        with real_open(tmp_config_path, encoding="utf-8") as f:
+            assert json.load(f)["future_unknown_key"] == "keep me"
+
     def test_load_invalid_utf8_returns_false(self, tmp_config_path):
         """A corrupt (non-UTF-8 binary) file must not crash load()."""
         with open(tmp_config_path, "wb") as f:

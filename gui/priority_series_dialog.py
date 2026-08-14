@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog,
+    QAbstractItemDelegate, QAbstractItemView, QCheckBox, QComboBox, QDialog,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -161,19 +161,28 @@ class PrioritySeriesDialog(QDialog):
 
         The table only ever uses Qt's *transient* default editor (no
         ``openPersistentEditor`` call site), so ``closePersistentEditor``
-        is a no-op here.  The transient editor lives as a child of
-        the table while open — find it, route its value back through
-        the delegate's ``commitData`` signal, then close.  ``focusWidget``
-        would be more direct but does not update in headless contexts.
+        is a no-op here.  The transient editor lives as a child of the
+        table while open, so we locate it via ``findChild``:
+        ``focusWidget`` would be more direct but does not update in
+        headless contexts.
+
+        Handing the editor to the *view* (``commitData`` /
+        ``closeEditor``) rather than emitting the delegate's signals by
+        hand keeps us on the sanctioned path — the view is what
+        normally receives those signals, and it also drops its
+        editor bookkeeping and leaves ``EditingState``, which a bare
+        signal emission only does as a side effect.
+        ``setCurrentCell`` is not an option: moving the current cell
+        does not flush the open editor in a headless run, so the typed
+        text would be lost.
         """
         if self.terms_table.state() != QAbstractItemView.EditingState:
             return
         editor = self.terms_table.findChild(QLineEdit)
         if editor is None:
             return
-        delegate = self.terms_table.itemDelegate()
-        delegate.commitData.emit(editor)
-        delegate.closeEditor.emit(editor)
+        self.terms_table.commitData(editor)
+        self.terms_table.closeEditor(editor, QAbstractItemDelegate.NoHint)
 
     def _on_source_changed(self, index: int) -> None:
         self._close_pending_edit()

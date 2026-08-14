@@ -12,9 +12,11 @@ import pytest
 from core.config import AppConfig, PacsNode
 from core.transfer_engine import (
     SeriesJob, TransferStats, TransferEngine, TransferSignals,
-    SeriesCompletionRecord,
+    SeriesCompletionRecord, MAX_INCOMPLETE_QUERY_CYCLES,
+    MAX_TRACKED_STUDIES,
 )
 from core.dicom_ops import PacsConnectionError
+from core.transfer_log import TransferLog
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -94,11 +96,21 @@ class TestSeriesJob:
             "series_description", "modality", "series_number",
             "study_uid", "series_uid", "remote_count", "local_count",
             "status", "institution_name", "accession_number",
-            "images_per_minute", "study_date", "study_time",
+            "images_per_minute", "transferred_images",
+            "duration_seconds", "study_date", "study_time",
             "series_date", "series_time",
             "is_prior",
         }
         assert set(d.keys()) == expected
+
+    def test_to_dict_carries_per_series_totals(self):
+        """transferred_images / duration_seconds must travel in the dict
+        so a GUI consumer can sum per-series totals without reaching
+        back into the engine's live jobs."""
+        job = SeriesJob(transferred_images=42, duration_seconds=12.5)
+        d = job.to_dict()
+        assert d["transferred_images"] == 42
+        assert d["duration_seconds"] == 12.5
 
     def test_study_date_time_defaults(self):
         job = SeriesJob()
@@ -735,7 +747,7 @@ class TestStudiesQueriedEmission:
 
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [study_ds]
-        mock_ops.c_find_series.return_value = [series_ds]
+        mock_ops.c_find_series_checked.return_value = (True, [series_ds])
         mock_ops.c_find_local_series.return_value = []
 
         received = []
@@ -762,7 +774,7 @@ class TestStudiesQueriedEmission:
 
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [study_ds]
-        mock_ops.c_find_series.return_value = [series_ds]
+        mock_ops.c_find_series_checked.return_value = (True, [series_ds])
         mock_ops.c_find_local_series.return_value = []
 
         received = []
@@ -788,7 +800,7 @@ class TestStudiesQueriedEmission:
 
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [study_ds]
-        mock_ops.c_find_series.return_value = [series1, series2]
+        mock_ops.c_find_series_checked.return_value = (True, [series1, series2])
         mock_ops.c_find_local_series.return_value = []
 
         received = []
@@ -827,7 +839,8 @@ class TestStudiesQueriedEmission:
 
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [study_a, study_b]
-        mock_ops.c_find_series.side_effect = [[series_a], [series_b]]
+        mock_ops.c_find_series_checked.side_effect = [
+            (True, [series_a]), (True, [series_b])]
         mock_ops.c_find_local_series.return_value = []
 
         received = []
@@ -876,8 +889,8 @@ class TestStudiesQueriedEmission:
         mock_ops = MagicMock()
         # c_find_studies returns BOTH (PACS returns all for date range)
         mock_ops.c_find_studies.return_value = [recent, old]
-        # c_find_series only called for the recent one (old filtered by time)
-        mock_ops.c_find_series.return_value = [series_recent]
+        # series query only runs for the recent one (old filtered by time)
+        mock_ops.c_find_series_checked.return_value = (True, [series_recent])
         mock_ops.c_find_local_series.return_value = []
 
         received = []
@@ -1014,16 +1027,26 @@ class TestStudyCompletedReEmit:
     re-sends), stays silent so it does not falsify the completion time."""
 
     @pytest.fixture(autouse=True)
-    def _setup(self, populated_config, qapp):
+    def _setup(self, populated_config, qapp, tmp_path):
         self.config = populated_config
         self.config.filter_groups_enabled = False
-        self.engine = TransferEngine(self.config, "ct")
+        # Own SQLite file — some of these tests go through
+        # _record_success, which persists to the transfer log.
+        self.engine = TransferEngine(
+            self.config, "ct",
+            transfer_log=TransferLog(str(tmp_path / "transfer_log.sqlite")))
 
     def _received(self):
         received = []
         self.engine.signals.study_completed.connect(
             lambda uid, inst, full, images: received.append(images))
         return received
+
+    def _arrived(self, study_uid: str, images: int) -> None:
+        """Simulate *images* further images actually arriving for a study
+        — what ``_record_success`` does with the count the PACS reported."""
+        self.engine._study_images_transferred[study_uid] = (
+            self.engine._study_images_transferred.get(study_uid, 0) + images)
 
     def test_reemits_when_more_images_arrive(self):
         """All series terminal at 100 images → emit.  Then a previously
@@ -1034,6 +1057,7 @@ class TestStudyCompletedReEmit:
             SeriesJob(study_uid="S1", series_uid="1.2", status="error",
                       transferred_images=0, remote_count=3),
         ]
+        self._arrived("S1", 100)
         received = self._received()
 
         self.engine._check_study_complete("S1")
@@ -1042,6 +1066,7 @@ class TestStudyCompletedReEmit:
         # Late series finally lands.
         self.engine._queue[1].status = "done"
         self.engine._queue[1].transferred_images = 50
+        self._arrived("S1", 50)
         self.engine._check_study_complete("S1")
         assert received == [100, 150]
 
@@ -1051,6 +1076,7 @@ class TestStudyCompletedReEmit:
             SeriesJob(study_uid="S1", series_uid="1.1", status="done",
                       transferred_images=100, remote_count=100),
         ]
+        self._arrived("S1", 100)
         received = self._received()
 
         self.engine._check_study_complete("S1")
@@ -1067,6 +1093,7 @@ class TestStudyCompletedReEmit:
             SeriesJob(study_uid="S1", series_uid="1.2", status="error",
                       transferred_images=0, remote_count=3),
         ]
+        self._arrived("S1", 100)
         received = self._received()
 
         self.engine._check_study_complete("S1")
@@ -1075,6 +1102,7 @@ class TestStudyCompletedReEmit:
         # Exactly 5 more images land — at the threshold, NOT above it.
         self.engine._queue[1].status = "done"
         self.engine._queue[1].transferred_images = 5
+        self._arrived("S1", 5)
         self.engine._check_study_complete("S1")
         assert received == [100], (
             "a straggler wave of 5 images (≤ threshold) must not re-fire")
@@ -1087,6 +1115,7 @@ class TestStudyCompletedReEmit:
             SeriesJob(study_uid="S1", series_uid="1.2", status="error",
                       transferred_images=0, remote_count=6),
         ]
+        self._arrived("S1", 100)
         received = self._received()
 
         self.engine._check_study_complete("S1")
@@ -1095,23 +1124,89 @@ class TestStudyCompletedReEmit:
         # 6 more images (> threshold of 5) → re-fire.
         self.engine._queue[1].status = "done"
         self.engine._queue[1].transferred_images = 6
+        self._arrived("S1", 6)
         self.engine._check_study_complete("S1")
         assert received == [100, 106]
 
-    def test_cleared_at_cycle_start(self):
-        """A fresh cycle clears the per-study image memory so the first
-        completion of the new cycle emits again."""
+    def test_survives_cycle_start(self):
+        """A fresh cycle must NOT reset the per-study memory: retrying the
+        same stragglers cycle after cycle would otherwise refresh the
+        completion timestamp for free."""
         self.engine._queue = [
             SeriesJob(study_uid="S1", series_uid="1.1", status="done",
                       transferred_images=100, remote_count=100),
         ]
+        self._arrived("S1", 100)
         received = self._received()
         self.engine._check_study_complete("S1")
         assert received == [100]
 
-        self.engine._completed_studies.clear()
+        self.engine._completed_patients.clear()   # what a cycle DOES reset
         self.engine._check_study_complete("S1")
-        assert received == [100, 100]
+        assert received == [100], (
+            "a new cycle must not re-fire a completion on its own")
+
+    def test_retry_cycle_without_new_images_stays_silent(self):
+        """The reported bug: a later cycle re-queues the study's missing
+        series, the retry moves NOTHING, and the completion time jumped to
+        "now" anyway.  Only the queue is rebuilt — no images arrive — so
+        there must be no second emit."""
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.1", status="done",
+                      transferred_images=400, remote_count=400),
+            SeriesJob(study_uid="S1", series_uid="1.2", status="error",
+                      transferred_images=0, remote_count=200),
+        ]
+        self._arrived("S1", 400)
+        received = self._received()
+        self.engine._check_study_complete("S1")
+        assert received == [400]
+
+        # Next cycle: only the still-missing series is queued, it is
+        # retried, and it fails again (no _record_success → no arrivals).
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.2", status="error",
+                      transferred_images=0, remote_count=200),
+        ]
+        self.engine._check_study_complete("S1")
+        assert received == [400], (
+            "a failed retry cycle must not advance the completion time")
+
+    def test_success_reporting_zero_images_does_not_refresh(self):
+        """A C-MOVE that answers "success" but moved zero sub-operations
+        must not count as an arrival, even though the job's image count
+        is rounded up to ``to_transfer`` for stats and display."""
+        job = SeriesJob(study_uid="S1", series_uid="1.2",
+                        remote_count=200, local_count=0)
+        self.engine._queue = [job]
+        self.engine._study_images_transferred["S1"] = 400
+        self.engine._completed_studies["S1"] = 400
+        received = self._received()
+
+        self.engine._record_success(job, images=0, t_elapsed=1.0,
+                                    to_transfer=200)
+
+        assert job.transferred_images == 200, (
+            "display/stats keep the optimistic rounding-up")
+        assert self.engine._study_images_transferred["S1"] == 400, (
+            "zero reported sub-operations must not count as arrivals")
+        assert received == []
+
+    def test_record_success_counts_reported_images(self):
+        """Images the PACS really reported do count, and push the study
+        over the refresh threshold."""
+        job = SeriesJob(study_uid="S1", series_uid="1.2",
+                        remote_count=60, local_count=0)
+        self.engine._queue = [job]
+        self.engine._study_images_transferred["S1"] = 400
+        self.engine._completed_studies["S1"] = 400
+        received = self._received()
+
+        self.engine._record_success(job, images=60, t_elapsed=1.0,
+                                    to_transfer=60)
+
+        assert self.engine._study_images_transferred["S1"] == 460
+        assert received == [60]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1181,7 +1276,7 @@ class TestPriorsInstitutionFilter:
         # c_find_studies(patient_id=...) returns current + prior
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
-        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_series_checked.return_value = (True, [prior_series])
         mock_ops.c_find_local_series.return_value = []
 
         jobs = self.engine._resolve_priors(
@@ -1205,7 +1300,7 @@ class TestPriorsInstitutionFilter:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
-        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_series_checked.return_value = (True, [prior_series])
         mock_ops.c_find_local_series.return_value = []
 
         jobs = self.engine._resolve_priors(
@@ -1228,7 +1323,7 @@ class TestPriorsInstitutionFilter:
 
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [current[0], prior_ds]
-        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_series_checked.return_value = (True, [prior_series])
         mock_ops.c_find_local_series.return_value = []
 
         jobs = self.engine._resolve_priors(
@@ -1251,7 +1346,7 @@ class TestPriorsInstitutionFilter:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
-        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_series_checked.return_value = (True, [prior_series])
         mock_ops.c_find_local_series.return_value = []
 
         jobs = self.engine._resolve_priors(
@@ -1276,7 +1371,7 @@ class TestPriorsInstitutionFilter:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
-        mock_ops.c_find_series.return_value = [prior_series]
+        mock_ops.c_find_series_checked.return_value = (True, [prior_series])
         mock_ops.c_find_local_series.return_value = []
 
         jobs = self.engine._resolve_priors(
@@ -1335,7 +1430,7 @@ class TestRetryBlacklist:
     def _mock_ops(self, study_ds, series_ds, c_move_success=False):
         ops = MagicMock()
         ops.c_find_studies.return_value = [study_ds]
-        ops.c_find_series.return_value = [series_ds]
+        ops.c_find_series_checked.return_value = (True, [series_ds])
         ops.c_find_local_series.return_value = []
         ops.c_move_series.return_value = (
             c_move_success,
@@ -1403,7 +1498,7 @@ class TestRetryBlacklist:
 
         ops = MagicMock()
         ops.c_find_studies.return_value = [study]
-        ops.c_find_series.return_value = [bad, good]
+        ops.c_find_series_checked.return_value = (True, [bad, good])
         ops.c_find_local_series.return_value = []
 
         def c_move_side_effect(study_uid, series_uid, progress_cb=None):
@@ -1489,7 +1584,7 @@ class TestRetryBlacklist:
 
         ops = MagicMock()
         ops.c_find_studies.return_value = [study]
-        ops.c_find_series.return_value = [bad, good]
+        ops.c_find_series_checked.return_value = (True, [bad, good])
         ops.c_find_local_series.return_value = []
         ops.c_move_series.return_value = (True, 300)
 
@@ -1606,7 +1701,7 @@ class TestSingleAEPerCycle:
 
         ops = MagicMock()
         ops.c_find_studies.return_value = [study]
-        ops.c_find_series.return_value = [s1, s2, s3]
+        ops.c_find_series_checked.return_value = (True, [s1, s2, s3])
         ops.c_find_local_series.return_value = []
         ops.c_move_series.return_value = (True, 100)
 
@@ -2105,3 +2200,444 @@ class TestPrioritySeriesOrdering:
         # S1.1 is the first substantial series → leads, even though S1.2
         # is axial.
         assert [j.series_uid for j in out] == ["S1.1", "S1.2"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — truncated series C-FIND defers the completion verdict
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestIncompleteSeriesQuery:
+    """A series C-FIND that broke off mid-stream yields a SHORT series
+    list.  Building the queue from it and then declaring the study
+    "fully complete" would sign off on series the PACS never
+    enumerated — so the completion verdict is deferred to the next
+    cycle, which re-queries the study."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.filter_groups_enabled = False
+        self.config.prior_studies_count = 0
+        self.engine = TransferEngine(self.config, "ct")
+
+    def _study_ds(self, study_uid="S1", patient_id="P1"):
+        from datetime import datetime
+        now = datetime.now()
+        ds = MagicMock()
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = now.strftime("%Y%m%d")
+        ds.StudyTime = now.strftime("%H%M%S")
+        ds.PatientName = "Doe^John"
+        ds.PatientID = patient_id
+        ds.StudyDescription = "CT Head"
+        ds.InstitutionName = "Hospital Alpha"
+        return ds
+
+    def _series_ds(self, series_uid="S1.1", num_instances=100):
+        ds = MagicMock()
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesDescription = "Axial"
+        ds.Modality = "CT"
+        ds.SeriesNumber = "1"
+        ds.NumberOfSeriesRelatedInstances = num_instances
+        ds.InstitutionName = "Hospital Alpha"
+        return ds
+
+    def _query(self, complete: bool, series):
+        from datetime import datetime, timedelta
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [self._study_ds()]
+        mock_ops.c_find_series_checked.return_value = (complete, series)
+        mock_ops.c_find_local_series.return_value = []
+        cutoff = datetime.now() - timedelta(hours=1)
+        # Drop the cached ops so each call gets THIS cycle's mock — the
+        # engine reuses one DicomOperations for its whole lifetime.
+        self.engine._dicom_ops = None
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=mock_ops):
+            return self.engine._query_source(
+                "20260401", cutoff, max_images=0, seen_series=set())
+
+    def test_complete_query_leaves_no_mark(self):
+        jobs = self._query(True, [self._series_ds()])
+        assert len(jobs) == 1
+        assert self.engine._incomplete_series_queries == set()
+
+    def test_truncated_query_marks_the_study(self):
+        jobs = self._query(False, [self._series_ds()])
+        # The partial results are still queued — what arrived is real
+        # work, it just isn't the whole study.
+        assert len(jobs) == 1
+        assert self.engine._incomplete_series_queries == {"S1"}
+
+    def test_marked_study_does_not_emit_study_completed(self):
+        self._query(False, [self._series_ds()])
+        with self.engine._queue_lock:
+            self.engine._queue = [
+                SeriesJob(study_uid="S1", series_uid="S1.1", status="done",
+                          transferred_images=100, remote_count=100)]
+        self.engine._study_images_transferred["S1"] = 100
+
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda *a: received.append(a))
+        self.engine._check_study_complete("S1")
+
+        assert received == [], (
+            "a study whose series query was truncated must not be "
+            "declared complete from the partial list")
+        assert "S1" not in self.engine._completed_studies, (
+            "no completion mark either — the next cycle must decide")
+
+    def test_next_complete_cycle_clears_the_mark_and_emits(self):
+        self._query(False, [self._series_ds()])
+        assert self.engine._incomplete_series_queries == {"S1"}
+
+        # Next cycle: the series query succeeds.
+        self._query(True, [self._series_ds()])
+        assert self.engine._incomplete_series_queries == set()
+
+        with self.engine._queue_lock:
+            self.engine._queue = [
+                SeriesJob(study_uid="S1", series_uid="S1.1", status="done",
+                          transferred_images=100, remote_count=100)]
+        self.engine._study_images_transferred["S1"] = 100
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda *a: received.append(a))
+        self.engine._check_study_complete("S1")
+
+        assert len(received) == 1
+        assert received[0][0] == "S1"
+        assert received[0][2] is True
+
+    def test_other_studies_are_unaffected(self):
+        self.engine._incomplete_series_queries.add("S1")
+        with self.engine._queue_lock:
+            self.engine._queue = [
+                SeriesJob(study_uid="S2", series_uid="S2.1", status="done",
+                          transferred_images=10, remote_count=10)]
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda *a: received.append(a))
+        self.engine._check_study_complete("S2")
+        assert len(received) == 1
+
+    def test_prior_studies_are_marked_too(self):
+        """Priors reach _check_study_complete the same way, so a
+        truncated prior series query must defer as well."""
+        self.config.prior_studies_count = 1
+        self.config.prior_studies_same_modality = False
+        prior = self._study_ds(study_uid="S0")
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [prior]
+        mock_ops.c_find_series_checked.return_value = (
+            False, [self._series_ds("S0.1")])
+        mock_ops.c_find_local_series.return_value = []
+
+        self.engine._build_prior_jobs_for_study(
+            mock_ops, prior, "P1", seen_series=set(), max_images=0)
+
+        assert self.engine._incomplete_series_queries == {"S0"}
+
+    def test_connection_error_still_propagates(self):
+        """PacsConnectionError must not be swallowed by the new path —
+        the engine still needs its unreachable-PACS handling."""
+        from datetime import datetime, timedelta
+        mock_ops = MagicMock()
+        mock_ops.c_find_studies.return_value = [self._study_ds()]
+        mock_ops.c_find_series_checked.side_effect = PacsConnectionError(
+            "down")
+        cutoff = datetime.now() - timedelta(hours=1)
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=mock_ops):
+            with pytest.raises(PacsConnectionError):
+                self.engine._query_source(
+                    "20260401", cutoff, max_images=0, seen_series=set())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — _query_source step helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestQuerySourceHelpers:
+    """The pieces extracted out of _query_source keep their exact
+    behavior — including the deliberate quirks."""
+
+    def _ds(self, uid, date="20260401", time_="120000", institution=""):
+        ds = MagicMock()
+        ds.StudyInstanceUID = uid
+        ds.StudyDate = date
+        ds.StudyTime = time_
+        ds.InstitutionName = institution
+        return ds
+
+    def test_time_filter_keeps_studies_at_or_after_cutoff(self):
+        from datetime import datetime
+        cutoff = datetime(2026, 4, 1, 12, 0, 0)
+        kept = TransferEngine._filter_studies_by_time(
+            [self._ds("A", time_="115959"),
+             self._ds("B", time_="120000"),
+             self._ds("C", time_="120001")], cutoff)
+        assert [getattr(s, 'StudyInstanceUID') for s in kept] == ["B", "C"]
+
+    def test_time_filter_keeps_unparseable_timestamps(self):
+        """Dropping a study because its PACS sent garbage would silently
+        skip real work."""
+        from datetime import datetime
+        cutoff = datetime(2026, 4, 1, 12, 0, 0)
+        kept = TransferEngine._filter_studies_by_time(
+            [self._ds("A", date="", time_="")], cutoff)
+        assert len(kept) == 1
+
+    def test_metadata_seed_trims_time_and_dedups(self):
+        meta = TransferEngine._seed_study_metadata([
+            self._ds("A", time_="120000.500", institution=" Alpha "),
+            self._ds("A", time_="130000"),
+            self._ds("", time_="140000"),
+        ])
+        assert list(meta) == ["A"]
+        assert meta["A"]["study_time"] == "120000"
+        assert meta["A"]["institution_name"] == "Alpha"
+
+    def test_metadata_seed_covers_time_filtered_studies(self, qapp,
+                                                        populated_config):
+        """Seeding runs on the RAW results, so the dashboard study rate
+        sees studies the engine itself filtered out."""
+        raw = [self._ds("A"), self._ds("B")]
+        meta = TransferEngine._seed_study_metadata(raw)
+        assert set(meta) == {"A", "B"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — series-level persistence helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPersistSeriesRecord:
+    """_persist_series_record mirrors _persist_study_record: both writes
+    are best-effort and must never abort a transfer that already
+    succeeded on the wire."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.log = MagicMock()
+        self.engine = TransferEngine(self.config, "ct",
+                                     transfer_log=self.log)
+        self.job = SeriesJob(study_uid="S1", series_uid="S1.1",
+                             patient_id="P1", modality="CT",
+                             remote_count=100, local_count=0)
+
+    def test_records_and_clears_failures(self):
+        self.engine._persist_series_record(self.job, 100, 12.5)
+        kwargs = self.log.record_series.call_args.kwargs
+        assert kwargs["source_pacs"] == "ct"
+        assert kwargs["series_uid"] == "S1.1"
+        assert kwargs["image_count"] == 100
+        assert kwargs["duration_seconds"] == 12.5
+        self.log.clear_series_failures.assert_called_once_with(
+            source_pacs="ct", series_uid="S1.1")
+
+    def test_clears_failures_even_if_record_write_fails(self):
+        import sqlite3
+        self.log.record_series.side_effect = sqlite3.Error("disk full")
+        self.engine._persist_series_record(self.job, 100, 1.0)
+        self.log.clear_series_failures.assert_called_once()
+
+    def test_sqlite_errors_do_not_abort_the_transfer(self):
+        import sqlite3
+        self.log.record_series.side_effect = sqlite3.Error("disk full")
+        self.log.clear_series_failures.side_effect = sqlite3.Error("locked")
+        self.engine._queue = [self.job]
+        received = []
+        self.engine.signals.series_completed.connect(
+            lambda uid, images: received.append((uid, images)))
+
+        result = self.engine._record_success(
+            self.job, images=100, t_elapsed=1.0, to_transfer=100)
+
+        assert result == 100
+        assert received == [("S1.1", 100)]
+
+    def test_record_success_logs_the_rounded_up_count(self):
+        """The log records what the series is worth, not what a possibly
+        under-reporting SCP claimed — while the raw report is what feeds
+        the arrival counter."""
+        self.engine._queue = [self.job]
+        self.engine._record_success(
+            self.job, images=90, t_elapsed=1.0, to_transfer=100)
+        assert self.log.record_series.call_args.kwargs["image_count"] == 100
+        assert self.engine._study_images_transferred["S1"] == 90
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — bounded growth of the cross-cycle study history
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStudyHistoryPruning:
+    """``_completed_studies`` / ``_study_images_transferred`` must
+    survive across cycles (that is what keeps retried stragglers from
+    refreshing the completion timestamp), so they can only be bounded,
+    never cleared."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.engine = TransferEngine(self.config, "ct")
+
+    def _fill(self, n, start=0):
+        for i in range(start, start + n):
+            uid = f"S{i}"
+            self.engine._completed_studies[uid] = i
+            self.engine._study_images_transferred[uid] = i
+
+    def test_no_eviction_below_the_cap(self):
+        self._fill(10)
+        self.engine._prune_study_history([])
+        assert len(self.engine._completed_studies) == 10
+        assert len(self.engine._study_images_transferred) == 10
+
+    def test_evicts_least_recently_active_above_the_cap(self):
+        self._fill(MAX_TRACKED_STUDIES + 5)
+        self.engine._prune_study_history([])
+        assert len(self.engine._completed_studies) == MAX_TRACKED_STUDIES
+        # The five oldest entries went first.
+        assert "S0" not in self.engine._completed_studies
+        assert "S4" not in self.engine._completed_studies
+        assert "S5" in self.engine._completed_studies
+
+    def test_evicts_from_both_dicts_together(self):
+        """Half-evicting would either fake a first completion or
+        suppress every future refresh."""
+        self._fill(MAX_TRACKED_STUDIES + 1)
+        self.engine._prune_study_history([])
+        assert "S0" not in self.engine._completed_studies
+        assert "S0" not in self.engine._study_images_transferred
+
+    def test_queued_studies_are_never_evicted(self):
+        """Losing the mark of a study that can still complete this cycle
+        would make its completion look like a FIRST completion and
+        wrongly refresh its Download Completions timestamp."""
+        self._fill(MAX_TRACKED_STUDIES + 10)
+        self.engine._prune_study_history(["S0", "S1", "S0"])
+        assert "S0" in self.engine._completed_studies
+        assert "S1" in self.engine._completed_studies
+        assert len(self.engine._completed_studies) == MAX_TRACKED_STUDIES
+
+    def test_queue_activity_refreshes_recency(self):
+        """A study that keeps showing up in the queue survives an
+        arbitrary number of later studies; its long-idle peers go
+        first."""
+        self._fill(10)                                  # S0..S9, early
+        self.engine._prune_study_history(["S0"])        # cycle N
+        self._fill(MAX_TRACKED_STUDIES, start=100)      # later cycles
+        self.engine._prune_study_history(["S0"])        # cycle N+1
+        assert "S0" in self.engine._completed_studies
+        assert "S1" not in self.engine._completed_studies, (
+            "an idle old study is the one that goes")
+
+    def test_cross_cycle_guarantee_survives_pruning(self):
+        """End to end: a completed study that is re-queued next cycle
+        keeps its history, so the retry stays silent."""
+        job = SeriesJob(study_uid="S1", series_uid="S1.1", status="done",
+                        transferred_images=100, remote_count=100)
+        with self.engine._queue_lock:
+            self.engine._queue = [job]
+        self.engine._study_images_transferred["S1"] = 100
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda *a: received.append(a))
+        self.engine._check_study_complete("S1")
+        assert len(received) == 1
+
+        # Next cycle re-queues the same study; pruning runs with it
+        # active and must not forget it.
+        self.engine._prune_study_history(["S1"])
+        self.engine._check_study_complete("S1")
+        assert len(received) == 1, (
+            "pruning must not turn a retry into a fresh completion")
+
+    def test_run_one_cycle_prunes(self):
+        self._fill(MAX_TRACKED_STUDIES + 3)
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=MagicMock()), \
+             patch.object(self.engine, '_query_and_build_queue',
+                          return_value=[]):
+            assert self.engine._run_one_cycle(hours=3, max_images=0) == 0
+        assert len(self.engine._completed_studies) == MAX_TRACKED_STUDIES
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Incomplete series queries — deferral must be bounded
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestIncompleteQueryDeferral:
+    """Deferring the completion verdict on a truncated series list is
+    right for a blip, but a source that truncates every cycle would
+    defer forever and the study would silently never reach Download
+    Completions."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp, tmp_path):
+        self.config = populated_config
+        self.config.filter_groups_enabled = False
+        self.engine = TransferEngine(
+            self.config, "ct",
+            transfer_log=TransferLog(str(tmp_path / "log.sqlite")))
+
+    def test_complete_query_never_defers(self):
+        self.engine._note_series_query_result("S1", True)
+        assert self.engine._completion_deferred("S1") is False
+
+    def test_first_truncation_defers(self):
+        self.engine._note_series_query_result("S1", False)
+        assert self.engine._completion_deferred("S1") is True
+
+    def test_deferral_gives_up_after_the_limit(self):
+        for _ in range(MAX_INCOMPLETE_QUERY_CYCLES):
+            self.engine._note_series_query_result("S1", False)
+        assert self.engine._completion_deferred("S1") is False, (
+            "a persistently truncating source must not withhold the "
+            "study indefinitely")
+
+    def test_a_good_cycle_resets_the_streak(self):
+        """Only CONSECUTIVE truncations count — an occasional blip must
+        never accumulate towards the limit."""
+        for _ in range(MAX_INCOMPLETE_QUERY_CYCLES - 1):
+            self.engine._note_series_query_result("S1", False)
+        self.engine._note_series_query_result("S1", True)
+        self.engine._note_series_query_result("S1", False)
+        assert self.engine._completion_deferred("S1") is True
+
+    def test_streak_is_per_study(self):
+        for _ in range(MAX_INCOMPLETE_QUERY_CYCLES):
+            self.engine._note_series_query_result("S1", False)
+        self.engine._note_series_query_result("S2", False)
+        assert self.engine._completion_deferred("S1") is False
+        assert self.engine._completion_deferred("S2") is True
+
+    def test_check_study_complete_stays_silent_while_deferred(self):
+        self.engine._queue = [
+            SeriesJob(study_uid="S1", series_uid="1.1", status="done",
+                      transferred_images=100, remote_count=100),
+        ]
+        self.engine._study_images_transferred["S1"] = 100
+        received = []
+        self.engine.signals.study_completed.connect(
+            lambda uid, inst, full, imgs: received.append(imgs))
+
+        self.engine._note_series_query_result("S1", False)
+        self.engine._check_study_complete("S1")
+        assert received == []
+
+        # Two more truncated cycles → the deferral gives up and fires.
+        self.engine._note_series_query_result("S1", False)
+        self.engine._note_series_query_result("S1", False)
+        self.engine._check_study_complete("S1")
+        assert received == [100]
+
+    def test_streak_is_pruned_with_the_other_study_history(self):
+        for i in range(MAX_TRACKED_STUDIES + 20):
+            self.engine._incomplete_query_streak[f"S{i}"] = 1
+        self.engine._prune_study_history([])
+        assert len(self.engine._incomplete_query_streak) == MAX_TRACKED_STUDIES

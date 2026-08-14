@@ -16,6 +16,12 @@ import logging.handlers
 import os
 import platform
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # import-time cost avoided; see check_dependencies()
+    from PySide6.QtWidgets import QApplication
+
+    from core.config import AppConfig
 
 # Ensure 'core' and 'gui' are importable regardless of how the script is launched
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +59,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dicom_sync")
 
+# Interpreter range the GC workaround in ``_configure_gc`` applies to.
+# 3.14 introduced the incremental collector that races PySide's
+# cross-thread deallocs; no fixed release is known yet, so the upper
+# bound is open-ended and should be tightened once one ships.
+_GC_WORKAROUND_MIN = (3, 14)
+_GC_WORKAROUND_MAX = (3, 99)
+# How often the manual, main-thread-only collection runs (ms).
+_GC_COLLECT_INTERVAL_MS = 60 * 1000
+
 
 def check_dependencies() -> None:
     """Check that required packages are installed."""
@@ -69,7 +84,7 @@ def check_dependencies() -> None:
         sys.exit(1)
 
 
-def _ensure_config(config) -> None:
+def _ensure_config(config: "AppConfig") -> None:
     """Load the config, running the first-run setup dialog if none exists.
 
     Exits the process if the user cancels the initial-setup dialog.
@@ -84,7 +99,7 @@ def _ensure_config(config) -> None:
             sys.exit(0)
 
 
-def _configure_gc(app) -> None:
+def _configure_gc(app: "QApplication") -> None:
     """Install the GC workaround for the Python 3.14 cross-thread crash.
 
     Python 3.14's incremental GC runs mark_stacks at any bytecode
@@ -100,13 +115,34 @@ def _configure_gc(app) -> None:
 
     The QTimer is parented to *app* so it outlives this function
     (``main`` never returns, but parenting keeps it explicit).
+
+    Gated on the interpreter version so older runtimes — which do not
+    have the incremental collector and therefore not the race — keep
+    Python's normal GC behaviour.  There is no known upper bound yet:
+    re-test on each new minor release and raise ``_GC_WORKAROUND_MAX``
+    once a fixed CPython ships, so this lifts by itself.
     """
     from PySide6.QtCore import QTimer
 
+    if not (_GC_WORKAROUND_MIN <= sys.version_info[:2]
+            <= _GC_WORKAROUND_MAX):
+        logger.info(
+            "Python %d.%d: automatic GC left enabled (the incremental-GC "
+            "cross-thread workaround does not apply).",
+            *sys.version_info[:2])
+        return
+
+    # Deliberately process-wide and deliberately loud: disabling
+    # automatic GC is surprising enough that it must show up in the log
+    # of any session someone later has to debug.
+    logger.info(
+        "Python %d.%d: automatic GC disabled, collecting every %ds "
+        "on the main thread (incremental-GC cross-thread workaround).",
+        *sys.version_info[:2], _GC_COLLECT_INTERVAL_MS // 1000)
     gc.freeze()
     gc.disable()
     gc_timer = QTimer(app)
-    gc_timer.setInterval(60 * 1000)
+    gc_timer.setInterval(_GC_COLLECT_INTERVAL_MS)
     gc_timer.timeout.connect(lambda: gc.collect())
     gc_timer.start()
 
