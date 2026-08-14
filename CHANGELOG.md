@@ -2,6 +2,80 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.4.0] — 2026-08-14
+
+Maintenance release from two full code reviews (65 findings).  No new
+features: every change either fixes a defect, removes a way for the GUI
+to lie about its state, or breaks up code that had grown too large to
+review safely.
+
+### Fixed
+- **Statistics window went blank after being closed once.** Closing it
+  released the SQLite connection, but the window is cached and re-shown,
+  so every later query failed silently and the user saw empty tables.
+- **Warning dialogs no longer freeze the app.** The PACS-unreachable and
+  connection-lost warnings ran a nested event loop inside a signal slot,
+  re-entering every other queued engine signal.  Both are now non-modal
+  and de-duplicated per source.
+- **A failed built-in receiver is now reported.** When the local PACS is
+  unreachable and the fallback Storage SCP cannot bind, the dashboard
+  used to keep showing "Starting service…" forever with only a log line.
+  It now returns to "Stopped" and explains why.
+- **Truncated series queries can no longer hide a study forever.**
+  Deferring a study's completion verdict when its series query broke off
+  mid-stream was unbounded, so a persistently flaky source kept the study
+  out of Download Completions indefinitely.  Capped at three consecutive
+  truncations.
+- **Config files containing non-ASCII now load on any locale.** The
+  config was read with the platform default encoding; on a German
+  Windows box a UTF-8 config failed to load, silently triggering the
+  first-run wizard and dropping unknown keys on the next save.
+- **Transfer-rate standard deviation is no longer numerically unstable.**
+  Measured relative error on a fast link improved from ~1.2e-10 to
+  ~1.8e-16.
+
+### Changed
+- The **Download Completions** list and the **statistics** detail tables
+  are capped (500 rows each), oldest first.  The statistics summary,
+  boxplot and per-source/per-modality breakdowns still use the full
+  history — only the browsable tables are limited, with a row count
+  shown.
+- The **high study load** warning has a 15-minute cooldown; a rate
+  hovering at the threshold used to re-pop it every few seconds.
+- The built-in **Storage SCP** binds in the calling thread and fails
+  immediately instead of sleeping on the GUI thread and guessing.
+- **Source PACS settings are validated** on add/save: AE titles are
+  capped at DICOM's 16 characters and the IP field must be a valid
+  address or hostname.
+- The **automatic-GC workaround** is gated on the interpreter version and
+  logs once at startup, so it lifts by itself on a fixed CPython.
+- Remaining hardcoded German strings now go through the translation
+  layer (five new keys in all four languages).
+
+### Internal
+- New `gui/queue_table.py` — the series-queue rendering, extracted from
+  the dashboard.
+- New `gui/service_watchdog.py` — active-transfer state, the stall
+  watchdog's two-condition wedge rule, and pending-restart bookkeeping.
+  Eight loose widget attributes became two small objects.
+- New `core/dicom_time.py` — one implementation of DICOM date/time
+  parsing and display formatting, replacing four hand-rolled copies (one
+  of which was dead code kept alive only by its tests).
+- `SourceDashboard` shrank from 1607 to 1234 lines; the longest function
+  in the project went from 160 to 75 lines; nesting deeper than three
+  levels went from 6 sites to 4; unannotated parameters from 11 to 0.
+- Per-study bookkeeping in the transfer engine is now pruned, so a
+  service running for weeks no longer grows three dictionaries without
+  bound.
+- Colours live in `gui/styles.py`; no inline hex remains outside the
+  palette modules.
+- `AppConfig.local_node`'s setter used to accept an assignment and
+  silently discard it; it now raises.
+
+### Tests
+- 970 → 1158 (+188), including three new suites for the extracted
+  modules.
+
 ## [1.3.3] — 2026-06-29
 
 Follow-up to 1.3.2: keeps straggler images from falsifying the Download
