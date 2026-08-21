@@ -2,6 +2,55 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.5.0] — 2026-08-21
+
+A source PACS that sends JPEG 2000 pixel data no matter what was
+negotiated could not be downloaded at all: every image series failed
+while its reports came through.  DICOM Sync can now take delivery of
+such a source's images itself and hand the local PACS files it accepts.
+
+### Added
+- **Receive C-MOVE images with the built-in SCP** — a new per-source
+  option in the PACS node editor.  Normally the source PACS delivers
+  straight to the configured local destination; switch this on and
+  DICOM Sync takes delivery instead and writes the images to the
+  fallback folder, where the local PACS picks them up.
+
+  Use it when the local PACS is reachable — it answers C-ECHO, queries
+  work — but every C-MOVE from one particular source still comes back
+  `0 completed / N failed`.  Seen in the field with a PACS that offers
+  its images as *JPEG 2000 Lossless or Implicit VR Little Endian* but
+  sends JPEG 2000 compressed pixel data either way.  A receiver that
+  accepts the uncompressed option then gets objects whose pixel data
+  does not match their declared syntax, and rejects every one of them.
+
+  The SCP binds only the network interface that reaches that source, so
+  the local PACS keeps serving its own address for everything else,
+  including the queries DICOM Sync uses to track what has arrived.
+  Requires a fallback folder.
+
+### Fixed
+- **The built-in Storage SCP accepted only uncompressed transfer
+  syntaxes.** It offered pynetdicom's defaults, so against the kind of
+  source described above it would have stored mislabelled images
+  instead of usable ones.  It now prefers lossless compressed syntaxes
+  when a sender offers them.  Lossy syntaxes are still accepted, but
+  ranked behind the uncompressed ones — a sender offering both can
+  serve either, and picking lossy would discard image data for nothing.
+- **Images stopped arriving once the local PACS emptied the fallback
+  folder.** The folder is watched by a local PACS that imports what
+  lands in it and then removes the emptied directory; every image after
+  that first import failed until the service was restarted.
+- **"Preferred Syntax" under Local Destination did nothing.** It was
+  saved to the configuration and never read.  It is the receiving
+  side's preference, so it only ever had a meaning for the built-in
+  SCP — it now drives it, and its tooltip says so.
+
+### Internal
+- `pytest` is declared in `requirements.txt`; it is excluded from the
+  app bundle by the PyInstaller spec.
+- 20 new tests (1178 total).
+
 ## [1.4.0] — 2026-08-14
 
 Maintenance release from two full code reviews (65 findings).  No new
