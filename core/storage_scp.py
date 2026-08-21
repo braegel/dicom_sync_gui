@@ -158,7 +158,7 @@ class StorageSCP(QObject):
             return self._running_flag
 
     @running.setter
-    def running(self, value: bool):
+    def running(self, value: bool) -> None:
         # Setter kept so existing test mocks that assign ``.running``
         # continue to work; thread-safety only matters on real instances.
         with self._run_lock:
@@ -204,7 +204,7 @@ class StorageSCP(QObject):
             logger.error(f"Store failed: {e}")
             return 0xC000
 
-    def start(self):
+    def start(self) -> None:
         """Bind the SCP's listening socket and serve in the background.
 
         ``block=False`` binds in the CALLING thread and raises
@@ -248,7 +248,7 @@ class StorageSCP(QObject):
             ) from e
         logger.info(f"Storage SCP started on port {self.port}")
 
-    def stop(self):
+    def stop(self) -> None:
         # Atomically claim the shutdown so a concurrent stop() cannot
         # race us into calling ae.shutdown() twice on the same
         # (already-torn-down) AE.

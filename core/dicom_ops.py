@@ -5,7 +5,9 @@ Abstracted from the original CLI script for GUI use.
 
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (
+    Any, Callable, Dict, Iterator, List, Optional, Tuple,
+)
 
 from pydicom import Dataset
 from pydicom.uid import (
@@ -13,6 +15,7 @@ from pydicom.uid import (
     JPEGLosslessSV1, JPEGLossless, DeflatedExplicitVRLittleEndian,
 )
 from pynetdicom import AE
+from pynetdicom.association import Association
 from pynetdicom.sop_class import (
     PatientRootQueryRetrieveInformationModelFind,
     PatientRootQueryRetrieveInformationModelMove,
@@ -137,7 +140,7 @@ class DicomOperations:
         # Verification (C-ECHO) keeps pynetdicom's default syntaxes.
         self.ae.add_requested_context(Verification)
 
-    def close(self):
+    def close(self) -> None:
         """Shut down the AE so any association threads exit before the
         object is dropped.
 
@@ -155,7 +158,7 @@ class DicomOperations:
             logger.warning(
                 f"[{self.remote_name}] AE shutdown failed: {e}")
 
-    def _associate(self, config: Dict):
+    def _associate(self, config: Dict[str, Any]) -> Association:
         """Open an association to *config*, raising
         :class:`PacsConnectionError` if it cannot be established.
 
@@ -329,6 +332,39 @@ class DicomOperations:
         one (see its docstring)."""
         return self._execute_find_checked(query_ds, target)[1]
 
+    @staticmethod
+    def _iter_find_results(assoc: Association,
+                           query_ds: Dataset) -> Iterator[Dataset]:
+        """Yield the identifier of each PENDING C-FIND response.
+
+        Split out of :py:meth:`_execute_find_checked` so that method
+        reads as "associate, collect, release" instead of nesting the
+        warning filter, the response loop and two status guards four
+        levels deep inside its own ``try``.
+
+        A GENERATOR, deliberately, not a list: the caller must keep the
+        datasets that arrived before an association break, which is the
+        whole point of its ``complete`` flag.  Building a list here and
+        returning it would discard exactly those partial results when
+        the stream raises partway through.
+
+        Only PENDING responses (0xFF00 / 0xFF01) carry an identifier;
+        the final SUCCESS response has none and must not be collected.
+        """
+        # Suppress pydicom's "VR UI value length exceeds maximum"
+        # warning that some PACS implementations trigger; scoped to the
+        # call site, not process-wide.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                message='.*value length.*exceeds the maximum length.*VR UI.*')
+            for status, dataset in assoc.send_c_find(
+                    query_ds, StudyRootQueryRetrieveInformationModelFind):
+                if status is None or dataset is None:
+                    continue
+                if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
+                    yield dataset
+
     def _execute_find_checked(self, query_ds: Dataset, target: str = 'remote'
                               ) -> Tuple[bool, List[Dataset]]:
         """Run a C-FIND and return ``(complete, results)``.
@@ -351,19 +387,11 @@ class DicomOperations:
         complete = True
         assoc = self._associate(config)
         try:
-            # Suppress pydicom's "VR UI value length exceeds maximum"
-            # warning that some PACS implementations trigger; scoped to
-            # the call site, not process-wide.
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    'ignore',
-                    message='.*value length.*exceeds the maximum length.*VR UI.*')
-                for status, dataset in assoc.send_c_find(
-                        query_ds, StudyRootQueryRetrieveInformationModelFind):
-                    if status is None or dataset is None:
-                        continue
-                    if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
-                        results.append(dataset)
+            # Append as they arrive: a break mid-stream must leave the
+            # datasets received so far in ``results`` (see the
+            # ``complete`` flag above).
+            for dataset in self._iter_find_results(assoc, query_ds):
+                results.append(dataset)
         except Exception as e:
             logger.error(f"C-FIND error: {e}")
             complete = False
