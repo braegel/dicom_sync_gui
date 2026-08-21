@@ -731,3 +731,68 @@ class TestPacsNodeBuiltinReceiver:
         """Config files written before this field existed must still
         load, with the built-in receiver disabled."""
         assert PacsNode.from_dict({"name": "tz"}).receive_with_builtin_scp is False
+
+
+class TestAppConfigAsyncSave:
+    """``save()`` fsyncs, so calling it from a Qt slot stalls the event
+    loop for the length of the disk write.  ``save_async`` snapshots on
+    the calling thread and writes on a background one."""
+
+    def _config(self, tmp_path):
+        cfg = AppConfig(str(tmp_path / "cfg.json"))
+        cfg.remote_nodes["ct"] = PacsNode(name="CT", ae_title="CT")
+        return cfg
+
+    def test_save_async_writes_the_file(self, tmp_path):
+        cfg = self._config(tmp_path)
+        cfg.save_async()
+        cfg.flush()
+        with open(cfg.config_path, encoding="utf-8") as f:
+            assert json.load(f)["remotes"]["ct"]["ae_title"] == "CT"
+
+    def test_payload_is_snapshotted_on_the_calling_thread(self, tmp_path):
+        """The snapshot is what makes an off-thread write safe: state
+        mutated after the call must not leak into that write."""
+        cfg = self._config(tmp_path)
+        cfg.language = "de"
+        cfg.save_async()
+        cfg.language = "fr"          # after the snapshot
+        cfg.flush()
+        with open(cfg.config_path, encoding="utf-8") as f:
+            assert json.load(f)["language"] == "de"
+
+    def test_bursts_coalesce_to_the_last_state(self, tmp_path):
+        """Ten UI events must not produce ten disk writes — and the
+        file must end up holding the FINAL state, not an arbitrary one."""
+        cfg = self._config(tmp_path)
+        writes = []
+        real = cfg._write_payload
+
+        def counting(data):
+            writes.append(data["language"])
+            return real(data)
+
+        cfg._write_payload = counting
+        for lang in ("en", "de", "fr", "es"):
+            cfg.language = lang
+            cfg.save_async()
+        cfg.flush()
+        assert writes, "no write happened at all"
+        assert len(writes) < 4, f"expected coalescing, got {len(writes)} writes"
+        with open(cfg.config_path, encoding="utf-8") as f:
+            assert json.load(f)["language"] == "es"
+
+    def test_flush_is_a_noop_without_a_pending_write(self, tmp_path):
+        self._config(tmp_path).flush()   # must not raise or block
+
+    def test_sync_save_after_flush_wins(self, tmp_path):
+        """The ordering ``flush()`` then ``save()`` is what stops a
+        queued older snapshot from rolling back newer state."""
+        cfg = self._config(tmp_path)
+        cfg.language = "de"
+        cfg.save_async()
+        cfg.flush()
+        cfg.language = "fr"
+        cfg.save()
+        with open(cfg.config_path, encoding="utf-8") as f:
+            assert json.load(f)["language"] == "fr"

@@ -12,6 +12,7 @@ import logging
 import os
 import platform
 import socket
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -159,7 +160,7 @@ class PacsNode:
     # An empty list passed explicitly is preserved (user-cleared).
     priority_series_terms: Optional[List[Dict[str, Any]]] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # An explicit non-empty list is deep-copied so the caller can
         # keep using its own list without leaking mutations into the
         # node, symmetric to the defensive copy in ``from_dict``.
@@ -231,7 +232,7 @@ class PacsNode:
 # and the on-disk JSON shape cannot drift apart between the two.
 
 def write_filter_groups_json(path: str, group_names: List[str],
-                             assignments: Dict[str, str]):
+                             assignments: Dict[str, str]) -> None:
     """Write filter group names and institution assignments to a JSON file.
 
     The file shape is the export format consumed by
@@ -307,36 +308,50 @@ def merge_filter_group_data(
 class AppConfig:
     """Application configuration."""
 
-    def __init__(self, config_path: str = ""):
+    def __init__(self, config_path: str = "") -> None:
         self.config_path = config_path or self._default_config_path()
-        self.remote_nodes: Dict[str, PacsNode] = {}
+        self._init_sources()
+        self._init_download_settings()
+        self._init_legacy_state()
+        self._init_writer()
 
-        # Cached local LAN IP; populated by update_local_ip() at startup,
-        # falls back to a fresh lookup via _resolve_local_ip() until then.
+    def _init_sources(self) -> None:
+        """The configured source PACS and the cached local address."""
+        self.remote_nodes: Dict[str, PacsNode] = {}
+        # Cached local LAN IP; populated by update_local_ip() at
+        # startup, falls back to a fresh lookup via _resolve_local_ip()
+        # until then.
         self._local_ip: Optional[str] = None
 
+    def _init_download_settings(self) -> None:
+        """Everything the user sets in the dashboard and Settings that
+        is NOT per source: prior studies, institution filtering, the
+        high-load alert and the UI language."""
         # Prior studies
         self.prior_studies_count: int = 0  # 0 = disabled
         self.prior_studies_same_modality: bool = False
 
         # Filter groups
-        self.filter_group_names: List[str] = []  # ordered list of group names
-        self.institution_assignments: Dict[str, str] = {}  # {institution: group_name}
-        self.active_filter_groups: List[str] = []  # groups selected in dashboard
-        self.filter_groups_enabled: bool = False  # master switch in dashboard
-        self.filter_allow_small_series: bool = False  # download small series regardless of group
-        self.filter_small_series_max: int = 20  # max images per series for the above
-        self.high_load_alert_enabled: bool = True  # popup when ≥12 studies/hour
+        self.filter_group_names: List[str] = []  # ordered group names
+        self.institution_assignments: Dict[str, str] = {}  # inst -> group
+        self.active_filter_groups: List[str] = []  # selected in dashboard
+        self.filter_groups_enabled: bool = False  # master switch
+        # Download small series even outside an active group, capped at
+        # filter_small_series_max images.
+        self.filter_allow_small_series: bool = False
+        self.filter_small_series_max: int = 20
+        self.high_load_alert_enabled: bool = True  # popup at >=12/hour
 
         # UI language (en, de, fr, es)
         self.language: str = "en"
 
-        # DEPRECATED state — the old *global* service parameters and the
-        # old global C-MOVE destination, kept only so pre-per-source
-        # config files still load.  New code reads the per-source values
-        # off PacsNode instead.  See the "DEPRECATED COMPATIBILITY
-        # SURFACE" section further down for the full rationale and for
-        # the migration helpers that consume these.
+    def _init_legacy_state(self) -> None:
+        """DEPRECATED state — the old *global* service parameters and
+        the old global C-MOVE destination, kept only so pre-per-source
+        config files still load.  New code reads the per-source values
+        off PacsNode instead.  See the "DEPRECATED COMPATIBILITY
+        SURFACE" section further down for the full rationale and for
+        the migration helpers that consume these."""
         self.default_hours: int = 3
         self.max_images: int = 0
         self.sync_interval: int = 60
@@ -347,6 +362,19 @@ class AppConfig:
         # round-tripped on save() so a newer-version field written by a
         # future build is not silently lost when this version saves.
         self._raw_data: Dict[str, Any] = {}
+
+    def _init_writer(self) -> None:
+        """Background-writer state (see save_async / flush).
+
+        ``_io_lock`` serializes the actual file write so a background
+        write and a synchronous ``save()`` can never interleave and
+        produce a half-merged config.  ``_pending_payload`` is a
+        one-slot mailbox: bursts coalesce to the newest snapshot
+        instead of queueing one write per UI event."""
+        self._io_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending_payload: Optional[Dict[str, Any]] = None
+        self._writer: Optional[threading.Thread] = None
 
     @staticmethod
     def _default_config_path() -> str:
@@ -428,7 +456,7 @@ class AppConfig:
         self.language = data.get("language", "en")
 
     def save(self) -> bool:
-        """Save configuration to file atomically.
+        """Save configuration to file atomically, synchronously.
 
         Writes to a sibling ``.tmp`` file and ``os.replace``s it onto the
         real path so a crash mid-write cannot leave the user with a
@@ -437,9 +465,29 @@ class AppConfig:
 
         Returns *True* on success, *False* if the file could not be
         written (``OSError``: permissions, full disk, stale mount …).
-        A failure is logged rather than raised — one caller is a
-        debounced-save QTimer slot, where an exception would propagate
-        into the Qt event loop instead of anything that could handle it.
+        A failure is logged rather than raised — callers include Qt
+        slots, where an exception would propagate into the event loop
+        instead of anything that could handle it.
+
+        This call fsyncs, so it is the RIGHT choice for a one-shot
+        user action ("I pressed OK, it must be on disk before the
+        dialog reports success") and the WRONG one for a recurring
+        autosave on the GUI thread — use :py:meth:`save_async` there.
+
+        Drains the background writer first.  A queued snapshot is by
+        definition older than what we are about to write, so letting it
+        land afterwards would silently roll the change back — making
+        that ordering the caller's job is a trap, so it lives here.
+        """
+        self.flush()
+        return self._write_payload(self._build_payload())
+
+    def _build_payload(self) -> Dict[str, Any]:
+        """Snapshot the current settings as the dict that goes to disk.
+
+        Cheap and side-effect free, so it can run on the GUI thread even
+        when the write itself is handed to the background writer — the
+        snapshot is what makes that write consistent.
         """
         # Start from the raw on-disk dict so unknown keys (e.g. settings
         # added by a future build) round-trip instead of being silently
@@ -463,7 +511,21 @@ class AppConfig:
             "max_images": self.max_images,
             "sync_interval": self.sync_interval,
         })
+        return data
+
+    def _write_payload(self, data: Dict[str, Any]) -> bool:
+        """Atomically write *data* to ``config_path``.
+
+        Holds ``_io_lock`` for the whole write so a synchronous
+        ``save()`` and the background writer cannot interleave their
+        tmp-file/rename dance on the same path.
+        """
         tmp_path = self.config_path + ".tmp"
+        with self._io_lock:
+            return self._write_payload_locked(data, tmp_path)
+
+    def _write_payload_locked(self, data: Dict[str, Any],
+                              tmp_path: str) -> bool:
         try:
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             # UTF-8 to match load().  json.dump escapes non-ASCII by
@@ -480,6 +542,67 @@ class AppConfig:
             logger.error(f"Config save error ({self.config_path}): {e}")
             return False
 
+    def save_async(self) -> None:
+        """Snapshot the settings now, write them off the GUI thread.
+
+        For the recurring autosave path (a hammered spinbox, rapid
+        toggles): ``save()`` fsyncs, and doing that in a Qt slot stalls
+        the event loop for the duration of the disk write — invisible on
+        a local SSD, seconds on a network home directory.
+
+        Bursts coalesce: the payload is a one-slot mailbox, so ten
+        changes in a row produce one write of the final state rather
+        than ten writes.  At most one writer thread exists at a time.
+        Call :py:meth:`flush` before a synchronous ``save()`` (and
+        before shutdown) so a queued older snapshot cannot land after
+        newer state was written.
+        """
+        payload = self._build_payload()
+        with self._pending_lock:
+            self._pending_payload = payload
+            if self._writer is not None and self._writer.is_alive():
+                # The running writer re-checks the mailbox before it
+                # exits, so it will pick this snapshot up.
+                return
+            self._writer = threading.Thread(
+                target=self._drain_pending, daemon=True,
+                name="config-save")
+            self._writer.start()
+
+    def _drain_pending(self) -> None:
+        """Background writer loop: write the newest pending snapshot
+        until the mailbox is empty, then retire.
+
+        Clearing ``_writer`` happens under ``_pending_lock`` in the same
+        critical section that finds the mailbox empty, so a concurrent
+        ``save_async`` either sees a live writer (and just queues) or
+        starts a fresh one — a snapshot can never be dropped between the
+        two.
+        """
+        while True:
+            with self._pending_lock:
+                payload = self._pending_payload
+                self._pending_payload = None
+                if payload is None:
+                    self._writer = None
+                    return
+            self._write_payload(payload)
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Wait for the background writer to drain, at most *timeout*.
+
+        Needed before a synchronous ``save()`` and before shutdown: a
+        queued snapshot is by definition older than the current state,
+        so letting it land afterwards would silently roll settings back.
+        A writer that overruns the timeout is left running — it is a
+        daemon thread writing atomically, so the worst case is the older
+        snapshot winning, never a corrupt file.
+        """
+        with self._pending_lock:
+            writer = self._writer
+        if writer is not None and writer.is_alive():
+            writer.join(timeout)
+
     def get_remote_names(self) -> List[str]:
         return list(self.remote_nodes.keys())
 
@@ -492,7 +615,7 @@ class AppConfig:
         until ``update_local_ip()`` has populated the cache."""
         return self._local_ip or get_local_ip()
 
-    def update_local_ip(self):
+    def update_local_ip(self) -> None:
         """Refresh the cached local IP for all per-source local destinations.
 
         Called once at startup so that ``get_local_dict_for`` always returns
@@ -587,7 +710,7 @@ class AppConfig:
                     node.fallback_folder = self._legacy_fallback_path
 
     @property
-    def local_node(self):
+    def local_node(self) -> "PacsNode":
         """Legacy property — returns a PacsNode-like object from the first
         remote's local settings.  Only used in migration / tests."""
         ip = self._resolve_local_ip()
@@ -635,7 +758,7 @@ class AppConfig:
 
     # ── Filter groups export / import ────────────────────────────────────
 
-    def export_filter_groups(self, path: str):
+    def export_filter_groups(self, path: str) -> None:
         """Export filter group names and institution assignments to a JSON file."""
         write_filter_groups_json(
             path, self.filter_group_names, self.institution_assignments)
