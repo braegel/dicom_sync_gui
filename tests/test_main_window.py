@@ -754,6 +754,83 @@ class TestMainWindowSCP:
         mock_scp.start.assert_called_once()
         assert ("LOCAL_AE", 11112) in self.win.storage_scps
 
+    @patch("gui.main_window.local_ip_for", return_value="10.168.20.14")
+    @patch("gui.main_window.StorageSCP")
+    def test_builtin_receiver_starts_even_when_local_reachable(
+            self, MockSCP, _mock_ip):
+        """The whole point of ``receive_with_builtin_scp`` is the case
+        the fallback path cannot cover: the local PACS answers C-ECHO
+        perfectly well but still rejects every image this source sends,
+        so "local reachable" must NOT skip the SCP here."""
+        mock_scp = MagicMock()
+        mock_scp.running = False
+        MockSCP.return_value = mock_scp
+
+        node = self.win.config.remote_nodes["ct"]
+        node.receive_with_builtin_scp = True
+        node.fallback_folder = "/tmp/incoming"
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60}}
+        self.win._on_scp_check_done("ct", True, True, node.to_dict())
+
+        MockSCP.assert_called_once()
+        mock_scp.start.assert_called_once()
+
+    @patch("gui.main_window.local_ip_for", return_value="10.168.20.14")
+    @patch("gui.main_window.StorageSCP")
+    def test_builtin_receiver_binds_the_source_facing_address(
+            self, MockSCP, _mock_ip):
+        """Binding the wildcard would collide with the local PACS that
+        already holds this port.  Binding the address that reaches THIS
+        source takes precedence for its traffic while leaving the local
+        PACS to serve its own address — which the engine still needs for
+        its local C-FIND."""
+        mock_scp = MagicMock()
+        mock_scp.running = False
+        MockSCP.return_value = mock_scp
+
+        node = self.win.config.remote_nodes["ct"]
+        node.receive_with_builtin_scp = True
+        node.fallback_folder = "/tmp/incoming"
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60}}
+        self.win._on_scp_check_done("ct", True, True, node.to_dict())
+
+        assert MockSCP.call_args.kwargs["bind_address"] == "10.168.20.14"
+
+    @patch("gui.main_window.StorageSCP")
+    def test_builtin_receiver_refuses_without_fallback_folder(self, MockSCP):
+        """Received images would have nowhere to go — starting an SCP
+        that drops everything would be worse than not starting."""
+        node = self.win.config.remote_nodes["ct"]
+        node.receive_with_builtin_scp = True
+        node.fallback_folder = ""
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60}}
+
+        with patch.object(MainWindow, "_start_engine") as mock_start:
+            self.win._on_scp_check_done("ct", True, True, node.to_dict())
+
+        MockSCP.assert_not_called()
+        mock_start.assert_not_called()
+
+    @patch("gui.main_window.StorageSCP")
+    def test_fallback_scp_still_binds_the_wildcard(self, MockSCP):
+        """The classic fallback runs because the local PACS is DOWN, so
+        there is no port to share and images may arrive on any
+        interface — that path must keep its wildcard bind."""
+        mock_scp = MagicMock()
+        mock_scp.running = False
+        MockSCP.return_value = mock_scp
+
+        node = self.win.config.remote_nodes["ct"]
+        node.fallback_folder = "/tmp/incoming"
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60}}
+        self.win._on_scp_check_done("ct", True, False, node.to_dict())
+
+        assert MockSCP.call_args.kwargs["bind_address"] == "0.0.0.0"
+
     def test_scp_skipped_when_local_reachable(self):
         node = self.win.config.remote_nodes["ct"]
         params = {"hours": 3, "max_images": 0, "sync_interval": 60}
@@ -981,7 +1058,8 @@ class TestAutoRestartRetry:
         """The dashboard must fall back to its stopped state so the
         user can retry, rather than staying on 'Starting service…'."""
         node = self.win.config.remote_nodes["ct"]
-        self.win._pending_start_params = {"ct": {"hours": 3}}
+        self.win._pending_start_params = {
+            "ct": {"hours": 3, "max_images": 0, "sync_interval": 60}}
         dashboard = self.win.dashboards["ct"]
 
         with patch.object(dashboard, "set_service_running") as mock_set:

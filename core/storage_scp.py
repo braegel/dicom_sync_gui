@@ -7,12 +7,27 @@ import inspect
 import logging
 import os
 import threading
+from typing import List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
 from pydicom import Dataset
 from pynetdicom import AE, evt, StoragePresentationContexts
 from pynetdicom.sop_class import Verification
+from pydicom.uid import (
+    DeflatedExplicitVRLittleEndian,
+    ExplicitVRBigEndian,
+    ExplicitVRLittleEndian,
+    ImplicitVRLittleEndian,
+    JPEG2000,
+    JPEG2000Lossless,
+    JPEGBaseline8Bit,
+    JPEGExtended12Bit,
+    JPEGLosslessSV1,
+    JPEGLSLossless,
+    JPEGLSNearLossless,
+    RLELossless,
+)
 
 logger = logging.getLogger("dicom_sync")
 
@@ -37,6 +52,68 @@ _SAVE_AS_KWARGS = (
 # Nth, which is all the throttled progress-log handler needs anyway.
 _IMAGE_SIGNAL_EVERY = 25
 
+# Transfer syntaxes this SCP will accept, in OUR order of preference --
+# and the order matters, because as the association ACCEPTOR we are the
+# side that picks.  pynetdicom walks this list and takes the first entry
+# the sender also proposed; the sender's own ordering is ignored.
+#
+# Lossless compressed comes FIRST, ahead of the uncompressed syntaxes.
+# That is not a size optimization, it works around a real and otherwise
+# silent data-corruption bug:
+#
+#   Some PACS (confirmed with a "1.5.0/WIN32" implementation) send the
+#   pixel data JPEG 2000 compressed NO MATTER which transfer syntax was
+#   negotiated.  Propose them ``[JPEG2000Lossless, ImplicitVRLittleEndian]``
+#   and accept Implicit VR LE, and they still put an encapsulated J2K
+#   codestream in (7FE0,0010) with an undefined length -- which is only
+#   legal in a COMPRESSED syntax.  The object is then mislabelled: 60 KB
+#   of J2K bytes claiming to be 512 KB of raw pixels.  pydicom parses it
+#   anyway, so the corruption is invisible here, but a DCMTK-based
+#   receiver downstream (OsiriX, dcmtk itself) rejects the file.
+#
+# Accepting the compressed syntax whenever the sender offers one makes
+# the label match the bytes, so the stored file is conformant either way.
+#
+# Lossy syntaxes stay LAST, behind the uncompressed ones: if a sender
+# offers both lossy-compressed and uncompressed it can serve either, and
+# picking lossy would throw away image data for nothing.
+STORAGE_TRANSFER_SYNTAXES = [
+    # 1. lossless compressed -- preferred (see above)
+    JPEG2000Lossless,
+    JPEGLSLossless,
+    JPEGLosslessSV1,
+    RLELossless,
+    # 2. uncompressed
+    ExplicitVRLittleEndian,
+    ImplicitVRLittleEndian,
+    DeflatedExplicitVRLittleEndian,
+    ExplicitVRBigEndian,
+    # 3. lossy -- accepted only when nothing better is on offer
+    JPEG2000,
+    JPEGLSNearLossless,
+    JPEGBaseline8Bit,
+    JPEGExtended12Bit,
+]
+
+
+def _syntaxes_preferring(preferred: Optional[str]) -> List[str]:
+    """Return the accepted transfer syntaxes with *preferred* moved to
+    the front, or ``STORAGE_TRANSFER_SYNTAXES`` unchanged when no
+    preference is given.
+
+    Front position is what has an effect: as the acceptor we pick the
+    first entry the sender also proposed.  Everything else is kept
+    behind it as a fallback rather than dropped, so choosing a syntax a
+    particular sender does not offer degrades to the default order
+    instead of failing the association.  A syntax that is not in the
+    default list at all is still honoured -- the UI offers a few that
+    the default order does not enumerate.
+    """
+    if not preferred:
+        return STORAGE_TRANSFER_SYNTAXES
+    return [preferred] + [ts for ts in STORAGE_TRANSFER_SYNTAXES
+                          if ts != preferred]
+
 
 class StorageSCP(QObject):
     """Built-in DICOM Storage SCP.
@@ -54,12 +131,16 @@ class StorageSCP(QObject):
     image_received = Signal(int)
 
     def __init__(self, ae_title: str, port: int, storage_path: str,
-                 bind_address: str = "0.0.0.0"):
+                 bind_address: str = "0.0.0.0",
+                 preferred_syntax: Optional[str] = None):
         super().__init__()
         self.ae_title = ae_title
         self.port = port
         self.bind_address = bind_address
         self.storage_path = storage_path
+        # Transfer syntax UID the node's "Preferred Syntax" asks for, or
+        # None to use STORAGE_TRANSFER_SYNTAXES unchanged.
+        self.transfer_syntaxes = _syntaxes_preferring(preferred_syntax)
         self.ae = None
         # ``_running_flag`` is read/written from both the reactor thread
         # and the caller (GUI) thread; access goes through ``_run_lock``
@@ -96,7 +177,19 @@ class StorageSCP(QObject):
             # Conformant Part 10 write; keyword chosen at import time
             # (see _SAVE_AS_KWARGS) to stay compatible with pydicom 2.x
             # ("write_like_original") and 3.x ("enforce_file_format").
-            ds.save_as(filepath, **_SAVE_AS_KWARGS)
+            try:
+                ds.save_as(filepath, **_SAVE_AS_KWARGS)
+            except FileNotFoundError:
+                # The storage directory vanished under us.  That is not
+                # an edge case here: the whole point of this folder is
+                # that a local PACS watches it and imports what lands in
+                # it -- OsiriX removes the (now empty) directory once it
+                # has, and every following image would then fail with
+                # ENOENT until the service is restarted.  Recreate and
+                # retry once, off the hot path so the common case still
+                # costs nothing.
+                os.makedirs(self.storage_path, exist_ok=True)
+                ds.save_as(filepath, **_SAVE_AS_KWARGS)
             with self._lock:
                 self._images_received += 1
                 count = self._images_received
@@ -129,8 +222,14 @@ class StorageSCP(QObject):
                 return
             self._running_flag = True
         ae = AE(ae_title=self.ae_title)
-        ae.supported_contexts = StoragePresentationContexts
-        ae.add_supported_context(Verification)
+        # Rebuild the default storage contexts with our own transfer
+        # syntax preference list instead of pynetdicom's (which offers
+        # only the uncompressed syntaxes) -- see
+        # STORAGE_TRANSFER_SYNTAXES for why the order is load-bearing.
+        for cx in StoragePresentationContexts:
+            ae.add_supported_context(
+                cx.abstract_syntax, self.transfer_syntaxes)
+        ae.add_supported_context(Verification, self.transfer_syntaxes)
         self.ae = ae
         try:
             ae.start_server(

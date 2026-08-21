@@ -12,7 +12,13 @@ from PySide6.QtCore import QCoreApplication
 
 from pydicom import dcmread
 from pydicom.dataset import Dataset, FileMetaDataset
-from pydicom.uid import ExplicitVRLittleEndian
+from pydicom.uid import (
+    ExplicitVRLittleEndian,
+    ImplicitVRLittleEndian,
+    JPEG2000,
+    JPEG2000Lossless,
+    JPEGBaseline8Bit,
+)
 
 import core.storage_scp as storage_scp_module
 from core.storage_scp import StorageSCP
@@ -232,3 +238,129 @@ class TestStorageSCPStartFailure:
 
         ae_instance.shutdown.assert_called_once()
         assert scp.ae is None
+
+
+class TestStorageSCPTransferSyntaxPreference:
+    """The SCP is the association ACCEPTOR, so ITS ordering decides which
+    transfer syntax a sender ends up using.  Getting that order wrong is
+    not cosmetic: a PACS was observed sending JPEG 2000 pixel data
+    regardless of what was negotiated, so accepting an uncompressed
+    syntax from it produced mislabelled objects that a DCMTK-based
+    receiver downstream rejects.  See STORAGE_TRANSFER_SYNTAXES."""
+
+    def test_lossless_compressed_ranks_above_uncompressed(self):
+        order = storage_scp_module.STORAGE_TRANSFER_SYNTAXES
+        assert order.index(JPEG2000Lossless) < order.index(ImplicitVRLittleEndian)
+        assert order.index(JPEG2000Lossless) < order.index(ExplicitVRLittleEndian)
+
+    def test_lossy_ranks_below_uncompressed(self):
+        """A sender offering both lossy and uncompressed can serve
+        either — picking lossy would discard image data for nothing."""
+        order = storage_scp_module.STORAGE_TRANSFER_SYNTAXES
+        for lossy in (JPEG2000, JPEGBaseline8Bit):
+            assert order.index(ExplicitVRLittleEndian) < order.index(lossy)
+            assert order.index(ImplicitVRLittleEndian) < order.index(lossy)
+
+    def test_uncompressed_syntaxes_are_still_offered(self):
+        """Preferring compressed must not mean refusing plain senders."""
+        order = storage_scp_module.STORAGE_TRANSFER_SYNTAXES
+        assert ImplicitVRLittleEndian in order
+        assert ExplicitVRLittleEndian in order
+
+    def test_storage_contexts_are_built_with_that_order(self, qapp, tmp_path):
+        """The preference list is worthless unless the contexts actually
+        carry it — pynetdicom's default storage contexts offer only the
+        uncompressed syntaxes."""
+        scp = StorageSCP("TEST_AE", 11112, str(tmp_path))
+        with patch("core.storage_scp.AE") as ae_cls:
+            ae_instance = MagicMock()
+            ae_cls.return_value = ae_instance
+            scp.start()
+
+        offered = [
+            call.args[1] for call in ae_instance.add_supported_context.call_args_list
+        ]
+        assert offered, "no supported contexts were registered"
+        for syntaxes in offered:
+            assert syntaxes is storage_scp_module.STORAGE_TRANSFER_SYNTAXES
+
+
+class TestStorageSCPRecreatesVanishedStorageDir:
+    """The storage folder is watched by a local PACS that imports what
+    lands in it and then deletes the emptied directory.  Without a retry
+    every image after that first import fails with ENOENT until the
+    service is restarted."""
+
+    def _event(self, sop_uid, written):
+        ds = MagicMock()
+        ds.SOPInstanceUID = sop_uid
+        ds.file_meta = MagicMock()
+
+        def save_as(path, **_kw):
+            if not os.path.isdir(os.path.dirname(path)):
+                raise FileNotFoundError(2, "No such file or directory", path)
+            open(path, "wb").close()
+            written.append(path)
+
+        ds.save_as = save_as
+        event = MagicMock()
+        event.dataset = ds
+        event.file_meta = MagicMock()
+        return event
+
+    def test_store_succeeds_after_directory_is_removed(self, qapp, tmp_path):
+        storage = tmp_path / "incoming"
+        scp = StorageSCP("TEST_AE", 11112, str(storage))
+        written = []
+
+        assert scp.handle_store(self._event("1.2.3", written)) == 0x0000
+        # Local PACS imports the file and takes the directory with it.
+        os.remove(written[0])
+        os.rmdir(storage)
+
+        assert scp.handle_store(self._event("1.2.4", written)) == 0x0000
+        assert scp.images_received == 2
+        assert storage.is_dir()
+
+
+class TestStorageSCPPreferredSyntax:
+    """The node's "Preferred Syntax" is the RECEIVER's preference, so it
+    only ever had a meaning for the built-in SCP — when the local PACS
+    receives, that negotiation happens on an association this app is not
+    part of.  It used to be stored and never read."""
+
+    def test_no_preference_keeps_the_default_order(self, qapp, tmp_path):
+        scp = StorageSCP("AE", 11112, str(tmp_path))
+        assert scp.transfer_syntaxes is storage_scp_module.STORAGE_TRANSFER_SYNTAXES
+
+    def test_preference_moves_to_the_front(self, qapp, tmp_path):
+        scp = StorageSCP("AE", 11112, str(tmp_path),
+                         preferred_syntax=ImplicitVRLittleEndian)
+        assert scp.transfer_syntaxes[0] == ImplicitVRLittleEndian
+
+    def test_other_syntaxes_are_kept_as_fallbacks(self, qapp, tmp_path):
+        """Choosing a syntax a given sender does not offer must degrade
+        to the default order, not fail the association."""
+        scp = StorageSCP("AE", 11112, str(tmp_path),
+                         preferred_syntax=ImplicitVRLittleEndian)
+        assert set(storage_scp_module.STORAGE_TRANSFER_SYNTAXES) <= set(
+            scp.transfer_syntaxes)
+        assert scp.transfer_syntaxes.count(ImplicitVRLittleEndian) == 1
+
+    def test_syntax_outside_the_default_list_is_honoured(self, qapp, tmp_path):
+        """The UI offers a few syntaxes the default order does not
+        enumerate — picking one must still take effect."""
+        jpeg_lossless = "1.2.840.10008.1.2.4.57"
+        scp = StorageSCP("AE", 11112, str(tmp_path),
+                         preferred_syntax=jpeg_lossless)
+        assert scp.transfer_syntaxes[0] == jpeg_lossless
+
+    def test_contexts_are_registered_with_the_preference(self, qapp, tmp_path):
+        scp = StorageSCP("AE", 11112, str(tmp_path),
+                         preferred_syntax=ImplicitVRLittleEndian)
+        with patch("core.storage_scp.AE") as ae_cls:
+            ae_instance = MagicMock()
+            ae_cls.return_value = ae_instance
+            scp.start()
+        for call in ae_instance.add_supported_context.call_args_list:
+            assert call.args[1][0] == ImplicitVRLittleEndian

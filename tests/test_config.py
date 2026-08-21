@@ -11,7 +11,8 @@ import pytest
 
 from core.config import (
     AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES, RETRIEVE_METHODS,
-    DEFAULT_CONFIG_FILE, get_local_ip, default_priority_terms,
+    DEFAULT_CONFIG_FILE, get_local_ip, local_ip_for,
+    default_priority_terms,
 )
 
 
@@ -686,3 +687,47 @@ class TestGetLocalIP:
         mock_sock.side_effect = OSError("Network unreachable")
         ip = get_local_ip()
         assert ip == "127.0.0.1"
+
+
+class TestLocalIPFor:
+    """``local_ip_for`` answers "which of MY addresses reaches that
+    host", which is not the same question ``get_local_ip`` answers (that
+    one always follows the default route).  A source PACS behind a VPN
+    is reached on the tunnel address, and the built-in SCP must bind
+    exactly that address to win over another process's wildcard bind."""
+
+    def test_returns_valid_ip_format(self):
+        parts = local_ip_for("8.8.8.8").split(".")
+        assert len(parts) == 4
+        assert all(p.isdigit() for p in parts)
+
+    def test_asks_the_route_to_the_given_host(self):
+        with patch("socket.socket") as mock_sock:
+            sock = mock_sock.return_value.__enter__.return_value
+            sock.getsockname.return_value = ("10.168.20.14", 51234)
+            assert local_ip_for("10.1.15.30") == "10.168.20.14"
+        sock.connect.assert_called_once()
+        assert sock.connect.call_args.args[0][0] == "10.1.15.30"
+
+    def test_falls_back_to_default_route_on_error(self):
+        """VPN down or a bad address must not crash the SCP startup —
+        fall back to the default-route address."""
+        with patch("core.config.socket.socket", side_effect=OSError("no route")):
+            with patch("core.config.get_local_ip", return_value="192.168.1.55"):
+                assert local_ip_for("10.1.15.30") == "192.168.1.55"
+
+
+class TestPacsNodeBuiltinReceiver:
+
+    def test_defaults_to_off(self):
+        assert PacsNode().receive_with_builtin_scp is False
+
+    def test_round_trips_through_dict(self):
+        node = PacsNode(name="tz", receive_with_builtin_scp=True)
+        assert node.to_dict()["receive_with_builtin_scp"] is True
+        assert PacsNode.from_dict(node.to_dict()).receive_with_builtin_scp is True
+
+    def test_missing_key_in_old_config_loads_as_off(self):
+        """Config files written before this field existed must still
+        load, with the built-in receiver disabled."""
+        assert PacsNode.from_dict({"name": "tz"}).receive_with_builtin_scp is False

@@ -45,8 +45,8 @@ from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtMultimedia import QSoundEffect
 
-from core.config import AppConfig, PacsNode
-from core.dicom_ops import DicomOperations
+from core.config import AppConfig, PacsNode, local_ip_for
+from core.dicom_ops import DicomOperations, TRANSFER_SYNTAXES
 from core.storage_scp import StorageSCP
 from core.transfer_engine import TransferEngine, TERMINAL_STATUSES
 from core.transfer_log import TransferLog, default_db_path
@@ -671,8 +671,23 @@ class MainWindow(QMainWindow):
             self._handle_unreachable_remote(remote_key, node)
             return
 
-        if not local_reachable and not self._ensure_fallback_scp(
-                remote_key, node):
+        # Three ways the receiving side can be arranged, in priority
+        # order:
+        #   1. the node explicitly wants the built-in SCP to receive
+        #      (``receive_with_builtin_scp``) -- regardless of whether
+        #      the local PACS answers, because the problem it solves is
+        #      a local PACS that answers fine but then rejects this
+        #      source's images;
+        #   2. the local PACS is unreachable -> classic fallback SCP;
+        #   3. nothing to do, C-MOVE goes straight to the local PACS.
+        if node.receive_with_builtin_scp:
+            scp_ready = self._ensure_builtin_receiver(remote_key, node)
+        elif not local_reachable:
+            scp_ready = self._ensure_fallback_scp(remote_key, node)
+        else:
+            scp_ready = True
+
+        if not scp_ready:
             # SCP startup failed (e.g. the local port is still
             # transiently bound during the restart window).  A watchdog
             # auto-restart must not die silently on "Stopped" — leave the
@@ -783,46 +798,93 @@ class MainWindow(QMainWindow):
         restore the queued start before every call just to survive that
         side effect; the caller owns them now.
         """
-        fallback = node.fallback_folder
-        if fallback:
-            storage_path = os.path.join(fallback, remote_key)
-            self._log(
-                f"Local PACS [{node.local_ae_title}:{node.local_port}] "
-                f"not reachable for {remote_key}. "
-                f"Starting built-in SCP — saving to: {storage_path}")
-            scp_key = (node.local_ae_title, node.local_port)
-            scp = StorageSCP(
-                node.local_ae_title,
-                node.local_port,
-                storage_path,
-            )
-            # Surface fallback-mode activity in the log — without
-            # this the user has no feedback that images actually
-            # land in the folder.  Throttled in the handler (first
-            # image, then every 25th).  The signal is emitted from
-            # the pynetdicom reactor thread; Qt.AutoConnection
-            # queues the slot onto the GUI thread.
-            scp.image_received.connect(
-                lambda count, k=scp_key:
-                    self._on_fallback_image_received(k, count))
-            try:
-                scp.start()
-            except RuntimeError as e:
-                # Port already in use, permission denied, etc.  Report
-                # the failure so the engine doesn't fire C-MOVEs at a
-                # dead local SCP, and surface it in the log instead of
-                # leaking the traceback to stderr.  Whether the queued
-                # start is dropped or retried is the caller's call.
-                self._log(
-                    f"Storage SCP startup failed for {remote_key}: "
-                    f"{e}. Engine not started.")
-                return False
-            self.storage_scps[scp_key] = scp
-        else:
+        if not node.fallback_folder:
             self._log(
                 f"Local PACS [{node.local_ae_title}:{node.local_port}] "
                 f"not reachable for {remote_key}. "
                 f"No fallback folder configured.")
+            return True
+        self._log(
+            f"Local PACS [{node.local_ae_title}:{node.local_port}] "
+            f"not reachable for {remote_key}. Starting built-in SCP.")
+        # Wildcard bind: the local PACS is down, so there is nothing to
+        # share the port with and images may arrive on any interface.
+        return self._start_builtin_scp(remote_key, node, "0.0.0.0")
+
+    def _ensure_builtin_receiver(self, remote_key: str,
+                                 node: PacsNode) -> bool:
+        """The node is configured to have the built-in SCP receive its
+        C-MOVE images even though the local PACS is up.
+
+        Binds the SCP to the interface address that reaches THIS source
+        rather than the wildcard, which is what lets it coexist with the
+        local PACS: a socket bound to a specific address wins over
+        another process's wildcard bind on the same port, so images from
+        this source land here while the local PACS keeps serving its own
+        address -- including the engine's local C-FIND, which is how it
+        knows what has already arrived.
+
+        Returns ``True`` when the caller may start the engine.
+        """
+        if not node.fallback_folder:
+            # Without a folder the received images would have nowhere to
+            # go.  Refuse rather than start an SCP that drops everything.
+            self._log(
+                f"{remote_key}: built-in receiver requested but no "
+                f"fallback folder configured — engine not started.")
+            return False
+        bind_address = local_ip_for(node.ip_address)
+        self._log(
+            f"{remote_key}: receiving C-MOVE images with the built-in "
+            f"SCP on {bind_address}:{node.local_port} "
+            f"[{node.local_ae_title}].")
+        return self._start_builtin_scp(remote_key, node, bind_address)
+
+    def _start_builtin_scp(self, remote_key: str, node: PacsNode,
+                           bind_address: str) -> bool:
+        """Create, wire up and start a built-in StorageSCP for *node*.
+
+        Shared by the unreachable-local fallback and the explicit
+        built-in-receiver path; they differ only in *bind_address* and
+        in what they log beforehand.  Returns ``False`` when the bind
+        failed, in which case the caller must not start the engine.
+        """
+        storage_path = os.path.join(node.fallback_folder, remote_key)
+        scp_key = (node.local_ae_title, node.local_port)
+        scp = StorageSCP(
+            node.local_ae_title,
+            node.local_port,
+            storage_path,
+            bind_address=bind_address,
+            # The node's "Preferred Syntax" is the receiving side's
+            # preference, so it only ever had a meaning for the built-in
+            # SCP -- when the local PACS receives, that negotiation
+            # happens on an association this app is not part of.
+            # Unknown names fall through to None, i.e. the default order.
+            preferred_syntax=TRANSFER_SYNTAXES.get(node.local_syntax),
+        )
+        # Surface built-in-SCP activity in the log — without this the
+        # user has no feedback that images actually land in the folder.
+        # Throttled in the handler (first image, then every 25th).  The
+        # signal is emitted from the pynetdicom reactor thread;
+        # Qt.AutoConnection queues the slot onto the GUI thread.
+        scp.image_received.connect(
+            lambda count, k=scp_key:
+                self._on_fallback_image_received(k, count))
+        try:
+            scp.start()
+        except RuntimeError as e:
+            # Port already in use, permission denied, etc.  Report the
+            # failure so the engine doesn't fire C-MOVEs at a dead local
+            # SCP, and surface it in the log instead of leaking the
+            # traceback to stderr.  Whether the queued start is dropped
+            # or retried is the caller's call.
+            self._log(
+                f"Storage SCP startup failed for {remote_key}: "
+                f"{e}. Engine not started.")
+            return False
+        self.storage_scps[scp_key] = scp
+        self._log(f"Images for {remote_key} are saved to: {storage_path}")
         return True
 
     def _show_awaiting_pacs(self, remote_key: str) -> None:

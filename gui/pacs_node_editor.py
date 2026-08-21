@@ -16,8 +16,8 @@ from typing import Optional
 
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QSpinBox, QWidget,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QSpinBox, QWidget,
 )
 
 from core.config import PacsNode, TRANSFER_SYNTAXES_NAMES
@@ -100,6 +100,15 @@ class PacsNodeEditor(QWidget):
 
         self.local_syntax_combo = QComboBox()
         self.local_syntax_combo.addItems(TRANSFER_SYNTAXES_NAMES)
+        self.local_syntax_combo.setToolTip(
+            "Transfer syntax the RECEIVER asks for. It only takes effect "
+            "with \"Receive C-MOVE images with the built-in SCP\" below — "
+            "when the local PACS receives, that is negotiated on an "
+            "association DICOM Sync is not part of.\n\n"
+            "Leave this on a lossless compressed syntax unless you know "
+            "the source PACS is well behaved: some send JPEG 2000 pixel "
+            "data whatever was negotiated, and picking an uncompressed "
+            "syntax from those makes every image arrive mislabelled.")
         layout.addRow("Preferred Syntax:", self.local_syntax_combo)
 
         self.fallback_edit = QLineEdit()
@@ -115,6 +124,20 @@ class PacsNodeEditor(QWidget):
         fb_widget = QWidget()
         fb_widget.setLayout(fb_layout)
         layout.addRow("Fallback Folder:", fb_widget)
+
+        self.builtin_receiver_check = QCheckBox(
+            "Receive C-MOVE images with the built-in SCP")
+        self.builtin_receiver_check.setToolTip(
+            "Take delivery of this source's images in DICOM Sync instead "
+            "of letting them go to the local PACS, and store them in the "
+            "fallback folder above (where the local PACS picks them up).\n\n"
+            "Switch this on when the local PACS is reachable but still "
+            "fails every C-MOVE from this source — some PACS send "
+            "JPEG 2000 pixel data no matter which transfer syntax was "
+            "negotiated, and a receiver that accepts an uncompressed "
+            "syntax then rejects every image.\n\n"
+            "Requires a fallback folder.")
+        layout.addRow("", self.builtin_receiver_check)
 
     def _build_sound_section(self, layout: QFormLayout) -> None:
         # ── Notification sound ──
@@ -185,6 +208,8 @@ class PacsNodeEditor(QWidget):
         self.local_ae_edit.setText(node.local_ae_title)
         self.local_port_spin.setValue(node.local_port)
         self.fallback_edit.setText(node.fallback_folder)
+        self.builtin_receiver_check.setChecked(
+            node.receive_with_builtin_scp)
         self.notification_sound_edit.setText(node.notification_sound_path)
 
     def get_node(self, base: Optional[PacsNode] = None) -> PacsNode:
@@ -213,6 +238,8 @@ class PacsNodeEditor(QWidget):
             local_port=self.local_port_spin.value(),
             local_syntax=self.local_syntax_combo.currentText(),
             fallback_folder=self.fallback_edit.text().strip(),
+            receive_with_builtin_scp=(
+                self.builtin_receiver_check.isChecked()),
             notification_sound_path=self.notification_sound_edit.text().strip(),
             notification_sound_enabled=(base.notification_sound_enabled
                                         if base is not None else True),
@@ -235,6 +262,7 @@ class PacsNodeEditor(QWidget):
         self.local_port_spin.setValue(11112)
         self.local_syntax_combo.setCurrentIndex(0)
         self.fallback_edit.clear()
+        self.builtin_receiver_check.setChecked(False)
         self.notification_sound_edit.clear()
 
     def has_minimum_data(self) -> bool:

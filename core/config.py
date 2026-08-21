@@ -71,6 +71,32 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def local_ip_for(host: str) -> str:
+    """Return the local interface address the kernel would use to reach
+    *host* -- which is NOT necessarily the address ``get_local_ip()``
+    reports.
+
+    ``get_local_ip()`` asks the route to 8.8.8.8, i.e. the default
+    route, so on this machine it answers with the LAN address.  A source
+    PACS reached through a VPN tunnel is a different route entirely and
+    arrives on the tunnel address.  ``receive_with_builtin_scp`` needs
+    that tunnel address: a C-STORE coming back from such a PACS is
+    addressed to it, and only a socket bound to exactly that address
+    takes precedence over another process holding the wildcard bind on
+    the same port.
+
+    Uses a connectionless UDP socket, so nothing is actually sent and
+    the PACS never sees it.  Falls back to ``get_local_ip()`` when the
+    route cannot be resolved (VPN down, bad address).
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((host, 9))  # discard port; no packet leaves
+            return s.getsockname()[0]
+    except Exception:
+        return get_local_ip()
+
+
 @dataclass(eq=False)
 class PacsNode:
     """Represents a source PACS node with per-source service *and* local
@@ -105,6 +131,26 @@ class PacsNode:
     local_port: int = DEFAULT_LOCAL_PORT
     local_syntax: str = DEFAULT_TRANSFER_SYNTAX
     fallback_folder: str = ""
+    # Receive this source's C-MOVE images with the BUILT-IN Storage SCP
+    # instead of letting them go to the local PACS -- even when that
+    # PACS is perfectly reachable (which is what separates this from the
+    # ``fallback_folder`` path).
+    #
+    # Needed when the local PACS cannot be trusted as a C-STORE target
+    # for this particular source.  Seen in the field: a PACS that sends
+    # JPEG 2000 pixel data whatever transfer syntax was negotiated, and
+    # a DCMTK-based local PACS that picks the uncompressed syntax out of
+    # what that source offers -- every image then arrives mislabelled
+    # and is rejected, so every C-MOVE reports 0 completed / N failed.
+    # The built-in SCP negotiates the compressed syntax (see
+    # STORAGE_TRANSFER_SYNTAXES) and writes conformant files into
+    # ``fallback_folder``, where the local PACS picks them up.
+    #
+    # The SCP binds ONLY the interface address that reaches this source
+    # (see ``local_ip_for``), so the local PACS keeps serving its own
+    # address and port for everything else, including the engine's
+    # local C-FIND.
+    receive_with_builtin_scp: bool = False
     notification_sound_enabled: bool = True
     notification_sound_path: str = ""
     # Per-source ordered list of {"term": str, "is_regex": bool}.
@@ -138,6 +184,7 @@ class PacsNode:
             "local_port": self.local_port,
             "local_syntax": self.local_syntax,
             "fallback_folder": self.fallback_folder,
+            "receive_with_builtin_scp": self.receive_with_builtin_scp,
             "notification_sound_enabled": self.notification_sound_enabled,
             "notification_sound_path": self.notification_sound_path,
             # Deep-copy entry dicts so callers can mutate the result
@@ -162,6 +209,8 @@ class PacsNode:
             local_port=data.get("local_port", DEFAULT_LOCAL_PORT),
             local_syntax=data.get("local_syntax", DEFAULT_TRANSFER_SYNTAX),
             fallback_folder=data.get("fallback_folder", ""),
+            receive_with_builtin_scp=bool(
+                data.get("receive_with_builtin_scp", False)),
             notification_sound_enabled=data.get("notification_sound_enabled", True),
             notification_sound_path=data.get("notification_sound_path", ""),
             # Missing key → bundled defaults (legacy migration).
