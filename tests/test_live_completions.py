@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
 )
 
 from core.transfer_engine import TransferEngine, SeriesJob
-from gui.live_completions import LiveCompletionsWindow
+from gui.live_completions import (
+    LiveCompletionsWindow, fold_row_totals,
+)
 from gui.main_window import MainWindow
 from core.config import AppConfig, PacsNode
 
@@ -2054,3 +2056,49 @@ class TestRowCap:
     def test_under_the_cap_nothing_is_dropped(self, window):
         self._add(window, 20)
         assert window.completions_table.rowCount() == 20
+
+
+class TestFoldRowTotals:
+    """The cumulative-vs-additive rule decides what the user reads off
+    the Images and Duration columns; getting the mode wrong silently
+    doubles or halves it."""
+
+    def test_cumulative_replaces_rather_than_adds(self):
+        """The engine re-emits a study's RUNNING totals, so adding them
+        would double-count every straggler wave."""
+        assert fold_row_totals(100, 50.0, 140, 70.0,
+                               cumulative=True) == (140, 70.0)
+
+    def test_cumulative_never_shrinks_a_row(self):
+        """A no-op re-query re-emits a smaller count; letting it through
+        would shrink a row that already recorded the full study."""
+        assert fold_row_totals(140, 70.0, 8, 3.0,
+                               cumulative=True) == (140, 70.0)
+
+    def test_cumulative_with_no_new_duration_keeps_the_old(self):
+        images, duration = fold_row_totals(
+            140, 70.0, 200, None, cumulative=True)
+        assert (images, duration) == (200, 70.0)
+
+    def test_additive_mode_sums(self):
+        assert fold_row_totals(100, 50.0, 40, 20.0,
+                               cumulative=False) == (140, 70.0)
+
+    def test_none_contributes_nothing_in_additive_mode(self):
+        assert fold_row_totals(100, 50.0, None, None,
+                               cumulative=False) == (100, 50.0)
+
+    def test_empty_row_starts_from_zero(self):
+        assert fold_row_totals(0, 0.0, 12, 4.5,
+                               cumulative=True) == (12, 4.5)
+
+
+class TestAnnotationsResolve:
+    """The app is built on Python 3.12 in CI, where annotations are
+    evaluated at definition time — a missing typing import is a hard
+    NameError there but invisible on 3.14 (PEP 649)."""
+
+    def test_fold_row_totals_hints_resolve(self):
+        import typing
+        import gui.live_completions as module
+        typing.get_type_hints(module.fold_row_totals)

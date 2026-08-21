@@ -7,7 +7,7 @@ and the delay between acquisition and download with color coding.
 """
 
 from datetime import datetime, timedelta
-from typing import Dict, NamedTuple, Optional
+from typing import Dict, NamedTuple, Optional, Tuple
 
 from core.dicom_time import format_duration, parse_time
 from core.stats_utils import median, median_and_pstdev
@@ -180,6 +180,38 @@ class _DateTimeItem(QTableWidgetItem):
         if own is not None and their is not None:
             return own < their
         return super().__lt__(other)
+
+
+def fold_row_totals(existing_images: int, existing_duration: float,
+                    new_images: Optional[int],
+                    new_duration: Optional[float],
+                    cumulative: bool) -> Tuple[int, float]:
+    """Fold a repeat completion into a row's running totals.
+
+    Returns ``(images, duration_seconds)``.
+
+    Two modes, and mixing them up silently doubles or halves what the
+    user sees, which is why the rule lives here as a pure function
+    rather than inline among the cell writes:
+
+    * ``cumulative=True`` — what the application always passes.  The
+      transfer engine re-emits a study's RUNNING TOTALS whenever new
+      images arrive, so the values replace the row's totals.  The
+      larger of old and new wins: a no-op re-query re-emits a smaller
+      (or absent) count, and letting that through would shrink a row
+      that had already recorded the full study.
+    * ``cumulative=False`` — the legacy / unit-test path, where the
+      caller passes a delta that is ADDED to the running totals.
+
+    ``None`` means "no value in this emit" and contributes nothing in
+    either mode.
+    """
+    if cumulative:
+        duration = (max(existing_duration, new_duration)
+                    if new_duration is not None else existing_duration)
+        return max(existing_images, new_images or 0), duration
+    return (existing_images + (new_images or 0),
+            existing_duration + (new_duration or 0.0))
 
 
 class LiveCompletionsWindow(QWidget):
@@ -393,18 +425,9 @@ class LiveCompletionsWindow(QWidget):
         if study_uid is not None:
             existing_row = self._find_row_by_study_uid(study_uid, source)
             if existing_row >= 0:
-                # Cumulative cutoff: skip the update if the running
-                # total would still be below the threshold (rare —
-                # if the row already passed the cutoff once, adding
-                # to it keeps it above).
-                if min_images_threshold is not None:
-                    # No None-guard on the item: the row came from
-                    # _insert_new_row, which fills every cell.
-                    existing = self.completions_table.item(
-                        existing_row, _COL_IMAGES).data(Qt.UserRole) or 0
-                    if (existing + (image_count or 0)
-                            < min_images_threshold):
-                        return
+                if self._below_cumulative_threshold(
+                        existing_row, image_count, min_images_threshold):
+                    return
                 self._update_existing_row(
                     existing_row,
                     formatted_comp=timing.formatted_comp,
@@ -434,6 +457,28 @@ class LiveCompletionsWindow(QWidget):
 
         self._enforce_row_cap()
         self._update_stats()
+
+    def _below_cumulative_threshold(
+            self, row: int, image_count: Optional[int],
+            threshold: Optional[int]) -> bool:
+        """Whether folding *image_count* into *row* would still leave
+        the study below *threshold*.
+
+        Rare in practice: once a row has passed the cutoff, adding to
+        it keeps it above.  It matters for the first wave — an 8-image
+        emit must not create a row that a later 50-image emit would
+        then have to merge into.
+
+        No None-guard on the item: the row came from
+        ``_insert_new_row``, which fills every cell.  A missing item
+        would be a bug in the insert path, and papering over it would
+        hide the broken row instead of surfacing it.
+        """
+        if threshold is None:
+            return False
+        existing = self.completions_table.item(
+            row, _COL_IMAGES).data(Qt.UserRole) or 0
+        return existing + (image_count or 0) < threshold
 
     def _insert_new_row(self, *, timing: _RowTiming,
                         study_uid: Optional[str],
@@ -607,19 +652,11 @@ class LiveCompletionsWindow(QWidget):
         t.setSortingEnabled(False)
 
         dur_item = t.item(row, _COL_DURATION)
-        existing_dur = dur_item.data(Qt.UserRole) or 0.0
         img_item = t.item(row, _COL_IMAGES)
-        existing_images = img_item.data(Qt.UserRole) or 0
-        if cumulative:
-            # Caller passes running totals — replace, don't add.  A
-            # re-emit with a smaller/absent value (e.g. a no-op re-query)
-            # must not shrink the row, so keep the larger of the two.
-            total_dur = (max(existing_dur, new_duration)
-                         if new_duration is not None else existing_dur)
-            total_images = max(existing_images, new_image_count or 0)
-        else:
-            total_dur = existing_dur + (new_duration or 0.0)
-            total_images = existing_images + (new_image_count or 0)
+        total_images, total_dur = fold_row_totals(
+            img_item.data(Qt.UserRole) or 0,
+            dur_item.data(Qt.UserRole) or 0.0,
+            new_image_count, new_duration, cumulative)
 
         texts = self._format_row_strings(
             total_images if total_images > 0 else None,
@@ -720,15 +757,27 @@ class LiveCompletionsWindow(QWidget):
             med, stddev = median_and_pstdev([v for _, v in items])
             if stddev < 0.001:
                 continue
-            high = med + _STDDEV_BAND_MULTIPLIER * stddev
-            low = med - _STDDEV_BAND_MULTIPLIER * stddev
-            for item, v in items:
-                if v > high:
-                    item.setForeground(QBrush(_RED))
-                elif v < low:
-                    item.setForeground(QBrush(_GREEN))
-                else:
-                    item.setForeground(QBrush(QColor("white")))
+            self._paint_band(
+                items,
+                low=med - _STDDEV_BAND_MULTIPLIER * stddev,
+                high=med + _STDDEV_BAND_MULTIPLIER * stddev)
+
+    @staticmethod
+    def _paint_band(items: list, *, low: float, high: float) -> None:
+        """Colour each ``(item, value)`` red above *high*, green below
+        *low*, white in between.
+
+        White rather than "leave as is": the same cell may have been
+        painted by an earlier pass with different band edges, and not
+        resetting it would leave stale colouring behind.
+        """
+        for item, value in items:
+            if value > high:
+                item.setForeground(QBrush(_RED))
+            elif value < low:
+                item.setForeground(QBrush(_GREEN))
+            else:
+                item.setForeground(QBrush(QColor("white")))
 
     def update_transfer_progress(self, pending_images: int,
                                  images_per_minute: float) -> None:

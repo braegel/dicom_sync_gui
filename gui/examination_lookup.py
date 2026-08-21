@@ -95,22 +95,21 @@ class ExaminationLookupDialog(QDialog):
         # lands so a double-click can't start overlapping searches.
         self.btn_search.setEnabled(False)
 
-        def job():
-            log = TransferLog(self._db_path)
-            try:
-                results = log.query_series(**kw)
-                # Compute baseline mbps stats in SQL (one round trip)
-                # instead of dragging the full series table into Python.
-                baseline = log.mbps_stats() if results else None
-                return results, baseline
-            except Exception:
-                # Tagged empty result instead of raising: on_done is
-                # only called on success, and a dropped callback would
-                # leave the Search button disabled forever.
-                logger.exception("Examination lookup query failed")
-                return [], None
-            finally:
-                log.close()
+        def job() -> tuple[list[dict], dict | None]:
+            with TransferLog(self._db_path) as log:
+                try:
+                    results = log.query_series(**kw)
+                    # Compute baseline mbps stats in SQL (one round
+                    # trip) instead of dragging the full series table
+                    # into Python.
+                    baseline = log.mbps_stats() if results else None
+                    return results, baseline
+                except Exception:
+                    # Tagged empty result instead of raising: on_done
+                    # is only called on success, and a dropped callback
+                    # would leave the Search button disabled forever.
+                    logger.exception("Examination lookup query failed")
+                    return [], None
 
         run_in_background(self, job, self._on_search_results,
                           label="exam_lookup")

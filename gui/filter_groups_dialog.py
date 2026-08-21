@@ -12,7 +12,7 @@ Workflow:
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QWidget,
@@ -527,7 +527,9 @@ class FilterGroupsDialog(QDialog):
         self._refresh_group_list()
         self._refresh_institution_tree()
 
-    def _peek_import_file(self, path: str):
+    def _peek_import_file(
+            self, path: str
+    ) -> Optional[Tuple[List[str], Dict[str, str]]]:
         """Read + parse the import file and validate it is non-empty.
 
         Returns ``(imported_groups, imported_assignments)`` on success,

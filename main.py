@@ -41,23 +41,34 @@ def _log_file_path() -> str:
     return os.path.join(log_dir, "dicom_sync_gui.log")
 
 
-# Setup logging before imports.  Rotating handler because the app
-# runs 24/7 as a service — an unbounded plain FileHandler would grow
-# the log file without limit on the host.
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler(
-            _log_file_path(),
-            maxBytes=2 * 1024 * 1024,  # 2 MB per file
-            backupCount=3,             # keep ~8 MB of history
-        ),
-    ]
-)
 logger = logging.getLogger("dicom_sync")
+
+
+def _setup_logging() -> None:
+    """Install the console + rotating-file handlers.
+
+    Called from ``main()``, NOT at import time.  It creates a directory
+    and opens a file, and an import must not do either — importing this
+    module to read ``__version__`` (the PyInstaller spec does) or to
+    run a unit test would otherwise leave a log directory behind on the
+    machine doing it.
+
+    Rotating handler because the app runs 24/7 as a service; an
+    unbounded plain FileHandler would grow without limit on the host.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.StreamHandler(),
+            logging.handlers.RotatingFileHandler(
+                _log_file_path(),
+                maxBytes=2 * 1024 * 1024,  # 2 MB per file
+                backupCount=3,             # keep ~8 MB of history
+            ),
+        ]
+    )
 
 # Interpreter range the GC workaround in ``_configure_gc`` applies to.
 # 3.14 introduced the incremental collector that races PySide's
@@ -148,6 +159,7 @@ def _configure_gc(app: "QApplication") -> None:
 
 
 def main() -> None:
+    _setup_logging()
     check_dependencies()
 
     from PySide6.QtWidgets import QApplication

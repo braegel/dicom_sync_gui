@@ -234,7 +234,7 @@ class TransferStatsWindow(QWidget):
     def _on_refresh_clicked(self) -> None:
         """Re-enumerate the filter combos from the full log on a
         worker thread, then refresh the views."""
-        def job():
+        def job() -> list[dict]:
             try:
                 return self._log.query_series()
             except Exception:
@@ -304,7 +304,7 @@ class TransferStatsWindow(QWidget):
         self._refresh_seq += 1
         seq = self._refresh_seq
 
-        def job():
+        def job() -> tuple[list[dict], list[dict]]:
             try:
                 series = self._log.query_series(**kw)
                 studies = self._log.query_studies(**kw)

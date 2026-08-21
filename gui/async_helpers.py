@@ -86,7 +86,7 @@ def run_in_background(owner: QObject,
     weak_owner = weakref.ref(owner)
     relay = _CallbackRelay(on_done, owner)
 
-    def run():
+    def run() -> None:
         try:
             result = job()
         except Exception as e:
