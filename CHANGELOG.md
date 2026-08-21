@@ -2,6 +2,60 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.5.1] — 2026-08-21
+
+Maintenance release from a full-project code review (21 findings).  Two
+of them were real defects; the rest is technical debt paid off without
+any change in behaviour.
+
+### Fixed
+- **Prior studies were silently discarded when the modality filter was
+  on.** `ModalitiesInStudy` arrives from pydicom as a `MultiValue` when
+  a study has more than one modality, and stringifying it yields
+  `"['CT', 'SR']"` — so the split produced the tokens `['CT'` and
+  `'SR']` and nothing ever matched.  A current study with two
+  modalities (the common case: `SR\CT`) therefore threw away EVERY
+  prior.  Single-modality studies worked, which is why it went
+  unnoticed.
+- **The dashboard's queue-status helpers were dead code that made the
+  test suite lie.**  `_status_text` / `_status_color` were defined
+  twice in the same class; the second pair silently shadowed the
+  delegation to `gui.queue_table`.  Nothing in the app called either
+  copy, but the tests did — so a regression in the code that actually
+  renders the queue would have passed.  The queue's status colours are
+  covered for the first time.
+
+### Changed
+- The **debounced config autosave no longer runs on the GUI thread.**
+  `save()` fsyncs, and doing that inside a Qt slot stalled the event
+  loop for the length of the disk write.  Writes now happen on a
+  background thread from a snapshot, coalescing bursts to a single
+  write of the final state.
+- **The transfer log's lookup columns are indexed.**  Measured on a
+  58 757-row log: a patient lookup drops from 8.7 ms to 0.0 ms, the
+  median scan from 28.2 ms to 9.7 ms.  `source_pacs` and `modality` are
+  deliberately left unindexed — measured at 112.9 ms → 114.5 ms, i.e.
+  no gain, because they match most of the table.
+- The engine's **inter-cycle wait blocks on the cancel event** instead
+  of polling it once a second, so Stop takes effect immediately.
+- Shutdown now **closes the shared SQLite connection** (checkpointing
+  the WAL) and **destroys outgoing dashboards explicitly** — with the
+  cyclic GC disabled on Python 3.14+, a detached dashboard caught in a
+  reference cycle kept five QTimers running for the rest of the
+  session.
+
+### Internal
+- New pure, Qt-free modules `core/prior_studies.py` and
+  `core/institution_filter.py`, following the pattern of
+  `core.queue_planner`.
+- Every remaining missing type annotation filled in (40), and verified
+  to *resolve* rather than merely parse — Python 3.14 defers annotation
+  evaluation, so a missing typing import is invisible here but a hard
+  `NameError` on the Python 3.12 the release DMG is built with.
+- No function nests deeper than three levels; the deprecated
+  `gui.dashboard` re-export blocks are gone.
+- 1233 tests (was 1178).
+
 ## [1.5.0] — 2026-08-21
 
 A source PACS that sends JPEG 2000 pixel data no matter what was
