@@ -25,9 +25,14 @@ jobs:
       matrix:
         include:
           # PyInstaller cannot cross-compile, so each architecture needs
-          # a native runner.  macos-13 is the last Intel image GitHub
-          # offers; the unversioned label tracks Apple Silicon.
-          - runner: macos-13
+          # a native runner.  Intel needs an explicit "-intel" label --
+          # the plain and "latest" macOS labels are all Apple Silicon
+          # now, and the old macos-13 image has been retired (a job
+          # asking for it queues forever rather than failing).
+          # macos-15-intel over macos-26-intel deliberately: the Intel
+          # build exists for older Macs, and an older SDK keeps it
+          # runnable on the older systems those tend to be on.
+          - runner: macos-15-intel
             arch: x86_64
           - runner: macos-latest
             arch: arm64
