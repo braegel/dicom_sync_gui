@@ -188,3 +188,31 @@ class PendingRestart:
 
     params: Any
     is_auto: bool = False
+
+
+# What a dashboard should do when a pending Restart can finally be
+# acted on.  Two call sites reach that point — the engine reporting it
+# has stopped, and the safety timer firing because it never did — and
+# they used to re-implement the same three-way branch independently.
+RESUME = "resume"        # bring the service back up with the snapshot
+CANCEL_SOURCE_GONE = "cancelled"   # source was deleted meanwhile
+NOTHING_PENDING = "none"           # no Restart was waiting
+
+
+def resolve_pending_restart(pending: Optional["PendingRestart"],
+                            source_exists: bool) -> str:
+    """Decide what to do with *pending* now that the engine is idle.
+
+    Returns one of ``RESUME`` / ``CANCEL_SOURCE_GONE`` /
+    ``NOTHING_PENDING``.
+
+    The source-removed case is its own outcome rather than a silent
+    ``RESUME``: MainWindow drops a ``start_requested`` for a source
+    that no longer exists, which would leave the user staring at a
+    half-finished restart with no explanation.
+    """
+    if pending is None:
+        return NOTHING_PENDING
+    if not source_exists:
+        return CANCEL_SOURCE_GONE
+    return RESUME

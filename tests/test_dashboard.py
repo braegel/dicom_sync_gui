@@ -557,12 +557,12 @@ class TestSeriesLevelWatchdog:
 
     def test_overran_but_progressing_does_not_restart(self):
         import time as _t
-        from gui.dashboard import _WATCHDOG_NO_PROGRESS_S
+        from gui.service_watchdog import WATCHDOG_NO_PROGRESS_S
         self.dashboard._active.series_uid = "u1"
         # Past the deadline, but progress arrived recently → still alive.
         self.dashboard._active.deadline_ts = _t.monotonic() - 10.0
         self.dashboard._active.last_progress_ts = (
-            _t.monotonic() - (_WATCHDOG_NO_PROGRESS_S / 2))
+            _t.monotonic() - (WATCHDOG_NO_PROGRESS_S / 2))
         with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
                 patch.object(self.dashboard, "_play_sound"):
             self.dashboard._on_slow_transfer_detected()
@@ -570,12 +570,12 @@ class TestSeriesLevelWatchdog:
 
     def test_overran_and_no_progress_restarts(self):
         import time as _t
-        from gui.dashboard import _WATCHDOG_NO_PROGRESS_S
+        from gui.service_watchdog import WATCHDOG_NO_PROGRESS_S
         self.dashboard._active.series_uid = "u1"
         # Past the deadline AND no progress for well over the threshold.
         self.dashboard._active.deadline_ts = _t.monotonic() - 10.0
         self.dashboard._active.last_progress_ts = (
-            _t.monotonic() - (_WATCHDOG_NO_PROGRESS_S + 30))
+            _t.monotonic() - (WATCHDOG_NO_PROGRESS_S + 30))
         with patch.object(self.dashboard, "_on_restart_clicked") as restart, \
                 patch.object(self.dashboard, "_play_sound"), \
                 patch.object(self.dashboard, "_show_slow_transfer_notice"):
@@ -592,14 +592,14 @@ class TestSeriesLevelWatchdog:
     def test_large_series_gets_generous_deadline(self):
         """A 300-image series must get a deadline far beyond the old 10s
         — proportional to size when a rate is known, else the min floor."""
-        from gui.dashboard import (
-            _WATCHDOG_MIN_DEADLINE_S, _WATCHDOG_MAX_DEADLINE_S)
+        from gui.service_watchdog import (
+            WATCHDOG_MIN_DEADLINE_S, WATCHDOG_MAX_DEADLINE_S)
         info = {"patient_name": "P", "series_description": "AX 3D",
                 "modality": "MR", "series_uid": "u1",
                 "remote_count": 300, "local_count": 0}
         deadline = self.dashboard._series_deadline_s(info)
-        assert deadline >= _WATCHDOG_MIN_DEADLINE_S
-        assert deadline <= _WATCHDOG_MAX_DEADLINE_S
+        assert deadline >= WATCHDOG_MIN_DEADLINE_S
+        assert deadline <= WATCHDOG_MAX_DEADLINE_S
 
 
 class TestIncrementalQueueUpdate:
@@ -1577,14 +1577,14 @@ class TestSadSoundGeneration:
 
     def test_sad_flag_accepted(self):
         """_generate_default_sound accepts sad parameter."""
-        from gui.dashboard import _generate_default_sound
+        from gui.notification_sound import _generate_default_sound
         path = _generate_default_sound(sad=False)
         assert path.endswith(".wav")
         assert os.path.exists(path)
 
     def test_sad_and_normal_produce_different_files(self):
         """sad=True and sad=False should produce different WAV data."""
-        from gui.dashboard import _generate_default_sound
+        from gui.notification_sound import _generate_default_sound
         import gui.dashboard as mod
         # Clear cache to force regeneration
         mod._default_sound_path = None
@@ -1601,13 +1601,14 @@ class TestSadSoundGeneration:
     def test_sad_sound_second_tone_lower(self):
         """In sad mode, the second tone should be lower than 880 Hz (A5),
         creating a descending interval instead of ascending."""
-        from gui.dashboard import _generate_default_sound, _SAD_FREQ_2
+        from gui.notification_sound import (
+            _generate_default_sound, _SAD_FREQ_2)
         assert _SAD_FREQ_2 < 880, (
             f"Sad second tone ({_SAD_FREQ_2} Hz) should be below A5 (880 Hz)")
 
     def test_normal_sound_second_tone_higher(self):
         """In normal mode, the second tone should be higher than 880 Hz."""
-        from gui.dashboard import _NORMAL_FREQ_2
+        from gui.notification_sound import _NORMAL_FREQ_2
         assert _NORMAL_FREQ_2 > 880, (
             f"Normal second tone ({_NORMAL_FREQ_2} Hz) should be above A5 (880 Hz)")
 

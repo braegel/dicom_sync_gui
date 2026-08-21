@@ -11,6 +11,8 @@ the widget's use of them.
 import pytest
 
 from gui.service_watchdog import (
+    CANCEL_SOURCE_GONE, NOTHING_PENDING, RESUME,
+    resolve_pending_restart,
     WATCHDOG_MAX_DEADLINE_S, WATCHDOG_MIN_DEADLINE_S,
     WATCHDOG_NO_PROGRESS_S, ActiveTransfer, PendingRestart,
     pending_images_of, series_deadline_s,
@@ -191,3 +193,27 @@ class TestPendingRestart:
 
     def test_defaults_to_a_manual_restart(self):
         assert PendingRestart(params=None).is_auto is False
+
+
+class TestResolvePendingRestart:
+    """Two call sites reach the "engine is idle, act on the pending
+    Restart" point — the service_stopped callback and the safety timer.
+    They used to carry a copy of this branch each."""
+
+    def test_nothing_pending(self):
+        assert resolve_pending_restart(None, True) == NOTHING_PENDING
+
+    def test_nothing_pending_wins_over_a_missing_source(self):
+        assert resolve_pending_restart(None, False) == NOTHING_PENDING
+
+    def test_resume_when_the_source_still_exists(self):
+        pending = PendingRestart(params=object(), is_auto=False)
+        assert resolve_pending_restart(pending, True) == RESUME
+
+    def test_cancelled_when_the_source_was_removed(self):
+        """MainWindow drops a start_requested for a source that no
+        longer exists, so this must be its own outcome rather than a
+        silent resume that never happens."""
+        pending = PendingRestart(params=object(), is_auto=True)
+        assert resolve_pending_restart(
+            pending, False) == CANCEL_SOURCE_GONE

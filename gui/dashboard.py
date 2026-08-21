@@ -10,10 +10,10 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QAction
+from PySide6.QtGui import QFont, QAction
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QGridLayout,
@@ -23,36 +23,28 @@ from PySide6.QtWidgets import (
 
 from core.i18n import tr
 from core.transfer_engine import TERMINAL_STATUSES, TransferStats
-# DEPRECATED re-exports.  The WAV synthesis moved to
-# gui.notification_sound and the study-rate logic to gui.study_rate;
-# these names stay importable from gui.dashboard only so existing call
-# sites and tests keep working.  New code must import from the owning
-# module.  Removable once no importer outside this file refers to them.
-from gui.notification_sound import (  # noqa: F401  (deprecated re-exports)
-    _NORMAL_FREQ_2, _SAD_FREQ_2, _generate_default_sound,
-)
+from gui.notification_sound import _generate_default_sound
 from gui import queue_table
 from gui.queue_table import QueueTableView
-from gui.service_watchdog import (  # noqa: F401  (constants re-exported)
-    WATCHDOG_DURATION_FACTOR as _WATCHDOG_DURATION_FACTOR,
-    WATCHDOG_MAX_DEADLINE_S as _WATCHDOG_MAX_DEADLINE_S,
-    WATCHDOG_MIN_DEADLINE_S as _WATCHDOG_MIN_DEADLINE_S,
-    WATCHDOG_NO_PROGRESS_S as _WATCHDOG_NO_PROGRESS_S,
-    WATCHDOG_POLL_MS as _WATCHDOG_POLL_MS,
+from gui.service_watchdog import (
+    WATCHDOG_POLL_MS,
     ActiveTransfer, PendingRestart, pending_images_of,
-    series_deadline_s,
+    resolve_pending_restart, series_deadline_s,
+    CANCEL_SOURCE_GONE, RESUME,
 )
-from gui.study_rate import (  # noqa: F401  (deprecated re-exports)
-    COLOR_GREEN, COLOR_RED, COLOR_YELLOW,
-    STUDY_RATE_GOOD_MAX, STUDY_RATE_HIGH_LOAD, STUDY_RATE_WARN_MAX,
+from gui.study_rate import (
+    COLOR_GREEN, COLOR_RED, STUDY_RATE_HIGH_LOAD,
     compute_study_rates, study_rate_color,
 )
 from gui.styles import (
     BTN_AMBER, BTN_BLUE, BTN_DOWNLOAD_SELECTED, BTN_START, BTN_STOP,
-    COLOR_MUTED, COLOR_ORANGE, LBL_RESTART_BANNER, STAT_BG_BAD,
-    STAT_BG_GOOD, SURFACE_BG, TEXT_DEFAULT, TOOLBTN_FILTER,
+    COLOR_ORANGE, LBL_RESTART_BANNER, STAT_BG_BAD,
+    STAT_BG_GOOD, SURFACE_BG, TOOLBTN_FILTER,
     stat_label_style,
 )
+
+if TYPE_CHECKING:  # annotation only
+    from core.config import PacsNode
 
 logger = logging.getLogger("dicom_sync")
 
@@ -260,15 +252,15 @@ class SourceDashboard(QWidget):
         self._timer.start(STATS_REFRESH_MS)
 
         # Debounce config writes: a hammered spinbox / rapid toggles
-        # otherwise call config.save() once per UI event, hitting disk
-        # synchronously on the main thread.  Note that the save still
-        # runs ON the GUI thread and fsyncs — invisible against a local
-        # disk, but if a deployment ever puts the user's home on a
-        # network mount this is the first place to move off-thread.
+        # otherwise call save() once per UI event.  The debounce alone
+        # was not enough — the write fsyncs, so it stalled the event
+        # loop for the duration of the disk write.  ``save_async``
+        # snapshots on this thread and writes on a background one; the
+        # snapshot is what keeps that write consistent.
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(CONFIG_SAVE_DEBOUNCE_MS)
-        self._save_timer.timeout.connect(self.config.save)
+        self._save_timer.timeout.connect(self.config.save_async)
 
         # Safety timer for ``_on_restart_clicked`` — see that method's
         # docstring.  Single-shot, started on Restart click, stopped
@@ -283,7 +275,7 @@ class SourceDashboard(QWidget):
         # gui.service_watchdog for the two-condition rule), then
         # auto-restarts the service.
         self._slow_transfer_timer = QTimer(self)
-        self._slow_transfer_timer.setInterval(_WATCHDOG_POLL_MS)
+        self._slow_transfer_timer.setInterval(WATCHDOG_POLL_MS)
         self._slow_transfer_timer.timeout.connect(
             self._on_slow_transfer_detected)
 
@@ -310,13 +302,18 @@ class SourceDashboard(QWidget):
         self._save_timer.start()
 
     def flush_pending_save(self) -> None:
-        """Synchronously persist any pending debounced save."""
+        """Synchronously persist any pending debounced save.
+
+        Stops the debounce timer so the pending write happens NOW and
+        not 500 ms after the window is gone; ``config.save()`` itself
+        drains any in-flight background write first.
+        """
         if self._save_timer.isActive():
             self._save_timer.stop()
         self.config.save()
 
     @property
-    def _remote_node(self):
+    def _remote_node(self) -> Optional["PacsNode"]:
         return self.config.remote_nodes.get(self.remote_key)
 
     @property
@@ -826,23 +823,49 @@ class SourceDashboard(QWidget):
         engine.  An auto-restart (watchdog) forces the start with the
         auto flag so MainWindow keeps retrying if the PACS is still
         unreachable."""
-        pending = self._pending_restart
-        if pending is None:
+        if self._pending_restart is None:
             return
-        params, auto = pending.params, pending.is_auto
-        self._pending_restart = None
         logger.warning(
             f"[{self.remote_key}] restart safety timeout fired; engine "
             f"did not emit service_stopped — forcing a fresh start")
-        if self.remote_key not in self.config.remote_nodes:
+        self._consume_pending_restart()
+
+    def _consume_pending_restart(self) -> None:
+        """Act on a waiting Restart now that the engine is (or is being
+        treated as) idle: clear it, then either bring the service back
+        up with the click-time snapshot or explain why it cannot be.
+
+        Shared by the two paths that reach this point — the engine
+        reporting ``service_stopped`` and the safety timer firing
+        because it never did.  They used to carry a copy of this branch
+        each, which is how they came to disagree about stopping the
+        safety timer.  The decision itself is
+        ``service_watchdog.resolve_pending_restart``; what stays here is
+        the widget work.
+        """
+        self._restart_safety_timer.stop()
+        pending = self._pending_restart
+        self._pending_restart = None
+        outcome = resolve_pending_restart(
+            pending, self.remote_key in self.config.remote_nodes)
+        if outcome == CANCEL_SOURCE_GONE:
+            # MainWindow drops a start_requested for a source that no
+            # longer exists, so say so instead of leaving the user with
+            # a half-finished restart.
             self.lbl_status.setText("Restart cancelled — source removed.")
             return
+        if outcome != RESUME:
+            return
+        params = pending.params if pending else None
         if params is not None:
+            # Re-apply the snapshotted spinbox values so the visible
+            # state matches the start request.
             self.hours_spin.setValue(params.hours)
             self.max_images_spin.setValue(params.max_images)
             self.interval_spin.setValue(params.sync_interval)
             self.manual_selection_check.setChecked(params.selection_mode)
-        self._on_start_clicked(auto_restart=auto)
+        self._on_start_clicked(
+            auto_restart=pending.is_auto if pending else False)
 
     def _current_service_params(self) -> ServiceParams:
         return ServiceParams(
@@ -883,34 +906,11 @@ class SourceDashboard(QWidget):
         # Pending / ETE countdown (and the stall watchdog).
         self._disarm_active_transfer()
         if self._restart_pending:
-            # Engine reached the idle state we were waiting for after
-            # a Restart click; bring it back up with the params
-            # snapshotted at click time.  Clear the flags BEFORE
-            # ``_on_start_clicked`` so any synchronous follow-up
-            # callbacks see the clean state.  Cancel the safety timer
-            # since the expected callback arrived in time.
-            self._restart_safety_timer.stop()
-            pending = self._pending_restart
-            params = pending.params if pending else None
-            auto = pending.is_auto if pending else False
-            self._pending_restart = None
-            # If the source was removed from the config during the
-            # restart wait window, MainWindow would silently drop the
-            # start_requested signal and leave the user staring at a
-            # half-finished restart.  Bail out cleanly instead.
-            if self.remote_key not in self.config.remote_nodes:
-                self.lbl_status.setText(
-                    "Restart cancelled — source removed.")
-                return
-            if params is not None:
-                # Re-apply the snapshotted spinbox values so the
-                # user-visible state matches the start request.
-                self.hours_spin.setValue(params.hours)
-                self.max_images_spin.setValue(params.max_images)
-                self.interval_spin.setValue(params.sync_interval)
-                self.manual_selection_check.setChecked(
-                    params.selection_mode)
-            self._on_start_clicked(auto_restart=auto)
+            # Engine reached the idle state we were waiting for after a
+            # Restart click.  The safety timer is cancelled and the
+            # snapshot consumed in one place — see
+            # ``_consume_pending_restart``.
+            self._consume_pending_restart()
 
     def _apply_control_enabled(self, running: bool) -> None:
         """Enable / disable the service-control buttons and spinboxes
@@ -1381,28 +1381,6 @@ class SourceDashboard(QWidget):
         msg.show()
 
     # ── Helpers ───────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _status_text(status: str) -> str:
-        return {
-            "queued": "\u23f3 Queued",
-            "transferring": "\u25b6 Transferring...",
-            "done": "\u2713 Done",
-            "error": "\u2717 Error",
-            "skipped": "\u2014 Skipped",
-            "unavailable": "\u2298 Not available",
-        }.get(status, status)
-
-    @staticmethod
-    def _status_color(status: str) -> QColor:
-        return {
-            "queued": QColor(COLOR_MUTED),
-            "transferring": QColor(COLOR_ORANGE),
-            "done": QColor(COLOR_GREEN),
-            "error": QColor(COLOR_RED),
-            "skipped": QColor(COLOR_MUTED),
-            "unavailable": QColor(COLOR_RED),
-        }.get(status, QColor(TEXT_DEFAULT))
 
     def reset(self) -> None:
         # Empties the table and drops the render caches, so the next
