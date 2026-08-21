@@ -1,3 +1,6 @@
 PySide6>=6.5
 pydicom>=2.4
 pynetdicom>=2.0
+
+# Test-only; excluded from the app bundle by dicom_sync.spec.
+pytest>=7.0
