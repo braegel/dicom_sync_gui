@@ -3,15 +3,51 @@ name: Build macOS DMG
 on:
   release:
     types: [created]
+  # Manual re-run: build and upload to a release that already exists.
+  # Needed when a release was published before this workflow could
+  # produce every artifact, or when one architecture has to be redone.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build for (e.g. v1.5.0)'
+        required: true
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: macos-latest
+    strategy:
+      # Both architectures are independent uploads to the same release.
+      # Without this, one runner failing would cancel the other and
+      # leave the release with a download link that 404s.
+      fail-fast: false
+      matrix:
+        include:
+          # PyInstaller cannot cross-compile, so each architecture needs
+          # a native runner.  macos-13 is the last Intel image GitHub
+          # offers; the unversioned label tracks Apple Silicon.
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-latest
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
     steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"  >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        with:
+          # On a manual run github.ref is the branch the workflow was
+          # started from, not the release — check out the tag instead so
+          # the rebuilt DMG matches what was published.
+          ref: ${{ steps.tag.outputs.tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -22,31 +58,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
       - name: Set version in spec
         run: |
-          sed -i '' "s/CFBundleShortVersionString.*/CFBundleShortVersionString\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
-          sed -i '' "s/CFBundleVersion.*/CFBundleVersion\": \"${{ steps.version.outputs.version }}\",/" dicom_sync.spec
+          sed -i '' "s/CFBundleShortVersionString.*/CFBundleShortVersionString\": \"${{ steps.tag.outputs.version }}\",/" dicom_sync.spec
+          sed -i '' "s/CFBundleVersion.*/CFBundleVersion\": \"${{ steps.tag.outputs.version }}\",/" dicom_sync.spec
 
       - name: Build app
         run: pyinstaller dicom_sync.spec -y
 
+      - name: Verify build architecture
+        # The DMG name is a promise to the person downloading it.  If a
+        # runner label ever maps to a different architecture, fail here
+        # rather than publish an arm64 build named x86_64.
+        run: |
+          BIN="dist/DICOM Sync.app/Contents/MacOS/DICOM Sync"
+          ACTUAL=$(lipo -archs "$BIN")
+          echo "expected: ${{ matrix.arch }} — built: $ACTUAL"
+          case " $ACTUAL " in
+            *" ${{ matrix.arch }} "*) ;;
+            *) echo "::error::${{ matrix.runner }} produced '$ACTUAL', expected '${{ matrix.arch }}'"; exit 1 ;;
+          esac
+
       - name: Create DMG
         run: |
+          rm -rf /tmp/dmg_staging
           mkdir -p /tmp/dmg_staging
           cp -R "dist/DICOM Sync.app" "/tmp/dmg_staging/DICOM Sync.app"
           ln -s /Applications "/tmp/dmg_staging/Applications"
           hdiutil create -volname "DICOM Sync" \
             -srcfolder /tmp/dmg_staging -ov -format UDZO \
-            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_arm64.dmg"
+            "DICOM_Sync_${{ steps.tag.outputs.version }}_macOS_${{ matrix.arch }}.dmg"
 
       - name: Upload DMG to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${{ github.ref_name }}" \
-            "DICOM_Sync_${{ steps.version.outputs.version }}_macOS_arm64.dmg" \
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "DICOM_Sync_${{ steps.tag.outputs.version }}_macOS_${{ matrix.arch }}.dmg" \
             --clobber
