@@ -11,15 +11,22 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Tuple,
+)
 
 from PySide6.QtCore import QObject, Signal
 from pydicom import Dataset
 
+from core import institution_filter
+from core import prior_studies as prior_studies_rules
 from core import queue_planner
 from core.dicom_ops import DicomOperations, PacsConnectionError
 from core.stats_utils import median
 from core.transfer_log import TransferLog, default_db_path
+
+if TYPE_CHECKING:  # import cycle at runtime; annotation only
+    from core.config import PacsNode
 
 logger = logging.getLogger("dicom_sync")
 
@@ -218,14 +225,14 @@ class TransferStats:
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False)
 
-    def start_session(self):
+    def start_session(self) -> None:
         with self._lock:
             self.start_time = time.time()
             self.total_images = 0
             self._completed_series = []
 
     def record_series(self, series_uid: str, image_count: int,
-                      duration_seconds: float):
+                      duration_seconds: float) -> None:
         """Record a completed series transfer with its measured speed.
 
         The series is always appended (so ``completed_count`` reflects
@@ -457,11 +464,11 @@ class TransferEngine:
         return self._running
 
     @property
-    def _remote_node(self):
+    def _remote_node(self) -> "PacsNode":
         return self.config.remote_nodes[self.remote_key]
 
     @property
-    def _active_node_or_none(self):
+    def _active_node_or_none(self) -> Optional["PacsNode"]:
         """Return the engine's ``PacsNode`` or ``None`` if the source
         has been removed from the config (vs. ``_remote_node`` which
         raises ``KeyError`` in that case)."""
@@ -497,7 +504,7 @@ class TransferEngine:
     # -- public API ----------------------------------------------------------
 
     def start(self, hours: int, max_images: int, sync_interval: int,
-              selection_mode: bool = False):
+              selection_mode: bool = False) -> None:
         """Start the continuous service loop."""
         if self._running:
             return
@@ -513,20 +520,20 @@ class TransferEngine:
         self._thread.start()
         self.signals.service_started.emit()
 
-    def stop(self):
+    def stop(self) -> None:
         """Request a graceful stop."""
         self._cancel.set()
         # Unblock any pending selection wait
         self._selection_event.set()
 
-    def confirm_selection(self, selected_uids: list):
+    def confirm_selection(self, selected_uids: List[str]) -> None:
         """Called from the GUI: user confirmed which series to download."""
         self._selected_uids = set(selected_uids)
         self._selection_event.set()
 
     # -- internal ------------------------------------------------------------
 
-    def _log(self, msg: str):
+    def _log(self, msg: str) -> None:
         logger.info(msg)
         # The emit runs on the service-loop thread; if the
         # TransferSignals QObject has already been torn down (test
@@ -538,9 +545,9 @@ class TransferEngine:
         except RuntimeError:
             pass
 
-    def _service_loop(self, hours: int, max_images: int, sync_interval: int):
+    def _service_loop(self, hours: int, max_images: int,
+                      sync_interval: int) -> None:
         self.stats.start_session()
-        node = self._remote_node
         self._log(f"[{self.remote_key}] Service started — downloading last "
                   f"{hours}h, max {max_images or 'unlimited'} img/series, "
                   f"interval {sync_interval}s")
@@ -560,11 +567,11 @@ class TransferEngine:
                     self._log(f"[{self.remote_key}] Cycle {cycle} — no new "
                               f"images. Waiting {sync_interval}s...")
 
-                # Sleep in small steps so we can react to cancel quickly
-                for _ in range(sync_interval):
-                    if self._cancel.is_set():
-                        break
-                    time.sleep(1)
+                # Block on the cancel event instead of polling it once
+                # a second: stop() then takes effect immediately rather
+                # than up to a second later, and an idle engine wakes
+                # once per cycle instead of ``sync_interval`` times.
+                self._cancel.wait(sync_interval)
 
         except Exception as e:
             self._log(f"[{self.remote_key}] Service error: {e}")
@@ -1326,7 +1333,7 @@ class TransferEngine:
             job.series_uid, "Transfer failed")
         return 0
 
-    def _check_study_complete(self, study_uid: str):
+    def _check_study_complete(self, study_uid: str) -> None:
         """Emit study_completed once all series of a study are terminal.
 
         Thin orchestrator: detect completion → persist the study record →
@@ -1447,7 +1454,7 @@ class TransferEngine:
 
         return all(_ok_for_completion(j) for j in study_series)
 
-    def _check_patient_complete(self, patient_id: str):
+    def _check_patient_complete(self, patient_id: str) -> None:
         """Emit patient_studies_completed if all series for this patient
         (including priors) are done or errored."""
         if patient_id in self._completed_patients:
@@ -1522,27 +1529,21 @@ class TransferEngine:
         self._log(f"  [Prior] {len(prior_studies)} candidate prior studies")
         return prior_studies
 
+    # The prior-selection rules live in the pure, Qt-free
+    # core.prior_studies module.  These thin wrappers keep the
+    # historical ``TransferEngine._foo(...)`` call sites (and the unit
+    # tests that target them directly) working — same pattern as the
+    # core.queue_planner delegates above.
     def _top_n_priors(self, prior_studies: List[Dataset],
                       current_studies: List[Dataset],
                       pid: str) -> List[Dataset]:
         """Sort newest-first, optionally filter to matching modality,
         then truncate to the configured count."""
-        # ``sorted(...)`` returns a fresh list so future callers can
-        # reuse ``prior_studies`` without seeing it mutated under them.
-        prior_studies = sorted(
-            prior_studies,
-            key=lambda x: (getattr(x, 'StudyDate', ''),
-                           getattr(x, 'StudyTime', '')),
-            reverse=True)
-
-        if self.config.prior_studies_same_modality:
-            prior_studies = self._filter_priors_by_modality(
-                prior_studies, current_studies, pid)
-
-        count = min(self.config.prior_studies_count, len(prior_studies))
-        self._log(f"  [Prior] downloading {count} of {len(prior_studies)} "
-                  f"(configured max: {self.config.prior_studies_count})")
-        return prior_studies[:count]
+        return prior_studies_rules.select_priors(
+            prior_studies, current_studies, pid,
+            same_modality=self.config.prior_studies_same_modality,
+            count=self.config.prior_studies_count,
+            log=self._log)
 
     def _filter_priors_by_modality(
             self, prior_studies: List[Dataset],
@@ -1550,23 +1551,8 @@ class TransferEngine:
             pid: str) -> List[Dataset]:
         """Keep only prior studies whose modality set intersects the
         modalities of the current studies for this patient."""
-        def split_modalities(ds: Dataset) -> Set[str]:
-            return {m.strip()
-                    for m in str(getattr(ds, 'ModalitiesInStudy', ''))
-                    .replace("\\", ",").split(",")
-                    if m.strip()}
-
-        target_mods: Set[str] = set()
-        for cs in current_studies:
-            if getattr(cs, 'PatientID', '') == pid:
-                target_mods |= split_modalities(cs)
-        self._log(f"  [Prior] modality filter active, target: {target_mods}")
-        if not target_mods:
-            return prior_studies
-        kept = [s for s in prior_studies
-                if split_modalities(s) & target_mods]
-        self._log(f"  [Prior] {len(kept)} after modality filter")
-        return kept
+        return prior_studies_rules.filter_by_modality(
+            prior_studies, current_studies, pid, log=self._log)
 
     def _build_prior_jobs_for_study(
             self, dicom_ops: DicomOperations, ps: Dataset, pid: str,
@@ -1611,36 +1597,23 @@ class TransferEngine:
     # ── Institution filter logic ──────────────────────────────────────────
 
     def _passes_institution_filter(self, institution_name: str) -> bool:
+        """Whether a study from *institution_name* should be downloaded.
+
+        The truth table itself is pure and lives in
+        :py:mod:`core.institution_filter`; what stays here is the part
+        that needs the engine: reporting a not-yet-seen unknown
+        institution to the GUI exactly once per service run.
         """
-        Check whether a study from the given institution should be downloaded.
-
-        Rules (when filtering is enabled):
-        - If institution is assigned to an active group → download
-        - If institution is assigned to an inactive group → skip
-        - If institution is unknown (not assigned to any group) → download
-          AND emit unknown_institution signal so the GUI can alert the user
-        - If filtering is disabled → always download
-        """
-        if not self.config.filter_groups_enabled:
-            return True
-
-        active_groups = set(self.config.active_filter_groups)
-        if not active_groups:
-            # No groups selected = no filtering active
-            return True
-
-        assignments = self.config.institution_assignments
-        assigned_group = assignments.get(institution_name, "")
-
-        if not assigned_group:
-            # Unknown / unassigned institution → download + alert
-            if institution_name and institution_name not in self._notified_institutions:
-                self._notified_institutions.add(institution_name)
-                self.signals.unknown_institution.emit(institution_name)
-            return True
-
-        # Known institution: check if its group is active
-        return assigned_group in active_groups
+        verdict = institution_filter.evaluate(
+            institution_name,
+            filtering_enabled=self.config.filter_groups_enabled,
+            active_groups=self.config.active_filter_groups,
+            assignments=self.config.institution_assignments)
+        if (verdict.is_unknown
+                and institution_name not in self._notified_institutions):
+            self._notified_institutions.add(institution_name)
+            self.signals.unknown_institution.emit(institution_name)
+        return verdict.allowed
 
     # ── Reusable helpers ──────────────────────────────────────────────
 

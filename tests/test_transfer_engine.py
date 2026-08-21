@@ -2641,3 +2641,43 @@ class TestIncompleteQueryDeferral:
             self.engine._incomplete_query_streak[f"S{i}"] = 1
         self.engine._prune_study_history([])
         assert len(self.engine._incomplete_query_streak) == MAX_TRACKED_STUDIES
+
+
+class TestServiceLoopCancelWait:
+    """The inter-cycle wait blocks on the cancel event rather than
+    polling it once a second — stop() must take effect immediately, and
+    an idle engine must not wake ``sync_interval`` times per cycle."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.engine = TransferEngine(populated_config, "ct")
+
+    def test_wait_is_used_for_the_inter_cycle_sleep(self):
+        engine = self.engine
+        calls = []
+
+        class _SpyEvent(threading.Event):
+            def wait(self, timeout=None):
+                calls.append(timeout)
+                self.set()             # end the loop after one cycle
+                return True
+
+        engine._cancel = _SpyEvent()
+        with patch.object(engine, "_run_one_cycle", return_value=0):
+            engine._service_loop(hours=1, max_images=0, sync_interval=42)
+        assert calls == [42], (
+            f"expected one wait(42) for the inter-cycle sleep, got {calls}")
+
+    def test_no_per_second_sleeping(self):
+        """The old loop called time.sleep(1) ``sync_interval`` times."""
+        engine = self.engine
+        engine._cancel = threading.Event()
+
+        def one_cycle(*_a, **_kw):
+            engine._cancel.set()
+            return 0
+
+        with patch.object(engine, "_run_one_cycle", side_effect=one_cycle), \
+                patch("core.transfer_engine.time.sleep") as sleep:
+            engine._service_loop(hours=1, max_images=0, sync_interval=30)
+        sleep.assert_not_called()
