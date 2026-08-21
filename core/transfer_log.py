@@ -107,6 +107,40 @@ CREATE TABLE IF NOT EXISTS study_transfer (
 """
 
 
+# Indexes for the columns ``_query`` filters on selectively, and for
+# the column ``mbps_stats`` sorts by.  Without them every lookup is a
+# full scan over the whole history — append-only, tens of thousands of
+# rows within months of 24/7 operation.
+#
+# Measured on a real 58 757-row log (times per query, mean of 15):
+#
+#   patient_id_hash = ?          8.7 ms  ->  0.0 ms
+#   study_date over one day      5.6 ms  ->  0.0 ms
+#   ORDER BY estimated_mbps     28.2 ms  ->  9.7 ms
+#   source_pacs = ?            112.9 ms  -> 114.5 ms   (no gain)
+#
+# So ``source_pacs`` and ``modality`` are deliberately NOT indexed:
+# both have a handful of distinct values, an index over them matches
+# most of the table, and SQLite then does a rowid lookup per row —
+# slower than the sequential scan it replaces, plus write cost on the
+# engine's hot path.  Selectivity is the whole criterion here; do not
+# add an index without measuring it the same way.
+_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_series_study_date "
+    "ON series_transfer (study_date)",
+    "CREATE INDEX IF NOT EXISTS idx_series_patient "
+    "ON series_transfer (patient_id_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_series_accession "
+    "ON series_transfer (accession_number_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_series_mbps "
+    "ON series_transfer (estimated_mbps)",
+    "CREATE INDEX IF NOT EXISTS idx_study_study_date "
+    "ON study_transfer (study_date)",
+    "CREATE INDEX IF NOT EXISTS idx_study_patient "
+    "ON study_transfer (patient_id_hash)",
+)
+
+
 # Per-table schema for ``_insert``: maps column name to the Python
 # type allowed for its value.  Keeping the schema authoritative here
 # means a stray caller passing attacker-controlled column names
@@ -200,12 +234,30 @@ class TransferLog:
         self._conn.execute(_SERIES_TABLE)
         self._conn.execute(_STUDY_TABLE)
         self._conn.execute(_FAILURES_TABLE)
+        # IF NOT EXISTS, so an existing log picks these up on the next
+        # open without a migration step.
+        for stmt in _INDEXES:
+            self._conn.execute(stmt)
         self._conn.commit()
 
-    def close(self):
+    def close(self) -> None:
         self._conn.close()
 
-    def _insert(self, table: str, fields: Dict[str, Any]):
+    def __enter__(self) -> "TransferLog":
+        """Support ``with TransferLog(path) as log:``.
+
+        Every short-lived caller was already writing the ``try/finally
+        … close()`` by hand; forgetting it leaks a SQLite connection
+        and, with WAL, leaves the -wal sidecar behind for the next
+        opener to replay.
+        """
+        return self
+
+    def __exit__(self, exc_type: object, exc: object,
+                 tb: object) -> None:
+        self.close()
+
+    def _insert(self, table: str, fields: Dict[str, Any]) -> None:
         """Insert a row built from a ``{column: value}`` mapping.
 
         Centralizes the parameterized-INSERT boilerplate so callers
@@ -270,7 +322,7 @@ class TransferLog:
                       study_description: str, series_description: str,
                       series_number: str, image_count: int,
                       duration_seconds: float,
-                      timestamp: Optional[str] = None):
+                      timestamp: Optional[str] = None) -> None:
         ipm = (image_count / duration_seconds) * 60 if duration_seconds > 0 else 0.0
         est_bytes = estimate_bytes(modality, image_count)
         est_mbps = (est_bytes * 8) / (duration_seconds * 1_000_000) if duration_seconds > 0 else 0.0
@@ -300,7 +352,7 @@ class TransferLog:
                      study_date: str, study_time: str, modality: str,
                      study_description: str, total_series: int,
                      total_images: int, total_duration_seconds: float,
-                     wall_clock_seconds: float):
+                     wall_clock_seconds: float) -> None:
         est_bytes = estimate_bytes(modality, total_images)
         est_mbps = (est_bytes * 8) / (wall_clock_seconds * 1_000_000) if wall_clock_seconds > 0 else 0.0
         self._insert("study_transfer", {
@@ -322,7 +374,7 @@ class TransferLog:
         })
 
     def record_series_failure(self, *, source_pacs: str,
-                              series_uid: str):
+                              series_uid: str) -> None:
         h = _sha256(series_uid)
         ts = datetime.now().isoformat()
         with self._lock:
@@ -354,7 +406,7 @@ class TransferLog:
             series_uid=series_uid) >= max_attempts
 
     def clear_series_failures(self, *, source_pacs: str,
-                              series_uid: str):
+                              series_uid: str) -> None:
         h = _sha256(series_uid)
         with self._lock:
             self._conn.execute(
@@ -462,8 +514,13 @@ class TransferLog:
         return {"count": n, "mean": mean, "stddev": stddev,
                 "median": median}
 
-    def _query(self, table: str, *, date_from, date_to, source_pacs,
-               modality, patient_id, accession_number) -> List[dict]:
+    def _query(self, table: str, *,
+               date_from: Optional[str] = None,
+               date_to: Optional[str] = None,
+               source_pacs: Optional[str] = None,
+               modality: Optional[str] = None,
+               patient_id: Optional[str] = None,
+               accession_number: Optional[str] = None) -> List[dict]:
         clauses: List[str] = []
         params: list = []
         if date_from:

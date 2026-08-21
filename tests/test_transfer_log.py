@@ -893,3 +893,58 @@ class TestSeriesFailureTracking:
         row_text = " ".join(str(v) for v in rows[0])
         assert "1.2.3.4.5" not in row_text, (
             "raw series_uid leaked into the failures table")
+
+
+class TestTransferLogIndexes:
+    """The log is append-only and reaches tens of thousands of rows;
+    the selective lookup columns need indexes or every Examination
+    Lookup scans the whole history."""
+
+    def test_selective_lookup_columns_are_indexed(self, tmp_path):
+        log = TransferLog(str(tmp_path / "t.sqlite"))
+        try:
+            rows = log._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        finally:
+            log.close()
+        names = {r[0] for r in rows}
+        for expected in ("idx_series_study_date", "idx_series_patient",
+                         "idx_series_accession", "idx_series_mbps",
+                         "idx_study_study_date", "idx_study_patient"):
+            assert expected in names, f"missing index {expected}"
+
+    def test_low_selectivity_columns_are_not_indexed(self, tmp_path):
+        """source_pacs and modality have a handful of distinct values —
+        an index there is measurably slower than the scan it replaces
+        and costs write time on the engine's hot path."""
+        log = TransferLog(str(tmp_path / "t.sqlite"))
+        try:
+            sql = " ".join(
+                r[0] or "" for r in log._conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index'"))
+        finally:
+            log.close()
+        assert "source_pacs" not in sql
+        assert "modality" not in sql
+
+    def test_indexes_are_added_to_an_existing_log(self, tmp_path):
+        """IF NOT EXISTS — an existing database picks them up on the
+        next open, with no migration step."""
+        path = str(tmp_path / "t.sqlite")
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE series_transfer (id INTEGER PRIMARY KEY, "
+            "study_date TEXT, patient_id_hash TEXT, "
+            "accession_number_hash TEXT, estimated_mbps REAL)")
+        conn.commit()
+        conn.close()
+
+        log = TransferLog(path)
+        try:
+            names = {r[0] for r in log._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'")}
+        finally:
+            log.close()
+        assert "idx_series_patient" in names
