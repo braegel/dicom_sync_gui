@@ -59,6 +59,15 @@ COL_STATUS = 8
 COL_ETE = 9
 COL_GROUP = 10       # hidden while institution filtering is off
 COL_CREATED = 11     # appended last on purpose — see above
+
+# Sensible one-time default widths (px) for the non-stretching columns.
+# Up here with the COL_* indices rather than buried in the builder, so
+# the column metadata reads as one block.
+DEFAULT_COLUMN_WIDTHS = (
+    (COL_CHECK, 28), (COL_MODALITY, 70), (COL_IMAGES, 70),
+    (COL_PENDING, 80), (COL_IPM, 70), (COL_STATUS, 120),
+    (COL_ETE, 80), (COL_GROUP, 110), (COL_CREATED, 130),
+)
 COLUMN_COUNT = 12
 
 HEADERS = [
@@ -168,11 +177,8 @@ class QueueTableView(QWidget):
         for col in (COL_MODALITY, COL_IMAGES, COL_PENDING, COL_IPM,
                     COL_STATUS, COL_ETE, COL_GROUP, COL_CREATED):
             header.setSectionResizeMode(col, QHeaderView.Interactive)
-        # Sensible one-time default widths for the Interactive columns.
-        for col, width in (
-                (COL_CHECK, 28), (COL_MODALITY, 70), (COL_IMAGES, 70),
-                (COL_PENDING, 80), (COL_IPM, 70), (COL_STATUS, 120),
-                (COL_ETE, 80), (COL_GROUP, 110), (COL_CREATED, 130)):
+        # One-time defaults; the user can drag them afterwards.
+        for col, width in DEFAULT_COLUMN_WIDTHS:
             table.setColumnWidth(col, width)
         table.setAlternatingRowColors(True)
         table.setEditTriggers(QTableWidget.NoEditTriggers)

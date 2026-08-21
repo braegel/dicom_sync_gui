@@ -1258,3 +1258,49 @@ class TestFallbackScpBindFailure:
 
         assert "ct" in self.win._auto_restart_retry_timers
         assert "scp_bind_failed:ct" not in self.win._open_warnings
+
+
+class TestMainWindowTeardownReleasesResources:
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.win = MainWindow(populated_config)
+
+    def test_transfer_log_is_closed(self):
+        """One SQLite connection is held for the whole app run; closing
+        it checkpoints the WAL instead of leaving the sidecar for the
+        next session to replay."""
+        with patch.object(self.win._transfer_log, "close") as close:
+            self.win._teardown_resources()
+        close.assert_called_once()
+
+    def test_teardown_survives_a_failing_close(self):
+        """A broken log must not stop the window from shutting down."""
+        import sqlite3
+        with patch.object(self.win._transfer_log, "close",
+                          side_effect=sqlite3.Error("boom")):
+            self.win._teardown_resources()   # must not raise
+
+    def test_config_is_flushed(self):
+        """Safety net for the no-dashboard case: a queued background
+        write must still land before the process goes away."""
+        with patch.object(self.win.config, "flush") as flush:
+            self.win._teardown_resources()
+        flush.assert_called()
+
+
+class TestMainWindowRebuildTabs:
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.win = MainWindow(populated_config)
+
+    def test_old_dashboards_are_destroyed(self):
+        """clear() only detaches them.  With the cyclic GC disabled on
+        3.14+, a detached dashboard caught in a reference cycle would
+        keep its five QTimers running for the rest of the session."""
+        old = list(self.win.dashboards.values())
+        assert old, "fixture should provide at least one dashboard"
+        with patch.object(type(old[0]), "deleteLater") as delete_later:
+            self.win._rebuild_tabs()
+        assert delete_later.call_count == len(old)

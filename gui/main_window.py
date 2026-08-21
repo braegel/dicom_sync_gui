@@ -32,6 +32,7 @@ to hop back to the GUI thread with the result.
 
 import logging
 import os
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -60,6 +61,7 @@ from gui.transfer_stats_window import TransferStatsWindow
 from gui.examination_lookup import ExaminationLookupDialog
 from gui.live_completions import LiveCompletionsWindow
 from core.i18n import tr
+from gui.styles import COLOR_PLACEHOLDER
 
 logger = logging.getLogger("dicom_sync")
 
@@ -234,7 +236,18 @@ class MainWindow(QMainWindow):
             self, language=getattr(self.config, "language", "en"))
 
     def _rebuild_tabs(self) -> None:
-        """Create one SourceDashboard tab per configured source PACS."""
+        """Create one SourceDashboard tab per configured source PACS.
+
+        The outgoing dashboards are destroyed explicitly.  ``clear()``
+        only detaches them, leaving their lifetime to the refcount — and
+        ``main._configure_gc`` disables the cyclic collector on Python
+        3.14+, so a widget caught in ANY reference cycle would never be
+        freed and its five QTimers (one of them a 2 s stats tick) would
+        keep firing against a detached widget for the rest of the run.
+        """
+        for dashboard in self.dashboards.values():
+            dashboard.setParent(None)
+            dashboard.deleteLater()
         self.tab_widget.clear()
         self.dashboards.clear()
 
@@ -245,7 +258,8 @@ class MainWindow(QMainWindow):
                 "Go to Settings \u2192 PACS Configuration to add one.")
             placeholder.setAlignment(Qt.AlignCenter)
             placeholder.setFont(QFont("", 12))
-            placeholder.setStyleSheet("QLabel { color: #888; }")
+            placeholder.setStyleSheet(
+                f"QLabel {{ color: {COLOR_PLACEHOLDER}; }}")
             self.tab_widget.addTab(placeholder, "No Sources")
             return
 
@@ -636,7 +650,7 @@ class MainWindow(QMainWindow):
         # fails fast instead of hanging).  Only bother with the local
         # probe when the remote is up, since we abort either way if it
         # isn't.
-        def check_reachability():
+        def check_reachability() -> None:
             local_config = self.config.get_local_dict_for(remote_key)
             ops = DicomOperations(local_config, node.to_dict(), remote_key)
             try:
@@ -1115,6 +1129,9 @@ class MainWindow(QMainWindow):
         # so closing the app never drops in-flight settings changes.
         for dashboard in self.dashboards.values():
             dashboard.flush_pending_save()
+        # Safety net for the no-dashboard case (no sources configured):
+        # a background write queued by anything else must still land.
+        self.config.flush()
 
         # The stats window keeps one SQLite connection for as long as we
         # hold it (it survives being closed and re-shown), so release it
@@ -1123,6 +1140,15 @@ class MainWindow(QMainWindow):
             self._stats_window.shutdown()
 
         self.log_window.close()
+
+        # The shared TransferLog holds one SQLite connection for the
+        # whole app run.  Closing it checkpoints the WAL — otherwise the
+        # -wal sidecar survives every session and the next open has to
+        # replay it.
+        try:
+            self._transfer_log.close()
+        except sqlite3.Error as e:
+            logger.warning(f"TransferLog close failed: {e}")
 
     def _join_engines_responsive(self, total_timeout: float) -> None:
         """Wait up to *total_timeout* seconds per engine while keeping the

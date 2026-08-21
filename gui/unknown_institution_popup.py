@@ -19,13 +19,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
-from gui.styles import BTN_OK_BLUE
+from gui.styles import BTN_OK_BLUE, COLOR_ORANGE
 
 logger = logging.getLogger("dicom_sync")
 
-# Header styling (kept local so this popup stays self-contained — these
-# values aren't exported by gui.styles).
-_WARN_COLOR = "#f39c12"
+# Header styling.  The colour comes from the shared palette — it used
+# to be a local literal with a comment claiming gui.styles didn't export
+# it, which was simply untrue and left two copies of the same hex to
+# drift apart.  The two metrics below genuinely are local to this popup.
+_WARN_COLOR = COLOR_ORANGE
 _HEADER_FONT_SIZE = 14
 _LABEL_PADDING = "4px"
 

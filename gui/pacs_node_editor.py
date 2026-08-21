@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.config import PacsNode, TRANSFER_SYNTAXES_NAMES
-from gui.styles import COLOR_LINK
+from gui.styles import COLOR_LINK, COLOR_SEPARATOR
 
 
 class PacsNodeEditor(QWidget):
@@ -162,7 +162,7 @@ class PacsNodeEditor(QWidget):
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setFrameShadow(QFrame.Sunken)
-        sep.setStyleSheet("QFrame { color: #666; }")
+        sep.setStyleSheet(f"QFrame {{ color: {COLOR_SEPARATOR}; }}")
         layout.addRow("", sep)
         lbl = QLabel(title)
         lbl.setFont(QFont("", -1, QFont.Bold))

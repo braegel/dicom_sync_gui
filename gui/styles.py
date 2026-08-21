@@ -78,6 +78,12 @@ COLOR_LINK = "#2980b9"
 SURFACE_BG = "#2c2c2c"
 SURFACE_BORDER = "#555"
 TEXT_DEFAULT = "#d4d4d4"
+# Dimmer than COLOR_MUTED, for the "nothing configured yet"
+# placeholder and for hairline separators.  Kept as distinct
+# values rather than folded into COLOR_MUTED — they are visibly
+# quieter and always sit on the surface background.
+COLOR_PLACEHOLDER = "#888888"
+COLOR_SEPARATOR = "#666666"
 TEXT_ON_ACCENT = "#ffffff"
 
 # Tinted backgrounds behind the colour-coded throughput readouts —
