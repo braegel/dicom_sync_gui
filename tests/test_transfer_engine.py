@@ -654,6 +654,80 @@ class TestInstitutionFilter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — filter changes mid-cycle
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFilterChangeMidCycle:
+    """A job is filtered once when the queue is built.  If the user
+    narrows the active groups while that cycle's transfers are still
+    running, jobs already sitting in ``self._queue`` for a
+    now-inactive group must not still go out — see
+    ``_job_still_passes_filter`` and its use in ``_transfer_queue``."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.engine = TransferEngine(self.config, "ct")
+
+    def _job(self, institution_name, remote_count=10):
+        return SeriesJob(
+            study_uid="S1", series_uid="SE1", patient_id="P1",
+            patient_name="X", remote_count=remote_count,
+            institution_name=institution_name)
+
+    def test_job_still_passes_when_group_still_active(self):
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A"]
+        job = self._job("Hospital Alpha")  # assigned to Group A
+        assert self.engine._job_still_passes_filter(job) is True
+
+    def test_job_fails_once_its_group_is_deactivated(self):
+        self.config.filter_groups_enabled = True
+        # Queued while Group B was active...
+        job = self._job("Clinic Beta")  # assigned to Group B
+        self.config.active_filter_groups = ["Group B"]
+        assert self.engine._job_still_passes_filter(job) is True
+        # ...then the user narrows the selection to Group A only.
+        self.config.active_filter_groups = ["Group A"]
+        assert self.engine._job_still_passes_filter(job) is False
+
+    def test_small_series_exception_still_honored_on_recheck(self):
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A"]
+        self.config.filter_allow_small_series = True
+        self.config.filter_small_series_max = 20
+        job = self._job("Clinic Beta", remote_count=5)  # Group B, inactive
+        assert self.engine._job_still_passes_filter(job) is True
+
+    def test_small_series_exception_does_not_cover_large_series(self):
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A"]
+        self.config.filter_allow_small_series = True
+        self.config.filter_small_series_max = 20
+        job = self._job("Clinic Beta", remote_count=50)  # over the cap
+        assert self.engine._job_still_passes_filter(job) is False
+
+    def test_transfer_queue_skips_job_whose_group_was_deactivated(self):
+        ops = MagicMock()
+        ops.c_move_series.return_value = (True, 10)
+        self.config.filter_groups_enabled = True
+        self.config.active_filter_groups = ["Group A", "Group B"]
+        allowed = self._job("Hospital Alpha")
+        stale = self._job("Clinic Beta")
+        jobs = [allowed, stale]
+
+        # The filter narrows to Group A only after the queue was built,
+        # before _transfer_queue works through it.
+        self.config.active_filter_groups = ["Group A"]
+        moved = self.engine._transfer_queue(jobs, ops)
+
+        assert stale.status == "skipped"
+        assert allowed.status == "done"
+        assert ops.c_move_series.call_count == 1
+        assert moved == 10
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TransferEngine — lifecycle
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1607,16 +1681,18 @@ class TestRetryBlacklist:
 
 class TestFetchLocalSeriesCounts:
     """A failing local PACS query (timeout, AE rejection, network blip)
-    must be logged. Silently returning an empty dict makes the engine
-    think nothing is locally stored and re-download the whole study
-    every cycle — wasting bandwidth without any user-visible signal."""
+    must be logged, and must return ``None`` rather than an empty dict:
+    an empty dict would make the engine think nothing is locally stored
+    and re-download the whole study every cycle — wasting bandwidth
+    (and re-triggering completion notifications) every time the local
+    PACS is briefly busy, e.g. mid-import."""
 
-    def test_returns_empty_dict_on_exception(self, caplog):
+    def test_returns_none_on_exception(self, caplog):
         ops = MagicMock()
         ops.c_find_local_series.side_effect = RuntimeError("timeout")
         result = TransferEngine._fetch_local_series_counts(
             ops, study_uid="1.2.3")
-        assert result == {}
+        assert result is None
 
     def test_logs_warning_on_exception(self, caplog):
         import logging
@@ -1646,6 +1722,92 @@ class TestFetchLocalSeriesCounts:
         result = TransferEngine._fetch_local_series_counts(
             ops, study_uid="1.2.3")
         assert result == {"1.2.3.1": 50, "1.2.3.2": 100}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TransferEngine — a study is skipped for the cycle, not re-downloaded,
+# when its local-availability check fails
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSkipStudyOnLocalQueryFailure:
+    """A local PACS that is briefly unreachable (busy importing, network
+    blip) must not make the engine believe a study has nothing local
+    yet.  Both the current-study and prior-study builders must return no
+    jobs for that study this cycle rather than queue it as if empty
+    locally — the next cycle re-queries once the local PACS recovers."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, populated_config, qapp):
+        self.config = populated_config
+        self.config.filter_groups_enabled = False  # no filtering
+        self.engine = TransferEngine(self.config, "ct")
+
+    def _make_study_ds(self, study_uid):
+        from datetime import datetime
+        now = datetime.now()
+        ds = MagicMock()
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = now.strftime("%Y%m%d")
+        ds.StudyTime = now.strftime("%H%M%S")
+        ds.PatientName = "Doe^John"
+        ds.PatientID = "P1"
+        ds.StudyDescription = "CT Head"
+        ds.InstitutionName = "Hospital Alpha"
+        return ds
+
+    def _make_series_ds(self, series_uid, num_instances=10):
+        ds = MagicMock()
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesDescription = "Axial"
+        ds.Modality = "CT"
+        ds.SeriesNumber = "1"
+        ds.NumberOfSeriesRelatedInstances = num_instances
+        ds.InstitutionName = "Hospital Alpha"
+        return ds
+
+    def test_build_study_jobs_returns_none_jobs_on_local_query_failure(self):
+        study_ds = self._make_study_ds("1.2.3")
+        series_ds = self._make_series_ds("1.2.3.1")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_series_checked.return_value = (True, [series_ds])
+        mock_ops.c_find_local_series.side_effect = RuntimeError(
+            "Association with kleditsch@10.0.0.1:11112 was not "
+            "established (rejected or timed out)")
+
+        jobs = self.engine._build_study_jobs(
+            mock_ops, study_ds, seen_series=set(), max_images=0)
+
+        assert jobs == []
+
+    def test_build_study_jobs_queues_normally_once_local_query_recovers(self):
+        """Same study, next cycle: local query succeeds and reports the
+        series not yet present — it must be queued as usual."""
+        study_ds = self._make_study_ds("1.2.3")
+        series_ds = self._make_series_ds("1.2.3.1")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_series_checked.return_value = (True, [series_ds])
+        mock_ops.c_find_local_series.return_value = []
+
+        jobs = self.engine._build_study_jobs(
+            mock_ops, study_ds, seen_series=set(), max_images=0)
+
+        assert len(jobs) == 1
+        assert jobs[0].series_uid == "1.2.3.1"
+
+    def test_build_prior_jobs_returns_none_jobs_on_local_query_failure(self):
+        ps = self._make_study_ds("1.2.3")
+        series_ds = self._make_series_ds("1.2.3.1")
+
+        mock_ops = MagicMock()
+        mock_ops.c_find_series_checked.return_value = (True, [series_ds])
+        mock_ops.c_find_local_series.side_effect = RuntimeError("timeout")
+
+        jobs = self.engine._build_prior_jobs_for_study(
+            mock_ops, ps, pid="P1", seen_series=set(), max_images=0)
+
+        assert jobs == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════

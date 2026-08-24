@@ -817,6 +817,15 @@ class TransferEngine:
             # queue for visibility but never transferred again.
             if job.status == "unavailable":
                 continue
+            # The filter may have changed after this queue was built
+            # (e.g. the user narrowed the active groups mid-cycle) —
+            # re-check right before transfer so a stale job doesn't
+            # still go out under the old settings.
+            if not self._job_still_passes_filter(job):
+                job.status = "skipped"
+                self.signals.queue_updated.emit(
+                    [j.to_dict() for j in jobs])
+                continue
             try:
                 total_images += self._transfer_series(job, dicom_ops)
             except PacsConnectionError as e:
@@ -1044,6 +1053,8 @@ class TransferEngine:
 
         local_series = self._fetch_local_series_counts(
             dicom_ops, study_uid)
+        if local_series is None:
+            return []
 
         return self._series_jobs_for(
             series_list,
@@ -1579,6 +1590,8 @@ class TransferEngine:
         if not self._passes_institution_filter(institution):
             return []
         local_series = self._fetch_local_series_counts(dicom_ops, ps_uid)
+        if local_series is None:
+            return []
 
         return self._series_jobs_for(
             series_list,
@@ -1615,6 +1628,24 @@ class TransferEngine:
             self.signals.unknown_institution.emit(institution_name)
         return verdict.allowed
 
+    def _job_still_passes_filter(self, job: "SeriesJob") -> bool:
+        """Re-check a queued job against the *current* filter settings.
+
+        Jobs are filtered once, when the queue is built at the start of
+        a cycle.  If the user changes the active groups while that
+        cycle's transfers are still running, jobs queued under the old
+        settings must not keep being sent just because they already
+        made it into ``self._queue`` — so every job is re-checked here
+        right before its transfer starts.  Mirrors the exact verdict
+        ``_build_study_jobs`` used to admit it, including the
+        small-series exception, so a job legitimately let in via that
+        exception isn't wrongly evicted by this recheck.
+        """
+        if self._passes_institution_filter(job.institution_name):
+            return True
+        return (self.config.filter_allow_small_series
+                and job.remote_count <= self.config.filter_small_series_max)
+
     # ── Reusable helpers ──────────────────────────────────────────────
 
     @staticmethod
@@ -1634,13 +1665,16 @@ class TransferEngine:
 
     @staticmethod
     def _fetch_local_series_counts(
-            dicom_ops: DicomOperations, study_uid: str) -> Dict[str, int]:
+            dicom_ops: DicomOperations,
+            study_uid: str) -> Optional[Dict[str, int]]:
         """Query local PACS and return {series_uid: image_count}.
 
-        Returns an empty dict on failure. Failures are logged at WARNING
-        because a swallowed local-query error makes the engine think
-        nothing is locally stored, causing it to re-download the entire
-        study every cycle until the local PACS recovers.
+        Returns ``None`` on failure — NOT an empty dict — so the caller
+        can skip the study for this cycle instead of treating it as
+        empty locally.  A local PACS that is briefly unreachable (e.g.
+        busy importing a prior batch) must not make the engine believe
+        nothing has arrived yet and re-download the whole study; the
+        next cycle re-queries once it recovers.
         """
         counts: Dict[str, int] = {}
         try:
@@ -1653,8 +1687,9 @@ class TransferEngine:
         except Exception as e:
             logger.warning(
                 f"Local PACS query failed for study {study_uid}: {e} — "
-                f"engine will treat the study as empty locally and may "
-                f"re-download series until the local PACS recovers")
+                f"skipping this study for this cycle; it will be "
+                f"retried once the local PACS is reachable again")
+            return None
         return counts
 
     def _make_dicom_ops(self) -> DicomOperations:
