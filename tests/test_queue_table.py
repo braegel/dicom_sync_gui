@@ -119,25 +119,27 @@ class TestRenderPathSelection:
 
 class TestSelectionMode:
 
-    def test_render_for_selection_shows_checkboxes(self, qapp):
+    def test_render_for_selection_shows_checkboxes_unchecked(self, qapp):
+        """Rows start unchecked — manual selection is opt-in per series,
+        not opt-out."""
         view = QueueTableView(_Config())
         view.render_for_selection([_job("a"), _job("b")])
         assert not view.table.isColumnHidden(COL_CHECK)
-        assert view.table.item(0, COL_CHECK).checkState() == Qt.Checked
+        assert view.table.item(0, COL_CHECK).checkState() == Qt.Unchecked
 
     def test_checked_series_uids(self, qapp):
         view = QueueTableView(_Config())
         view.render_for_selection([_job("a"), _job("b")])
-        view.table.item(1, COL_CHECK).setCheckState(Qt.Unchecked)
+        view.table.item(0, COL_CHECK).setCheckState(Qt.Checked)
         assert view.checked_series_uids() == ["a"]
 
     def test_set_all_checked(self, qapp):
         view = QueueTableView(_Config())
         view.render_for_selection([_job("a"), _job("b")])
-        view.set_all_checked(False)
-        assert view.checked_series_uids() == []
         view.set_all_checked(True)
         assert view.checked_series_uids() == ["a", "b"]
+        view.set_all_checked(False)
+        assert view.checked_series_uids() == []
 
     def test_next_render_rebuilds_after_selection(self, qapp):
         """Selection rows carry a checkbox and 'Waiting' statuses, so the

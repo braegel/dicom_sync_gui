@@ -397,7 +397,12 @@ class QueueTableView(QWidget):
 
     def render_for_selection(self, queue: list) -> None:
         """Render the manual-selection view: a checkbox per row and
-        "Waiting" statuses, with no rate-derived columns."""
+        "Waiting" statuses, with no rate-derived columns.
+
+        Rows start UNCHECKED: manual selection exists so the user can
+        pick a few series out of a whole study's worth of results, and
+        starting everything checked made that the wrong default — one
+        missed row and the "few" became "everything but that one"."""
         # The table now holds selection-mode rows — force the next
         # ``render`` to do a full rebuild even if the uid sequence
         # happens to match.
@@ -412,7 +417,7 @@ class QueueTableView(QWidget):
 
             cb_item = QTableWidgetItem()
             cb_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            cb_item.setCheckState(Qt.Checked)
+            cb_item.setCheckState(Qt.Unchecked)
             cb_item.setData(Qt.UserRole, job["series_uid"])
             self.table.setItem(row, COL_CHECK, cb_item)
 

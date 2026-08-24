@@ -1981,9 +1981,18 @@ class TestSelectionModeToggleAll:
         assert not self.dashboard.btn_select_all.isVisible()
         assert not self.dashboard.btn_deselect_all.isVisible()
 
+    def test_rows_start_unchecked(self):
+        """Manual selection is opt-in per series: nothing downloads
+        until the user ticks it, so a study with rows the user forgot
+        to look at can't slip through."""
+        self.dashboard.on_queue_ready_for_selection(self._queue(3))
+        for row in range(self.dashboard.series_table.rowCount()):
+            cb = self.dashboard.series_table.item(row, 0)
+            assert cb.checkState() == Qt.Unchecked
+
     def test_deselect_all_unchecks_every_row(self):
         self.dashboard.on_queue_ready_for_selection(self._queue(3))
-        # All rows start checked per on_queue_ready_for_selection
+        self.dashboard._set_all_series_checked(True)
         self.dashboard._set_all_series_checked(False)
         for row in range(self.dashboard.series_table.rowCount()):
             cb = self.dashboard.series_table.item(row, 0)
@@ -1991,8 +2000,6 @@ class TestSelectionModeToggleAll:
 
     def test_select_all_checks_every_row(self):
         self.dashboard.on_queue_ready_for_selection(self._queue(3))
-        # Start by clearing them
-        self.dashboard._set_all_series_checked(False)
         self.dashboard._set_all_series_checked(True)
         for row in range(self.dashboard.series_table.rowCount()):
             cb = self.dashboard.series_table.item(row, 0)
