@@ -14,8 +14,8 @@ no Python installation required.
 
 | File | Architecture | Size |
 |---|---|---|
-| [`DICOM_Sync_1.5.1_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.5.1/DICOM_Sync_1.5.1_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~59 MB |
-| [`DICOM_Sync_1.5.1_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.5.1/DICOM_Sync_1.5.1_macOS_x86_64.dmg) | Intel | ~63 MB |
+| [`DICOM_Sync_1.5.2_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.5.2/DICOM_Sync_1.5.2_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~59 MB |
+| [`DICOM_Sync_1.5.2_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.5.2/DICOM_Sync_1.5.2_macOS_x86_64.dmg) | Intel | ~63 MB |
 
 **Installation:**
 
@@ -88,7 +88,7 @@ The app is self-contained and stores its configuration in
   configurable folder.  It can also be switched on deliberately per
   source (*Receive C-MOVE images with the built-in SCP*) for a local
   PACS that is reachable but still rejects that source's images — see
-  the 1.5.1 changelog entry.
+  the 1.5.0 changelog entry.
 - **Filter Groups Export/Import** — back up or share institution assignments
   as JSON (merge or replace mode).
 - **Dark Theme** — modern dark UI, platform-independent via PySide6/Qt.
@@ -323,9 +323,9 @@ ARCH=arm64   # or x86_64
 mkdir -p _dmg
 cp -R "dist/DICOM Sync.app" _dmg/
 ln -s /Applications _dmg/Applications
-hdiutil create -volname "DICOM Sync 1.5.1" \
+hdiutil create -volname "DICOM Sync 1.5.2" \
   -srcfolder _dmg -ov -format UDZO \
-  releases/DICOM_Sync_1.5.1_macOS_${ARCH}.dmg
+  releases/DICOM_Sync_1.5.2_macOS_${ARCH}.dmg
 rm -rf _dmg
 ```
 
@@ -346,7 +346,7 @@ rm -rf _dmg
 ```
 dicom_sync_gui/
 ├── main.py                         # Entry point, dark theme, dependency check
-├── __init__.py                     # Package version (1.5.1)
+├── __init__.py                     # Package version (1.5.2)
 ├── __main__.py                     # python -m support
 ├── requirements.txt                # pip dependencies
 ├── dicom_sync.spec                 # PyInstaller build spec

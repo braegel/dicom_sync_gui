@@ -2,6 +2,37 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.5.2] — 2026-08-25
+
+### Fixed
+- **Changing the active filter groups while a cycle was still
+  transferring didn't take effect until the next cycle.** A cycle's
+  queue is built once, applying whichever groups were active at that
+  moment; the transfer loop then sent every job in it regardless of
+  filter changes made since. A series from a group deactivated
+  mid-download kept transferring anyway. Every job is now re-checked
+  against the *current* filter (small-series exception included)
+  immediately before its transfer starts; one that no longer passes is
+  marked `skipped` instead of sent.
+- **A local PACS that briefly refused a connection made the engine
+  re-download studies it already had.** The per-study "is this already
+  local?" check treated a failed C-FIND (association rejected or timed
+  out — e.g. the local PACS busy importing a batch) as "nothing is
+  stored here yet," so every series in that study queued for transfer
+  again. The study is now skipped for that cycle instead and
+  re-queried on the next one, once the local PACS answers again.
+
+### Changed
+- **Manual series selection now starts with every row unchecked.**
+  Rows previously came in fully checked, so picking a handful of
+  series out of a study's results meant deselecting the rest — one row
+  left untouched and "a few" silently became "everything but that
+  one." Select All / Deselect All still cover picking everything or
+  clearing it in one click.
+
+### Internal
+- 1242 tests (was 1233).
+
 ## [1.5.1] — 2026-08-21
 
 Maintenance release from a full-project code review (21 findings).  Two
