@@ -400,6 +400,12 @@ class SettingsDialog(QDialog):
                 f"Change one of them before saving.")
             return
 
+        # Softer sibling of the check above: a shared port that only
+        # breaks when both sources fall back at once.  Warn, but let the
+        # user proceed — the shared port is legitimate on its own.
+        if not self._confirm_wildcard_port_conflict():
+            return
+
         # Apply to config
         self.config.remote_nodes = dict(self._remote_nodes)
         self.config.prior_studies_count = self.prior_spin.value()
@@ -413,7 +419,14 @@ class SettingsDialog(QDialog):
     def _find_duplicate_local_endpoint(
             self) -> Optional[Tuple[str, str, str, int]]:
         """Return ``(key_a, key_b, ae_title, port)`` for the first
-        pair of sources whose local AE + port collide, or ``None``."""
+        pair of sources whose local AE + port collide, or ``None``.
+
+        An exact collision is unconditionally broken regardless of how
+        the images are received: ``MainWindow`` keys its live SCPs by
+        ``(local_ae_title, local_port)``, so the second source's
+        ``StorageSCP`` silently replaces the first in that dict even
+        though each writes to its own subfolder.
+        """
         seen: dict = {}
         for key, node in self._remote_nodes.items():
             endpoint = (node.local_ae_title, node.local_port)
@@ -422,6 +435,75 @@ class SettingsDialog(QDialog):
                         node.local_ae_title, node.local_port)
             seen[endpoint] = key
         return None
+
+    def _binds_wildcard_on_fallback(self, node: PacsNode) -> bool:
+        """Whether *node* would bind ``0.0.0.0`` if its local PACS goes
+        away.
+
+        The two receive paths bind differently, and only one of them can
+        collide.  ``receive_with_builtin_scp`` binds the interface
+        address that reaches its own source
+        (``MainWindow._ensure_builtin_receiver``), so two such sources
+        reached over different interfaces share a port perfectly well —
+        that is the whole point of the specific bind.  The fallback path
+        (``_ensure_fallback_scp``) binds the WILDCARD, which conflicts
+        with everything on that port.
+
+        A node with no fallback folder never starts an SCP at all, so it
+        cannot collide either.
+        """
+        return bool(node.fallback_folder) and not node.receive_with_builtin_scp
+
+    def _find_wildcard_port_conflict(
+            self) -> Optional[Tuple[str, str, int]]:
+        """Return ``(key_a, key_b, port)`` for the first pair of sources
+        that would both bind the wildcard on the same local port, or
+        ``None``.
+
+        Distinct from :py:meth:`_find_duplicate_local_endpoint`, which
+        only catches an exact AE+port match.  A socket binds on
+        ``(address, port)`` — the AE title is invisible to the OS — so
+        two sources with DIFFERENT local AE titles on the SAME port
+        still collide the moment both fall back to the built-in SCP.
+        The failure is deferred and quiet: the second bind raises, the
+        engine is simply not started, and the only trace is a log line.
+
+        This is a warning rather than a hard error because the shared
+        port is perfectly normal on its own — two sources delivering
+        into ONE local PACS is the common setup, and the conflict only
+        materialises if that PACS is unreachable and both sources fall
+        back at the same time.
+        """
+        seen: dict = {}
+        for key, node in self._remote_nodes.items():
+            if not self._binds_wildcard_on_fallback(node):
+                continue
+            if node.local_port in seen:
+                return (seen[node.local_port], key, node.local_port)
+            seen[node.local_port] = key
+        return None
+
+    def _confirm_wildcard_port_conflict(self) -> bool:
+        """Warn about a potential fallback bind conflict and ask whether
+        to save anyway.  Returns ``True`` when the caller may proceed."""
+        conflict = self._find_wildcard_port_conflict()
+        if conflict is None:
+            return True
+        key_a, key_b, port = conflict
+        reply = QMessageBox.question(
+            self, "Shared Fallback Port",
+            f"Source PACS \"{key_a}\" and \"{key_b}\" both use local "
+            f"port {port} and both have a fallback folder.\n\n"
+            f"That is fine while the local PACS is reachable. But if it "
+            f"goes down, both sources start the built-in Storage SCP on "
+            f"that port and only the first one can bind it — the second "
+            f"service then silently fails to start.\n\n"
+            f"To avoid this, give one of them a different local port, or "
+            f"tick \"Receive C-MOVE images with the built-in SCP\" so it "
+            f"binds its own interface instead of the wildcard.\n\n"
+            f"Save anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return reply == QMessageBox.Yes
 
     # ── Editor field validation ──────────────────────────────────────────
 

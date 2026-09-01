@@ -3,10 +3,13 @@ DICOM network operations: C-ECHO, C-FIND, C-MOVE.
 Abstracted from the original CLI script for GUI use.
 """
 
+import contextlib
 import logging
+import re
+import threading
 import warnings
 from typing import (
-    Any, Callable, Dict, Iterator, List, Optional, Tuple,
+    Any, Callable, Dict, Iterator, List, Optional, Set, Tuple,
 )
 
 from pydicom import Dataset
@@ -25,6 +28,99 @@ from pynetdicom.sop_class import (
 )
 
 logger = logging.getLogger("dicom_sync")
+
+# ---------------------------------------------------------------------
+# Non-conformant values from a PACS, and why one filter is not enough.
+#
+# pydicom 3.0.2 reports a value-representation violation on TWO
+# channels: it raises a Python warning AND logs a record through the
+# ``pydicom`` logger, which propagates to the root logger and so into
+# the app's log file.  The ``warnings.catch_warnings`` block in
+# _iter_find_results covers the first channel only, which is why the
+# very message that filter exists to remove kept being written anyway.
+#
+# Two producers are known in the field, and neither is anything this
+# application can fix:
+#
+# * OsiriX.  The SR series it generates ("OsiriX ROI SR", "OsiriX
+#   Annotations SR", "WindowsState SR", "Report SR") carry a
+#   SeriesInstanceUID that is a COMMA-JOINED LIST of the series the
+#   annotation refers to -- 95 to 287 characters where VR UI allows 64.
+#   Both the source PACS and the local PACS hand that same value back,
+#   so the two sides still agree and series matching is unaffected.
+# * UIDs with a leading zero in a component
+#   (``...20260825.082142.761``), which some modalities emit and every
+#   PACS in the chain stores verbatim.
+#
+# The damage was purely to the log.  Measured on the reporting machine,
+# these messages were 74% of the log's LINES and 92% of its BYTES,
+# rotating the real transfer history out of the 8 MB of retained
+# history in about five hours.
+#
+# The filter below therefore does NOT drop them outright: that a PACS
+# emits non-conformant values is worth knowing, so the FIRST report of
+# each distinct violation is kept and only the repeats are dropped.
+# Anything pydicom says that is not a VR violation is untouched.
+# ---------------------------------------------------------------------
+_VR_VIOLATION_MARKER = "Invalid value for VR"
+
+
+class _RepeatedVrViolationFilter(logging.Filter):
+    """Keep the first report of each VR violation, drop every repeat.
+
+    The signature strips the offending value and every number out of
+    the message, so the thousands of DISTINCT malformed UIDs a single
+    PACS produces collapse onto one key -- without that, remembering
+    "already seen" would mean remembering every bad UID ever received
+    and the set would grow without bound.
+    """
+
+    _QUOTED = re.compile(r"'[^']*'")
+    _NUMBER = re.compile(r"\d+")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._seen: Set[str] = set()
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            # A record we cannot even format is not the one we are
+            # trying to suppress -- let it through rather than swallow
+            # it.
+            return True
+        if _VR_VIOLATION_MARKER not in message:
+            return True
+        signature = self._NUMBER.sub("N", self._QUOTED.sub("'?'", message))
+        with self._lock:
+            if signature in self._seen:
+                return False
+            self._seen.add(signature)
+        return True
+
+
+_vr_filter_lock = threading.Lock()
+_vr_filter_installed = False
+
+
+def silence_repeated_vr_violations() -> None:
+    """Install the log-channel half of the VR-violation suppression.
+
+    Idempotent and thread-safe on purpose: one engine per source PACS
+    builds its own DicomOperations, concurrently, and
+    ``Logger.addFilter`` does not de-duplicate -- without the guard the
+    same filter would stack up once per source, and each copy would
+    keep its own "already seen" set.
+    """
+    global _vr_filter_installed
+    with _vr_filter_lock:
+        if _vr_filter_installed:
+            return
+        logging.getLogger("pydicom").addFilter(_RepeatedVrViolationFilter())
+        _vr_filter_installed = True
+
 
 # Progress callback signature: called with running (completed, total)
 # image counts during a C-MOVE.
@@ -86,7 +182,8 @@ class DicomOperations:
     """Handles all DICOM network operations."""
 
     def __init__(self, local_config: Dict[str, Any], remote_config: Dict[str, Any],
-                 remote_name: str = ""):
+                 remote_name: str = "",
+                 local_query_config: Optional[Dict[str, Any]] = None):
         self.local_config = local_config
         self.remote_config = remote_config
         self.remote_name = remote_name
@@ -96,7 +193,24 @@ class DicomOperations:
         # The local_config already contains the correct AE title, port, etc.
         # for this specific source PACS.
         self.move_dest_config = local_config
+        # Where ``target='local'`` queries go.  Normally the same box
+        # that receives the images, but the two are separable: the
+        # built-in Storage SCP can hold the receiving address while the
+        # local PACS is the only one that can answer a C-FIND.  See
+        # ``AppConfig.get_local_query_dict_for``.
+        self.local_query_config = (local_query_config
+                                   if local_query_config is not None
+                                   else local_config)
 
+        # Open associations shared by every C-FIND inside a
+        # ``find_session``; empty dict = a session is running, None =
+        # no session, associate per query.  See ``find_session``.
+        self._find_pool: Optional[Dict[str, Association]] = None
+        # Both halves of the VR-violation suppression belong together;
+        # the warnings half sits in _iter_find_results.  Installed here
+        # rather than at import time so that merely importing this
+        # module never mutates global logging state.
+        silence_repeated_vr_violations()
         self.ae = self._build_ae()
         self._register_contexts()
 
@@ -196,6 +310,9 @@ class DicomOperations:
         return assoc
 
     def c_echo(self, target: str = 'remote') -> bool:
+        # Deliberately the DESTINATION config, not the query one: the
+        # only caller asks this to decide whether C-MOVE can deliver to
+        # the local PACS or a built-in SCP has to stand in for it.
         config = self.local_config if target == 'local' else self.remote_config
         try:
             assoc = self._associate(config)
@@ -307,12 +424,29 @@ class DicomOperations:
         return self._execute_find(ds)
 
     def c_find_local_series(self, study_uid: str) -> List[Dataset]:
+        return self.c_find_local_series_checked(study_uid)[1]
+
+    def c_find_local_series_checked(
+            self, study_uid: str) -> Tuple[bool, List[Dataset]]:
+        """Local inventory query that also reports whether it ran to
+        completion — ``(complete, series)``.
+
+        The flag is load-bearing here, more so than for the remote
+        series query.  An endpoint that cannot answer a C-FIND *at all*
+        — the built-in Storage SCP, which offers no Find presentation
+        context — produces an established association and then an empty
+        result, which is indistinguishable from an authoritative "this
+        study has not arrived yet".  Believe the latter and the engine
+        re-downloads the entire time window on every cycle, forever.
+        ``complete`` is False in that case and True for a genuine empty
+        answer, so the caller can tell them apart.
+        """
         ds = Dataset()
         ds.QueryRetrieveLevel = 'SERIES'
         ds.StudyInstanceUID = study_uid
         ds.SeriesInstanceUID = ''
         ds.NumberOfSeriesRelatedInstances = ''
-        return self._execute_find(ds, target='local')
+        return self._execute_find_checked(ds, target='local')
 
     def c_find_local_images(self, study_uid: str, series_uid: str) -> List[Dataset]:
         ds = Dataset()
@@ -351,19 +485,94 @@ class DicomOperations:
         Only PENDING responses (0xFF00 / 0xFF01) carry an identifier;
         the final SUCCESS response has none and must not be collected.
         """
-        # Suppress pydicom's "VR UI value length exceeds maximum"
-        # warning that some PACS implementations trigger; scoped to the
-        # call site, not process-wide.
+        # Suppress pydicom's complaint about the non-conformant values
+        # some PACS implementations return; scoped to the call site,
+        # not process-wide.  This covers the ``warnings`` channel only
+        # -- pydicom ALSO logs the same violation, which
+        # ``silence_repeated_vr_violations`` handles.  Both are needed,
+        # and the pattern must match every VR violation, not just the
+        # over-long one: see the module-level note.
         with warnings.catch_warnings():
             warnings.filterwarnings(
-                'ignore',
-                message='.*value length.*exceeds the maximum length.*VR UI.*')
+                'ignore', message='.*Invalid value for VR.*')
             for status, dataset in assoc.send_c_find(
                     query_ds, StudyRootQueryRetrieveInformationModelFind):
                 if status is None or dataset is None:
                     continue
                 if getattr(status, "Status", 0) in (0xFF00, 0xFF01):
                     yield dataset
+
+    @contextlib.contextmanager
+    def find_session(self) -> Iterator[None]:
+        """Reuse ONE association per endpoint for every C-FIND in the
+        block, instead of opening and releasing one per query.
+
+        A query cycle asks the source PACS for its studies and then, for
+        EVERY study, a series list -- and asks the local PACS the same
+        question again to see what has already arrived.  At one
+        association per query that is ``1 + 2n`` connect / negotiate /
+        release round trips per cycle, which on the reporting machine
+        meant 33 associations every 69 seconds against one source and
+        roughly 49 000 per day across two, plus as many again against
+        the local PACS.  Inside a session the same cycle needs three.
+
+        Scope it to the QUERY phase only.  Holding a pooled association
+        open across a long C-MOVE would leave it idle for minutes and
+        invite the peer's idle timeout, which is the one thing this is
+        not trying to survive.
+
+        Re-entrant: a nested ``with`` is a no-op and the outermost block
+        keeps ownership, so a helper can open one defensively without
+        having to know whether its caller already did.
+
+        Failure is never fatal to the caller.  A pooled association that
+        breaks mid-query is dropped from the pool and the next query
+        reconnects, which is exactly what the unpooled code did anyway.
+        """
+        if self._find_pool is not None:
+            # Already inside a session: the outer block owns the pool
+            # and will release it.
+            yield
+            return
+        self._find_pool = {}
+        try:
+            yield
+        finally:
+            pool, self._find_pool = self._find_pool, None
+            for endpoint, assoc in pool.items():
+                try:
+                    assoc.release()
+                except Exception as e:
+                    # Releasing is best-effort: the peer may already be
+                    # gone, and a failure here must not mask whatever
+                    # the block itself was doing.
+                    logger.warning(
+                        f"[{self.remote_name}] releasing pooled "
+                        f"{endpoint} association failed: {e}")
+
+    def _find_association(self, target: str, config: Dict[str, Any]
+                          ) -> Tuple[Association, bool]:
+        """Return ``(association, pooled)`` for a C-FIND to *target*.
+
+        *pooled* is True when the association belongs to an open
+        ``find_session`` and the caller must NOT release it.  An entry
+        that is no longer established (peer aborted, idle timeout) is
+        replaced rather than handed out.
+        """
+        pool = self._find_pool
+        if pool is None:
+            return self._associate(config), False
+        assoc = pool.get(target)
+        if assoc is not None and assoc.is_established:
+            return assoc, True
+        # Either nothing pooled yet or the pooled one went stale.  A
+        # stale entry is dropped first so a failing _associate below
+        # cannot leave a dead association in the pool for the next
+        # query to pick up.
+        pool.pop(target, None)
+        assoc = self._associate(config)
+        pool[target] = assoc
+        return assoc, True
 
     def _execute_find_checked(self, query_ds: Dataset, target: str = 'remote'
                               ) -> Tuple[bool, List[Dataset]]:
@@ -376,7 +585,10 @@ class DicomOperations:
         it; callers that only aggregate what they got (institution
         discovery) can ignore it via :py:meth:`_execute_find`.
         """
-        config = self.local_config if target == 'local' else self.remote_config
+        # ``local`` here means the inventory endpoint, which is not
+        # necessarily the C-MOVE destination — see ``local_query_config``.
+        config = (self.local_query_config if target == 'local'
+                  else self.remote_config)
         results = []
         # ``_associate`` raises PacsConnectionError when the PACS is
         # unreachable; that propagates to the engine (which surfaces
@@ -385,7 +597,8 @@ class DicomOperations:
         # caught below and yields whatever partial results arrived,
         # flagged as incomplete.
         complete = True
-        assoc = self._associate(config)
+        assoc, pooled = self._find_association(target, config)
+        released = False
         try:
             # Append as they arrive: a break mid-stream must leave the
             # datasets received so far in ``results`` (see the
@@ -395,8 +608,17 @@ class DicomOperations:
         except Exception as e:
             logger.error(f"C-FIND error: {e}")
             complete = False
-        finally:
+            # Whatever broke this query breaks the next one too if the
+            # association is handed out again, so a pooled one is
+            # evicted and released here; the next query in the session
+            # reconnects.
+            if pooled and self._find_pool is not None:
+                self._find_pool.pop(target, None)
             assoc.release()
+            released = True
+        finally:
+            if not pooled and not released:
+                assoc.release()
         return complete, results
 
     def c_move_series(self, study_uid: str, series_uid: str,

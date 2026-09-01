@@ -11,7 +11,7 @@ import pytest
 
 from core.config import (
     AppConfig, PacsNode, TRANSFER_SYNTAXES_NAMES, RETRIEVE_METHODS,
-    DEFAULT_CONFIG_FILE, get_local_ip, local_ip_for,
+    DEFAULT_CONFIG_FILE, LOCAL_QUERY_LOOPBACK, get_local_ip, local_ip_for,
     default_priority_terms,
 )
 
@@ -597,6 +597,90 @@ class TestAppConfigHelpers:
         d = populated_config.get_local_dict_for("nonexistent")
         assert d["ae_title"] == "LOCAL_AE"  # fallback default
         assert d["port"] == 11112
+
+    def test_local_query_defaults_to_the_move_destination(
+            self, populated_config):
+        """Unset overrides keep the historical behaviour: the box that
+        receives the images is the one asked what it has."""
+        assert (populated_config.get_local_query_dict_for("ct")
+                == populated_config.get_local_dict_for("ct"))
+
+    def test_local_query_host_override(self, populated_config):
+        """Aim the inventory query somewhere else — needed when the
+        built-in Storage SCP holds the receiving address and cannot
+        answer a C-FIND."""
+        populated_config.remote_nodes["ct"].local_query_host = "127.0.0.1"
+        d = populated_config.get_local_query_dict_for("ct")
+        assert d["ip_address"] == "127.0.0.1"
+        # Everything else still describes the same local PACS.
+        assert d["ae_title"] == "LOCAL_AE"
+        assert d["port"] == 11112
+        # And the C-MOVE destination is untouched.
+        assert (populated_config.get_local_dict_for("ct")["ip_address"]
+                != "127.0.0.1")
+
+    def test_local_query_port_override(self, populated_config):
+        populated_config.remote_nodes["ct"].local_query_port = 11115
+        assert populated_config.get_local_query_dict_for("ct")["port"] == 11115
+        assert populated_config.get_local_dict_for("ct")["port"] == 11112
+
+    def test_builtin_scp_defaults_the_query_to_loopback(
+            self, populated_config):
+        """The collision this default exists to prevent: with the
+        built-in SCP receiving, the C-MOVE destination address and the
+        inventory address can be the same interface, and the SCP's
+        more-specific bind then swallows the query."""
+        node = populated_config.remote_nodes["ct"]
+        node.receive_with_builtin_scp = True
+        d = populated_config.get_local_query_dict_for("ct")
+        assert d["ip_address"] == LOCAL_QUERY_LOOPBACK
+        # Only the address moves; the local PACS is still the same AE
+        # on the same port, and the C-MOVE destination is untouched.
+        assert d["ae_title"] == "LOCAL_AE"
+        assert d["port"] == 11112
+        assert (populated_config.get_local_dict_for("ct")["ip_address"]
+                != LOCAL_QUERY_LOOPBACK)
+
+    def test_explicit_host_still_beats_the_loopback_default(
+            self, populated_config):
+        node = populated_config.remote_nodes["ct"]
+        node.receive_with_builtin_scp = True
+        node.local_query_host = "10.0.0.9"
+        assert (populated_config.get_local_query_dict_for("ct")["ip_address"]
+                == "10.0.0.9")
+
+    def test_without_the_builtin_scp_the_default_is_unchanged(
+            self, populated_config):
+        """No built-in SCP means no collision, so the historical
+        behaviour must survive untouched."""
+        node = populated_config.remote_nodes["ct"]
+        assert node.receive_with_builtin_scp is False
+        assert (populated_config.get_local_query_dict_for("ct")
+                == populated_config.get_local_dict_for("ct"))
+
+    def test_builtin_scp_does_not_move_the_query_port(
+            self, populated_config):
+        """Only the host is guessed.  The local PACS answers both roles
+        on one port everywhere we have seen, so inventing a port would
+        break the common case."""
+        node = populated_config.remote_nodes["ct"]
+        node.receive_with_builtin_scp = True
+        assert (populated_config.get_local_query_dict_for("ct")["port"]
+                == populated_config.get_local_dict_for("ct")["port"])
+
+    def test_local_query_overrides_survive_a_roundtrip(self):
+        node = PacsNode(name="x", local_query_host="127.0.0.1",
+                        local_query_port=11115)
+        restored = PacsNode.from_dict(node.to_dict())
+        assert restored.local_query_host == "127.0.0.1"
+        assert restored.local_query_port == 11115
+
+    def test_local_query_overrides_absent_from_old_config(self):
+        """A config file written before these fields existed must load
+        with the overrides off, i.e. unchanged behaviour."""
+        restored = PacsNode.from_dict({"name": "x"})
+        assert restored.local_query_host == ""
+        assert restored.local_query_port == 0
 
     def test_get_local_dict_legacy(self, populated_config):
         """Legacy get_local_dict() returns first source's local config."""

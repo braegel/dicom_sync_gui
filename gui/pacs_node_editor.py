@@ -139,6 +139,35 @@ class PacsNodeEditor(QWidget):
             "Requires a fallback folder.")
         layout.addRow("", self.builtin_receiver_check)
 
+        # ── Local inventory query ──
+        self._add_separator(layout, "Local Inventory Query (optional)")
+
+        self.local_query_host_edit = QLineEdit()
+        self.local_query_host_edit.setPlaceholderText(
+            "Leave empty: 127.0.0.1 with the built-in SCP, "
+            "else the C-MOVE destination")
+        self.local_query_host_edit.setToolTip(
+            "Where to ask \"what has already arrived?\". This is how "
+            "DICOM Sync avoids re-downloading series it already has.\n\n"
+            "Leave it empty unless the local PACS runs on another "
+            "machine than the one answering the query. Empty means the "
+            "C-MOVE destination normally, and 127.0.0.1 when \"Receive "
+            "C-MOVE images with the built-in SCP\" is on — because the "
+            "built-in SCP can otherwise bind the very address the "
+            "query uses, and it answers STORAGE only, with no C-FIND "
+            "at all. The query would come back empty, no series could "
+            "be verified, and this source would stop downloading.")
+        layout.addRow("Query Host:", self.local_query_host_edit)
+
+        self.local_query_port_spin = QSpinBox()
+        # 0 is the "unset" sentinel, hence a range starting at 0.
+        self.local_query_port_spin.setRange(0, 65535)
+        self.local_query_port_spin.setSpecialValueText("same as Local Port")
+        self.local_query_port_spin.setValue(0)
+        self.local_query_port_spin.setToolTip(
+            "Port for the inventory query. 0 means the Local Port above.")
+        layout.addRow("Query Port:", self.local_query_port_spin)
+
     def _build_sound_section(self, layout: QFormLayout) -> None:
         # ── Notification sound ──
         self._add_separator(layout, "Notification Sound")
@@ -210,6 +239,8 @@ class PacsNodeEditor(QWidget):
         self.fallback_edit.setText(node.fallback_folder)
         self.builtin_receiver_check.setChecked(
             node.receive_with_builtin_scp)
+        self.local_query_host_edit.setText(node.local_query_host)
+        self.local_query_port_spin.setValue(node.local_query_port)
         self.notification_sound_edit.setText(node.notification_sound_path)
 
     def get_node(self, base: Optional[PacsNode] = None) -> PacsNode:
@@ -240,6 +271,8 @@ class PacsNodeEditor(QWidget):
             fallback_folder=self.fallback_edit.text().strip(),
             receive_with_builtin_scp=(
                 self.builtin_receiver_check.isChecked()),
+            local_query_host=self.local_query_host_edit.text().strip(),
+            local_query_port=self.local_query_port_spin.value(),
             notification_sound_path=self.notification_sound_edit.text().strip(),
             notification_sound_enabled=(base.notification_sound_enabled
                                         if base is not None else True),
@@ -263,6 +296,8 @@ class PacsNodeEditor(QWidget):
         self.local_syntax_combo.setCurrentIndex(0)
         self.fallback_edit.clear()
         self.builtin_receiver_check.setChecked(False)
+        self.local_query_host_edit.clear()
+        self.local_query_port_spin.setValue(0)
         self.notification_sound_edit.clear()
 
     def has_minimum_data(self) -> bool:

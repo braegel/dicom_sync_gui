@@ -25,7 +25,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
 from core.config import (
-    AppConfig, merge_filter_group_data, write_filter_groups_json,
+    AppConfig, FilterGroupImportError, merge_filter_group_data,
+    parse_filter_groups_payload, write_filter_groups_json,
 )
 from core.dicom_ops import DicomOperations
 from gui.async_helpers import run_in_background
@@ -545,8 +546,19 @@ class FilterGroupsDialog(QDialog):
                 f"Could not read file:\n{e}")
             return None
 
-        imported_groups = data.get("filter_group_names", [])
-        imported_assignments = data.get("institution_assignments", {})
+        # The file is user-chosen, so valid JSON says nothing about its
+        # shape.  Validate before it reaches merge_filter_group_data,
+        # which does not fail loudly on the wrong type — it would turn
+        # a stray string into one group per character, or raise from
+        # deep inside the merge and escape this unguarded Qt slot.
+        try:
+            imported_groups, imported_assignments = (
+                parse_filter_groups_payload(data))
+        except FilterGroupImportError as e:
+            QMessageBox.critical(
+                self, "Import Failed",
+                f"This does not look like a filter-group export.\n\n{e}")
+            return None
 
         if not imported_groups and not imported_assignments:
             QMessageBox.warning(

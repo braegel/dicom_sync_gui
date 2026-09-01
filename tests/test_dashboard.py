@@ -2015,3 +2015,80 @@ class TestSelectionModeToggleAll:
             assert cb.checkState() == Qt.Checked
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SourceDashboard._pending_for — live countdown of the in-flight series
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDashboardPendingFor:
+    """The Pending / ETE columns are driven by this, and it used to be a
+    verbatim second copy of ``ActiveTransfer.pending_for`` — the copy the
+    application actually called, while the five existing tests covered
+    the ``ActiveTransfer`` original that no production code used.  These
+    tests pin the behaviour at the call site the app really takes."""
+
+    @pytest.fixture(autouse=True)
+    def _create(self, populated_config, qapp):
+        self.dashboard = SourceDashboard(
+            config=populated_config, remote_key="ct")
+
+    def _job(self, *, uid="s1", remote=100, local=0, status="queued"):
+        return {"series_uid": uid, "remote_count": remote,
+                "local_count": local, "status": status}
+
+    def test_queued_series_reports_the_full_remainder(self):
+        assert self.dashboard._pending_for(self._job()) == 100
+
+    def test_locally_present_images_are_subtracted(self):
+        assert self.dashboard._pending_for(
+            self._job(remote=100, local=30)) == 70
+
+    @pytest.mark.parametrize(
+        "status", ["done", "error", "skipped", "unavailable"])
+    def test_terminal_statuses_have_nothing_pending(self, status):
+        assert self.dashboard._pending_for(
+            self._job(status=status)) == 0
+
+    def test_active_transfer_progress_counts_down_live(self):
+        """The whole point of the method: images already received in
+        THIS run reduce the displayed remainder before the queue signal
+        catches up."""
+        self.dashboard._active.begin("s1", deadline_s=300)
+        self.dashboard._active.note_progress(40)
+        assert self.dashboard._pending_for(self._job(uid="s1")) == 60
+
+    def test_progress_only_discounts_the_series_in_flight(self):
+        self.dashboard._active.begin("s1", deadline_s=300)
+        self.dashboard._active.note_progress(40)
+        assert self.dashboard._pending_for(self._job(uid="s2")) == 100
+
+    def test_never_goes_negative(self):
+        """An SCP that over-reports completed sub-operations must not
+        produce a negative Pending cell."""
+        self.dashboard._active.begin("s1", deadline_s=300)
+        self.dashboard._active.note_progress(500)
+        assert self.dashboard._pending_for(self._job(uid="s1")) == 0
+
+    def test_local_count_above_remote_is_clamped(self):
+        assert self.dashboard._pending_for(
+            self._job(remote=10, local=99)) == 0
+
+    def test_disarming_stops_the_discount(self):
+        self.dashboard._active.begin("s1", deadline_s=300)
+        self.dashboard._active.note_progress(40)
+        self.dashboard._disarm_active_transfer()
+        assert self.dashboard._pending_for(self._job(uid="s1")) == 100
+
+    def test_matches_the_activetransfer_rule_it_delegates_to(self):
+        """Guards the delegation itself: if the two ever diverge again,
+        this fails rather than the drift going unnoticed."""
+        from core.transfer_engine import TERMINAL_STATUSES
+        self.dashboard._active.begin("s1", deadline_s=300)
+        self.dashboard._active.note_progress(25)
+        for job in (self._job(uid="s1"),
+                    self._job(uid="s2", remote=50, local=10),
+                    self._job(uid="s1", status="done")):
+            assert (self.dashboard._pending_for(job)
+                    == self.dashboard._active.pending_for(
+                        job, TERMINAL_STATUSES))

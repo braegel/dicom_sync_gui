@@ -895,6 +895,141 @@ class TestSeriesFailureTracking:
             "raw series_uid leaked into the failures table")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# No-progress detection — "the C-MOVE succeeded but nothing arrived"
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestLocalProgressTracking:
+    """A C-MOVE the source answers with SUCCESS is not proof the images
+    landed in the local PACS.  OsiriX, for one, does not store incoming
+    ROI/Annotation SR objects as queryable series — so the source keeps
+    reporting N instances, the local SERIES query keeps reporting 0, and
+    the engine re-fetched such a series every cycle forever.
+
+    Verification therefore straddles two cycles: a success ARMS the
+    check with the pre-transfer local count, and the next cycle's local
+    query DISARMS it with the count observed then.
+    """
+
+    ARM = dict(source_pacs="ct_scanner", series_uid="1.2.3")
+
+    def test_unarmed_progress_note_is_a_noop(self, log):
+        """A series sitting in the queue that was never transferred must
+        not accumulate attempts it never made."""
+        log.note_local_progress(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=0)
+        assert log.get_series_failure_count(**self.ARM) == 0
+
+    def test_arming_alone_costs_nothing(self, log):
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        assert log.get_series_failure_count(**self.ARM) == 0
+
+    def test_local_count_grew_clears_the_streak(self, log):
+        log.record_series_failure(**self.ARM)
+        log.record_series_failure(**self.ARM)
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=64)
+        assert log.get_series_failure_count(**self.ARM) == 0
+
+    def test_local_count_unchanged_counts_as_an_attempt(self, log):
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=0)
+        assert log.get_series_failure_count(**self.ARM) == 1
+
+    def test_partial_arrival_still_counts_as_progress(self, log):
+        """7 of 300 images is miserable, but it is movement — the series
+        is not the pathological "local PACS drops it" case this guards
+        against, so it must keep its retries."""
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=7)
+        assert log.get_series_failure_count(**self.ARM) == 0
+
+    def test_repeated_fruitless_transfers_reach_the_blacklist(self, log):
+        for _ in range(3):
+            log.arm_local_progress_check(**self.ARM, local_count=0)
+            log.note_local_progress(**self.ARM, local_count=0)
+        assert log.is_series_blacklisted(**self.ARM) is True
+
+    def test_verdict_is_idempotent_within_a_cycle(self, log):
+        """Disarming after the verdict means a second local query in the
+        same cycle cannot double-count one attempt."""
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=0)
+        assert log.get_series_failure_count(**self.ARM) == 1
+
+    def test_outright_failure_disarms_a_pending_check(self, log):
+        """An error already settled the attempt; the armed check must
+        not bill the same round trip a second time next cycle."""
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        log.record_series_failure(**self.ARM)
+        log.note_local_progress(**self.ARM, local_count=0)
+        assert log.get_series_failure_count(**self.ARM) == 1
+
+    def test_scoped_per_source_pacs(self, log):
+        log.arm_local_progress_check(
+            source_pacs="a", series_uid="1.2.3", local_count=0)
+        log.note_local_progress(
+            source_pacs="a", series_uid="1.2.3", local_count=0)
+        assert log.get_series_failure_count(
+            source_pacs="b", series_uid="1.2.3") == 0
+
+    def test_no_armed_attempt_has_no_age(self, log):
+        assert log.seconds_since_armed_attempt(**self.ARM) is None
+
+    def test_armed_attempt_reports_a_fresh_age(self, log):
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        age = log.seconds_since_armed_attempt(**self.ARM)
+        assert age is not None and 0 <= age < 5
+
+    def test_age_is_gone_once_the_verdict_is_in(self, log):
+        """Disarming ends the grace period as well — a series already
+        judged this cycle is not "still being imported"."""
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        log.note_local_progress(**self.ARM, local_count=0)
+        assert log.seconds_since_armed_attempt(**self.ARM) is None
+
+    def test_unparseable_timestamp_degrades_to_no_grace(self, log,
+                                                        db_path):
+        """A corrupt row must mean "no grace period", never "grace
+        forever" — the latter would silently stop the series from ever
+        being retried."""
+        log.arm_local_progress_check(**self.ARM, local_count=0)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE series_failures SET last_attempt_at = 'not a date'")
+        conn.commit()
+        conn.close()
+        assert log.seconds_since_armed_attempt(**self.ARM) is None
+
+    def test_migrates_a_log_written_without_the_column(self, db_path):
+        """An existing log from an older build must gain the column on
+        the next open, keeping the failure counts it already had."""
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE series_failures ("
+            "source_pacs TEXT NOT NULL, series_uid_hash TEXT NOT NULL, "
+            "attempt_count INTEGER NOT NULL DEFAULT 0, "
+            "last_attempt_at TEXT NOT NULL, "
+            "PRIMARY KEY (source_pacs, series_uid_hash))")
+        conn.execute(
+            "INSERT INTO series_failures VALUES (?, ?, 2, ?)",
+            ("ct_scanner", _sha256("1.2.3"), "2026-01-01T00:00:00"))
+        conn.commit()
+        conn.close()
+
+        tl = TransferLog(db_path)
+        try:
+            assert tl.get_series_failure_count(**self.ARM) == 2
+            # And the new mechanism works on the migrated row.
+            tl.arm_local_progress_check(**self.ARM, local_count=0)
+            tl.note_local_progress(**self.ARM, local_count=0)
+            assert tl.is_series_blacklisted(**self.ARM) is True
+        finally:
+            tl.close()
+
+
 class TestTransferLogIndexes:
     """The log is append-only and reaches tens of thousands of rows;
     the selective lookup columns need indexes or every Examination

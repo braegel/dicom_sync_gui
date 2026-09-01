@@ -43,6 +43,36 @@ def _log_file_path() -> str:
 
 logger = logging.getLogger("dicom_sync")
 
+# Level for pynetdicom's own logger.  It is deliberately NOT the app's.
+#
+# pynetdicom logs at INFO, not DEBUG, and that includes a full
+# element-by-element dump of every C-FIND request and response
+# identifier plus a banner per association.  Propagated to the root
+# logger it drowns everything else: measured on a live installation,
+# 23 650 lines per 71 seconds, so the whole 8 MB of rotated history
+# covered 4 minutes 16 seconds.  Any incident older than that was
+# already gone by the time anyone looked.
+#
+# The CPU cost is minor (~0.16 ms per response), so this is about
+# keeping the log readable and retentive, not about speed.  Set
+# DICOM_SYNC_PYNETDICOM_LOG=INFO (or DEBUG) to get the wire-level
+# detail back when diagnosing a negotiation problem.
+_PYNETDICOM_LOG_ENV = "DICOM_SYNC_PYNETDICOM_LOG"
+_PYNETDICOM_DEFAULT_LEVEL = "WARNING"
+
+
+def _configure_pynetdicom_logging() -> None:
+    """Quiet pynetdicom's per-PDU INFO logging unless asked otherwise."""
+    requested = os.environ.get(
+        _PYNETDICOM_LOG_ENV, _PYNETDICOM_DEFAULT_LEVEL).upper()
+    level = logging.getLevelName(requested)
+    if not isinstance(level, int):
+        logger.warning(
+            "%s=%r is not a log level; falling back to %s",
+            _PYNETDICOM_LOG_ENV, requested, _PYNETDICOM_DEFAULT_LEVEL)
+        level = logging.WARNING
+    logging.getLogger("pynetdicom").setLevel(level)
+
 
 def _setup_logging() -> None:
     """Install the console + rotating-file handlers.
@@ -69,6 +99,9 @@ def _setup_logging() -> None:
             ),
         ]
     )
+    # After basicConfig: it configures the ROOT logger, which is what
+    # pynetdicom's records propagate to.
+    _configure_pynetdicom_logging()
 
 # Interpreter range the GC workaround in ``_configure_gc`` applies to.
 # 3.14 introduced the incremental collector that races PySide's

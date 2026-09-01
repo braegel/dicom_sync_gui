@@ -13,7 +13,7 @@ from core.config import AppConfig, PacsNode
 from core.transfer_engine import (
     SeriesJob, TransferStats, TransferEngine, TransferSignals,
     SeriesCompletionRecord, MAX_INCOMPLETE_QUERY_CYCLES,
-    MAX_TRACKED_STUDIES,
+    MAX_TRACKED_STUDIES, MAX_SERIES_TRANSFER_ATTEMPTS,
 )
 from core.dicom_ops import PacsConnectionError
 from core.transfer_log import TransferLog
@@ -822,7 +822,7 @@ class TestStudiesQueriedEmission:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [study_ds]
         mock_ops.c_find_series_checked.return_value = (True, [series_ds])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         received = []
         self.engine.signals.studies_queried.connect(received.append)
@@ -849,7 +849,7 @@ class TestStudiesQueriedEmission:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [study_ds]
         mock_ops.c_find_series_checked.return_value = (True, [series_ds])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         received = []
         self.engine.signals.studies_queried.connect(received.append)
@@ -875,7 +875,7 @@ class TestStudiesQueriedEmission:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [study_ds]
         mock_ops.c_find_series_checked.return_value = (True, [series1, series2])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         received = []
         self.engine.signals.studies_queried.connect(received.append)
@@ -915,7 +915,7 @@ class TestStudiesQueriedEmission:
         mock_ops.c_find_studies.return_value = [study_a, study_b]
         mock_ops.c_find_series_checked.side_effect = [
             (True, [series_a]), (True, [series_b])]
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         received = []
         engine.signals.studies_queried.connect(received.append)
@@ -965,7 +965,7 @@ class TestStudiesQueriedEmission:
         mock_ops.c_find_studies.return_value = [recent, old]
         # series query only runs for the recent one (old filtered by time)
         mock_ops.c_find_series_checked.return_value = (True, [series_recent])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         received = []
         self.engine.signals.studies_queried.connect(received.append)
@@ -1351,7 +1351,7 @@ class TestPriorsInstitutionFilter:
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
         mock_ops.c_find_series_checked.return_value = (True, [prior_series])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         jobs = self.engine._resolve_priors(
             mock_ops, current, seen_series=set(), max_images=0)
@@ -1375,7 +1375,7 @@ class TestPriorsInstitutionFilter:
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
         mock_ops.c_find_series_checked.return_value = (True, [prior_series])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         jobs = self.engine._resolve_priors(
             mock_ops, current, seen_series=set(), max_images=0)
@@ -1398,7 +1398,7 @@ class TestPriorsInstitutionFilter:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [current[0], prior_ds]
         mock_ops.c_find_series_checked.return_value = (True, [prior_series])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         jobs = self.engine._resolve_priors(
             mock_ops, current, seen_series=set(), max_images=0)
@@ -1421,7 +1421,7 @@ class TestPriorsInstitutionFilter:
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
         mock_ops.c_find_series_checked.return_value = (True, [prior_series])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         jobs = self.engine._resolve_priors(
             mock_ops, current, seen_series=set(), max_images=0)
@@ -1446,7 +1446,7 @@ class TestPriorsInstitutionFilter:
         mock_ops.c_find_studies.return_value = [
             current[0], prior_ds]
         mock_ops.c_find_series_checked.return_value = (True, [prior_series])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         jobs = self.engine._resolve_priors(
             mock_ops, current, seen_series=set(), max_images=0)
@@ -1501,11 +1501,20 @@ class TestRetryBlacklist:
         ds.InstitutionName = "Hospital Alpha"
         return ds
 
+    def _make_local_series_ds(self, series_uid="1.2.3.1", count=3):
+        """A SERIES-level result as the LOCAL PACS returns it — only the
+        UID and the instance count, which is all the local inventory
+        query asks for."""
+        ds = MagicMock()
+        ds.SeriesInstanceUID = series_uid
+        ds.NumberOfSeriesRelatedInstances = count
+        return ds
+
     def _mock_ops(self, study_ds, series_ds, c_move_success=False):
         ops = MagicMock()
         ops.c_find_studies.return_value = [study_ds]
         ops.c_find_series_checked.return_value = (True, [series_ds])
-        ops.c_find_local_series.return_value = []
+        ops.c_find_local_series_checked.return_value = (True, [])
         ops.c_move_series.return_value = (
             c_move_success,
             0 if not c_move_success
@@ -1573,7 +1582,7 @@ class TestRetryBlacklist:
         ops = MagicMock()
         ops.c_find_studies.return_value = [study]
         ops.c_find_series_checked.return_value = (True, [bad, good])
-        ops.c_find_local_series.return_value = []
+        ops.c_find_local_series_checked.return_value = (True, [])
 
         def c_move_side_effect(study_uid, series_uid, progress_cb=None):
             if series_uid == "1.2.3.bad":
@@ -1599,9 +1608,15 @@ class TestRetryBlacklist:
         assert len(bad_jobs) == 1
         assert bad_jobs[0].status == "unavailable"
 
-    def test_successful_transfer_clears_prior_failures(self):
-        """If a series previously failed once and then succeeds, the
-        failure counter resets so a later failure isn't inherited."""
+    def test_arrival_at_the_local_pacs_clears_prior_failures(self):
+        """A series that previously failed and then actually ARRIVES
+        locally resets the failure counter, so a later failure isn't
+        inherited.
+
+        Two cycles, deliberately: the success itself proves nothing (see
+        the next test) — it is the following cycle's local query, which
+        now reports the images, that settles the verdict.
+        """
         self.engine._transfer_log.record_series_failure(
             source_pacs="ct", series_uid="1.2.3.1")
         assert self.engine._transfer_log.get_series_failure_count(
@@ -1611,12 +1626,103 @@ class TestRetryBlacklist:
         series = self._make_series_ds("1.2.3.1")
         ops = self._mock_ops(study, series, c_move_success=True)
 
-        with patch.object(self.engine, '_make_dicom_ops',
-                          return_value=ops):
+        with patch("core.transfer_engine.LOCAL_IMPORT_GRACE_S", 0), \
+                patch.object(self.engine, '_make_dicom_ops',
+                             return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            # Second cycle: the local PACS now holds the series.
+            ops.c_find_local_series_checked.return_value = (
+                True, [self._make_local_series_ds("1.2.3.1", count=10)])
             self.engine._run_one_cycle(hours=24, max_images=0)
 
         assert self.engine._transfer_log.get_series_failure_count(
             source_pacs="ct", series_uid="1.2.3.1") == 0
+
+    def test_success_without_local_arrival_counts_as_a_failed_attempt(self):
+        """The regression this whole mechanism exists for.
+
+        A series the local PACS silently discards — an OsiriX
+        ROI/Annotation SR is the real-world case — is answered with
+        SUCCESS by the source PACS on every C-MOVE while the local
+        SERIES-level query keeps reporting nothing.  The old code
+        cleared the failure streak on every such "success", so the
+        series was re-fetched every cycle forever (measured: 625 pulls
+        of one series in a single day).  Now each fruitless round trip
+        counts, and the series retires as 'unavailable'.
+        """
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        # c_find_local_series keeps answering "nothing here" — the
+        # default from _mock_ops — no matter how often the C-MOVE says
+        # it succeeded.
+        ops = self._mock_ops(study, series, c_move_success=True)
+
+        # Grace period off so the cycles are not collapsed into one; it
+        # delays this verdict, it does not change it.
+        with patch("core.transfer_engine.LOCAL_IMPORT_GRACE_S", 0), \
+                patch.object(self.engine, '_make_dicom_ops',
+                             return_value=ops):
+            for _ in range(MAX_SERIES_TRANSFER_ATTEMPTS + 1):
+                self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert self.engine._transfer_log.is_series_blacklisted(
+            source_pacs="ct", series_uid="1.2.3.1",
+            max_attempts=MAX_SERIES_TRANSFER_ATTEMPTS), (
+            "a C-MOVE that reports success but never lands anything "
+            "locally must eventually retire the series")
+        # And the wasted round trips are bounded by the retry budget
+        # instead of repeating once per cycle forever.
+        assert (ops.c_move_series.call_count
+                <= MAX_SERIES_TRANSFER_ATTEMPTS)
+
+    def test_grace_period_holds_back_a_just_transferred_series(self):
+        """A local PACS that imports asynchronously has not caught up
+        one cycle later.  Re-pulling the series then is pure waste — on
+        a live source with a 15-second interval it cost 12 304 seconds
+        of re-transferred series larger than 100 images."""
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=True)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert ops.c_move_series.call_count == 1, (
+            "a series transferred seconds ago must not be pulled again "
+            "before the local PACS has had a chance to import it")
+
+    def test_grace_period_does_not_score_a_no_progress_attempt(self):
+        """Held back is not the same as judged.  A series waiting to be
+        imported must keep its full retry budget — otherwise a short
+        sync interval alone would blacklist perfectly healthy series."""
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=True)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            for _ in range(5):
+                self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert self.engine._transfer_log.get_series_failure_count(
+            source_pacs="ct", series_uid="1.2.3.1") == 0
+
+    def test_series_is_reconsidered_once_the_grace_period_lapses(self):
+        study = self._make_study_ds("1.2.3")
+        series = self._make_series_ds("1.2.3.1")
+        ops = self._mock_ops(study, series, c_move_success=True)
+
+        with patch.object(self.engine, '_make_dicom_ops',
+                          return_value=ops):
+            self.engine._run_one_cycle(hours=24, max_images=0)
+            # Age the armed attempt past the grace window.
+            with patch("core.transfer_engine.LOCAL_IMPORT_GRACE_S", 0):
+                self.engine._run_one_cycle(hours=24, max_images=0)
+
+        assert ops.c_move_series.call_count == 2
 
     def test_preseeded_blacklist_skips_first_cycle(self):
         """If the DB already says this series has 3 failures from a
@@ -1659,7 +1765,7 @@ class TestRetryBlacklist:
         ops = MagicMock()
         ops.c_find_studies.return_value = [study]
         ops.c_find_series_checked.return_value = (True, [bad, good])
-        ops.c_find_local_series.return_value = []
+        ops.c_find_local_series_checked.return_value = (True, [])
         ops.c_move_series.return_value = (True, 300)
 
         received = []
@@ -1689,7 +1795,7 @@ class TestFetchLocalSeriesCounts:
 
     def test_returns_none_on_exception(self, caplog):
         ops = MagicMock()
-        ops.c_find_local_series.side_effect = RuntimeError("timeout")
+        ops.c_find_local_series_checked.side_effect = RuntimeError("timeout")
         result = TransferEngine._fetch_local_series_counts(
             ops, study_uid="1.2.3")
         assert result is None
@@ -1697,7 +1803,7 @@ class TestFetchLocalSeriesCounts:
     def test_logs_warning_on_exception(self, caplog):
         import logging
         ops = MagicMock()
-        ops.c_find_local_series.side_effect = RuntimeError(
+        ops.c_find_local_series_checked.side_effect = RuntimeError(
             "AE rejected association")
         with caplog.at_level(logging.WARNING, logger="dicom_sync"):
             TransferEngine._fetch_local_series_counts(
@@ -1718,10 +1824,52 @@ class TestFetchLocalSeriesCounts:
         s2 = MagicMock()
         s2.SeriesInstanceUID = "1.2.3.2"
         s2.NumberOfSeriesRelatedInstances = 100
-        ops.c_find_local_series.return_value = [s1, s2]
+        ops.c_find_local_series_checked.return_value = (True, [s1, s2])
         result = TransferEngine._fetch_local_series_counts(
             ops, study_uid="1.2.3")
         assert result == {"1.2.3.1": 50, "1.2.3.2": 100}
+
+    def test_empty_but_complete_answer_means_nothing_local_yet(self):
+        """The legitimate empty case must keep working — a study that
+        genuinely has not arrived returns ``{}``, not ``None``, so its
+        series get queued."""
+        ops = MagicMock()
+        ops.c_find_local_series_checked.return_value = (True, [])
+        assert TransferEngine._fetch_local_series_counts(
+            ops, study_uid="1.2.3") == {}
+
+    def test_incomplete_answer_returns_none(self):
+        """An endpoint with no Find presentation context — the built-in
+        Storage SCP — establishes the association and then answers
+        nothing.  That is NOT "nothing has arrived"; believing it
+        re-downloads the whole time window every cycle."""
+        ops = MagicMock()
+        ops.c_find_local_series_checked.return_value = (False, [])
+        assert TransferEngine._fetch_local_series_counts(
+            ops, study_uid="1.2.3") is None
+
+    def test_incomplete_answer_discards_partial_results(self):
+        """A query that broke off mid-stream saw only part of the
+        study.  Its partial counts would understate what is local and
+        re-queue series that are already there."""
+        ops = MagicMock()
+        s1 = MagicMock()
+        s1.SeriesInstanceUID = "1.2.3.1"
+        s1.NumberOfSeriesRelatedInstances = 50
+        ops.c_find_local_series_checked.return_value = (False, [s1])
+        assert TransferEngine._fetch_local_series_counts(
+            ops, study_uid="1.2.3") is None
+
+    def test_logs_warning_on_incomplete_answer(self, caplog):
+        import logging
+        ops = MagicMock()
+        ops.c_find_local_series_checked.return_value = (False, [])
+        with caplog.at_level(logging.WARNING, logger="dicom_sync"):
+            TransferEngine._fetch_local_series_counts(
+                ops, study_uid="1.2.3.4")
+        assert any("did not complete" in rec.message
+                   for rec in caplog.records)
+        assert any("1.2.3.4" in rec.message for rec in caplog.records)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1771,7 +1919,7 @@ class TestSkipStudyOnLocalQueryFailure:
 
         mock_ops = MagicMock()
         mock_ops.c_find_series_checked.return_value = (True, [series_ds])
-        mock_ops.c_find_local_series.side_effect = RuntimeError(
+        mock_ops.c_find_local_series_checked.side_effect = RuntimeError(
             "Association with kleditsch@10.0.0.1:11112 was not "
             "established (rejected or timed out)")
 
@@ -1788,7 +1936,7 @@ class TestSkipStudyOnLocalQueryFailure:
 
         mock_ops = MagicMock()
         mock_ops.c_find_series_checked.return_value = (True, [series_ds])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         jobs = self.engine._build_study_jobs(
             mock_ops, study_ds, seen_series=set(), max_images=0)
@@ -1802,7 +1950,7 @@ class TestSkipStudyOnLocalQueryFailure:
 
         mock_ops = MagicMock()
         mock_ops.c_find_series_checked.return_value = (True, [series_ds])
-        mock_ops.c_find_local_series.side_effect = RuntimeError("timeout")
+        mock_ops.c_find_local_series_checked.side_effect = RuntimeError("timeout")
 
         jobs = self.engine._build_prior_jobs_for_study(
             mock_ops, ps, pid="P1", seen_series=set(), max_images=0)
@@ -1864,11 +2012,15 @@ class TestSingleAEPerCycle:
         ops = MagicMock()
         ops.c_find_studies.return_value = [study]
         ops.c_find_series_checked.return_value = (True, [s1, s2, s3])
-        ops.c_find_local_series.return_value = []
+        ops.c_find_local_series_checked.return_value = (True, [])
         ops.c_move_series.return_value = (True, 100)
 
-        with patch.object(self.engine, '_make_dicom_ops',
-                          return_value=ops) as mock_make:
+        # Grace period off: this test is about AE reuse across cycles,
+        # and the freshly-transferred series would otherwise be held
+        # back on the second one.
+        with patch("core.transfer_engine.LOCAL_IMPORT_GRACE_S", 0), \
+                patch.object(self.engine, '_make_dicom_ops',
+                             return_value=ops) as mock_make:
             self.engine._run_one_cycle(hours=24, max_images=0)
             self.engine._run_one_cycle(hours=24, max_images=0)
 
@@ -2410,7 +2562,7 @@ class TestIncompleteSeriesQuery:
         mock_ops = MagicMock()
         mock_ops.c_find_studies.return_value = [self._study_ds()]
         mock_ops.c_find_series_checked.return_value = (complete, series)
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
         cutoff = datetime.now() - timedelta(hours=1)
         # Drop the cached ops so each call gets THIS cycle's mock — the
         # engine reuses one DicomOperations for its whole lifetime.
@@ -2495,7 +2647,7 @@ class TestIncompleteSeriesQuery:
         mock_ops.c_find_studies.return_value = [prior]
         mock_ops.c_find_series_checked.return_value = (
             False, [self._series_ds("S0.1")])
-        mock_ops.c_find_local_series.return_value = []
+        mock_ops.c_find_local_series_checked.return_value = (True, [])
 
         self.engine._build_prior_jobs_for_study(
             mock_ops, prior, "P1", seen_series=set(), max_images=0)
@@ -2590,26 +2742,32 @@ class TestPersistSeriesRecord:
                              patient_id="P1", modality="CT",
                              remote_count=100, local_count=0)
 
-    def test_records_and_clears_failures(self):
+    def test_records_and_arms_the_local_progress_check(self):
         self.engine._persist_series_record(self.job, 100, 12.5)
         kwargs = self.log.record_series.call_args.kwargs
         assert kwargs["source_pacs"] == "ct"
         assert kwargs["series_uid"] == "S1.1"
         assert kwargs["image_count"] == 100
         assert kwargs["duration_seconds"] == 12.5
-        self.log.clear_series_failures.assert_called_once_with(
-            source_pacs="ct", series_uid="S1.1")
+        # Arms with the PRE-transfer local count, which is what the next
+        # cycle compares against to decide whether anything arrived.
+        self.log.arm_local_progress_check.assert_called_once_with(
+            source_pacs="ct", series_uid="S1.1", local_count=0)
+        # A success on the wire is explicitly NOT a reason to wipe the
+        # streak any more — only real local arrival is.
+        self.log.clear_series_failures.assert_not_called()
 
-    def test_clears_failures_even_if_record_write_fails(self):
+    def test_arms_the_check_even_if_record_write_fails(self):
         import sqlite3
         self.log.record_series.side_effect = sqlite3.Error("disk full")
         self.engine._persist_series_record(self.job, 100, 1.0)
-        self.log.clear_series_failures.assert_called_once()
+        self.log.arm_local_progress_check.assert_called_once()
 
     def test_sqlite_errors_do_not_abort_the_transfer(self):
         import sqlite3
         self.log.record_series.side_effect = sqlite3.Error("disk full")
-        self.log.clear_series_failures.side_effect = sqlite3.Error("locked")
+        self.log.arm_local_progress_check.side_effect = sqlite3.Error(
+            "locked")
         self.engine._queue = [self.job]
         received = []
         self.engine.signals.series_completed.connect(

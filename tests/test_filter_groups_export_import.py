@@ -9,7 +9,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.config import (
-    AppConfig, merge_filter_group_data, write_filter_groups_json,
+    AppConfig, FilterGroupImportError, merge_filter_group_data,
+    parse_filter_groups_payload, write_filter_groups_json,
 )
 from gui.filter_groups_dialog import FilterGroupsDialog
 
@@ -483,3 +484,119 @@ class TestDialogImport:
             for i in range(self.dialog.group_list.count())
         ]
         assert any("Imported Group" in t for t in group_texts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# parse_filter_groups_payload — the import file is untrusted input
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestParseFilterGroupsPayload:
+    """Valid JSON says nothing about the SHAPE of a user-chosen file.
+    Without this validation a wrong type does not fail loudly — it either
+    corrupts silently (a string iterated into one group per character) or
+    raises from deep inside merge_filter_group_data, escaping the dialog's
+    unguarded Qt slot."""
+
+    # ── accepted shapes ──
+
+    def test_full_payload(self):
+        groups, assignments = parse_filter_groups_payload({
+            "filter_group_names": ["G1", "G2"],
+            "institution_assignments": {"Hospital": "G1"},
+        })
+        assert groups == ["G1", "G2"]
+        assert assignments == {"Hospital": "G1"}
+
+    def test_both_keys_are_optional(self):
+        """A file carrying only one half is legitimate."""
+        assert parse_filter_groups_payload(
+            {"filter_group_names": ["G1"]}) == (["G1"], {})
+        assert parse_filter_groups_payload(
+            {"institution_assignments": {"H": ""}}) == ([], {"H": ""})
+        assert parse_filter_groups_payload({}) == ([], {})
+
+    def test_returns_copies(self):
+        """The caller must not be able to mutate the source dict through
+        the result."""
+        data = {"filter_group_names": ["G1"],
+                "institution_assignments": {"H": "G1"}}
+        groups, assignments = parse_filter_groups_payload(data)
+        groups.append("G2")
+        assignments["X"] = "G1"
+        assert data["filter_group_names"] == ["G1"]
+        assert data["institution_assignments"] == {"H": "G1"}
+
+    def test_unassigned_institution_is_valid(self):
+        assert parse_filter_groups_payload(
+            {"institution_assignments": {"H": ""}})[1] == {"H": ""}
+
+    # ── rejected shapes ──
+
+    def test_group_names_as_string_is_rejected_not_coerced(self):
+        """The regression: "CT" used to be iterated into groups
+        ['C', 'T'] with no error at all."""
+        with pytest.raises(FilterGroupImportError, match="filter_group_names"):
+            parse_filter_groups_payload({"filter_group_names": "CT"})
+
+    def test_non_string_group_entry_is_rejected(self):
+        with pytest.raises(FilterGroupImportError, match="text entries"):
+            parse_filter_groups_payload({"filter_group_names": ["G1", 7]})
+
+    def test_assignments_as_list_is_rejected(self):
+        """Used to raise AttributeError from inside the merge."""
+        with pytest.raises(FilterGroupImportError,
+                           match="institution_assignments"):
+            parse_filter_groups_payload(
+                {"institution_assignments": ["a", "b"]})
+
+    def test_non_string_assignment_value_is_rejected(self):
+        with pytest.raises(FilterGroupImportError, match="text to text"):
+            parse_filter_groups_payload(
+                {"institution_assignments": {"H": 3}})
+
+    def test_non_object_top_level_is_rejected(self):
+        for payload in (["nope"], "nope", 42, None):
+            with pytest.raises(FilterGroupImportError, match="JSON object"):
+                parse_filter_groups_payload(payload)
+
+    def test_error_is_a_valueerror(self):
+        """Subclassing ValueError keeps any existing broad handler
+        working."""
+        assert issubclass(FilterGroupImportError, ValueError)
+
+
+class TestImportFilterGroupsRejectsMalformedFile:
+    """AppConfig.import_filter_groups shares the dialog's validation, so
+    the same bad file fails the same way on both paths."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.config = AppConfig(config_path=str(tmp_path / "cfg.json"))
+        self.path = str(tmp_path / "bad.json")
+
+    def _write(self, payload):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def test_malformed_file_raises(self):
+        self._write({"filter_group_names": "CT"})
+        with pytest.raises(FilterGroupImportError):
+            self.config.import_filter_groups(self.path)
+
+    def test_config_is_left_untouched_on_rejection(self):
+        """Validation happens before anything is applied, so a bad file
+        cannot half-import."""
+        self.config.filter_group_names = ["Existing"]
+        self.config.institution_assignments = {"H": "Existing"}
+        self._write({"institution_assignments": ["a", "b"]})
+        with pytest.raises(FilterGroupImportError):
+            self.config.import_filter_groups(self.path)
+        assert self.config.filter_group_names == ["Existing"]
+        assert self.config.institution_assignments == {"H": "Existing"}
+
+    def test_a_valid_file_still_imports(self):
+        self._write({"filter_group_names": ["G1"],
+                     "institution_assignments": {"H": "G1"}})
+        self.config.import_filter_groups(self.path, merge=False)
+        assert self.config.filter_group_names == ["G1"]
+        assert self.config.institution_assignments == {"H": "G1"}

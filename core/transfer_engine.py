@@ -124,9 +124,14 @@ TERMINAL_STATUSES = ("done", "error", "skipped", "unavailable")
 SMALL_SERIES_MAX_IMAGES_FOR_COMPLETION = 6
 
 # A series is retried at most this many times before it is marked
-# permanently unavailable (status "unavailable").  Small series that
-# fail to transfer for DICOM-level reasons would otherwise be retried
-# every cycle forever.
+# permanently unavailable (status "unavailable").
+#
+# An "attempt" is any round trip that moved the series no closer to
+# being local — BOTH a C-MOVE that failed outright AND one the source
+# answered with SUCCESS that still left nothing new in the local PACS.
+# The second kind used to be uncountable, because a success cleared the
+# streak; see the ``series_failures`` commentary in core.transfer_log
+# for what that cost in practice.
 MAX_SERIES_TRANSFER_ATTEMPTS = 3
 
 # Minimum number of NEW images a re-completion must add before
@@ -175,6 +180,25 @@ MAX_TRACKED_STUDIES = 5000
 # early verdict.  After this many attempts the partial view is accepted
 # and the shortfall is logged.
 MAX_INCOMPLETE_QUERY_CYCLES = 3
+
+# How long a just-transferred series is left alone before the engine
+# will consider pulling it again.
+#
+# The local inventory query answers "what does the local PACS hold",
+# which lags the transfer whenever that PACS imports asynchronously —
+# the built-in Storage SCP writes files into a watched folder and the
+# local PACS picks them up on its own schedule.  Until it has, the
+# series looks exactly as absent as it did before, so a short sync
+# interval re-pulls it in full, repeatedly.  Measured on a live source
+# running a 15-second interval: 12 304 seconds of re-transferred
+# series larger than 100 images.
+#
+# Two minutes is comfortably longer than a local import takes and far
+# shorter than any query window, so nothing is lost — a series that
+# genuinely still needs images is simply retried on a later cycle.
+# The grace period also holds the no-progress verdict open: a series
+# waiting to be imported must not be scored as "arrived nowhere".
+LOCAL_IMPORT_GRACE_S = 120
 
 # Minimum wall-clock gap between two ``series_progress`` emits during a
 # single C-MOVE.  pynetdicom yields one sub-operation status PER IMAGE;
@@ -729,8 +753,14 @@ class TransferEngine:
         seen_series: Set[str] = set()
 
         try:
-            jobs = self._query_source(
-                date_range, cutoff, max_images, seen_series, dicom_ops)
+            # One association per endpoint for the whole C-FIND pass
+            # instead of one per query -- see DicomOperations.
+            # find_session.  Deliberately NOT wrapped around
+            # _transfer_queue: a pooled association left idle through a
+            # long C-MOVE is a peer idle-timeout waiting to happen.
+            with dicom_ops.find_session():
+                jobs = self._query_source(
+                    date_range, cutoff, max_images, seen_series, dicom_ops)
         except PacsConnectionError as e:
             # The source (or local) PACS went away during the query.
             # Surface it once and treat the cycle as empty; the service
@@ -1105,6 +1135,19 @@ class TransferEngine:
             remote_count = int(
                 getattr(ser, 'NumberOfSeriesRelatedInstances', 0) or 0)
             local_count = local_series.get(series_uid, 0)
+            # Just transferred?  Then the local PACS may simply not have
+            # imported it yet, and both re-queuing it and scoring it as
+            # "arrived nowhere" would be wrong.  Leave the armed check
+            # standing and revisit on a later cycle.
+            if self._within_local_import_grace(series_uid):
+                continue
+            # Settle any pending no-progress check with the count the
+            # local PACS reports right now.  Must happen BEFORE the skip
+            # check: a series that has finally arrived in full is exactly
+            # the one that gets skipped here, and it is also the one
+            # whose armed check must be cleared — leaving it armed would
+            # hand a stale verdict to a much later re-queue.
+            self._note_local_progress(series_uid, local_count)
             if self._should_skip_series(
                     remote_count, local_count, max_images):
                 continue
@@ -1119,6 +1162,43 @@ class TransferEngine:
                 **job_fields,
             ))
         return jobs
+
+    def _within_local_import_grace(self, series_uid: str) -> bool:
+        """Whether *series_uid* was transferred too recently to judge.
+
+        Best-effort: a transfer log that cannot answer must not stall
+        the queue, so any error means "no grace period" — the previous
+        behaviour.
+        """
+        if not series_uid:
+            return False
+        try:
+            age = self._transfer_log.seconds_since_armed_attempt(
+                source_pacs=self.remote_key, series_uid=series_uid)
+        except sqlite3.Error as e:
+            logger.warning(
+                f"TransferLog.seconds_since_armed_attempt failed: {e}")
+            return False
+        return age is not None and age < LOCAL_IMPORT_GRACE_S
+
+    def _note_local_progress(self, series_uid: str,
+                             local_count: int) -> None:
+        """Tell the transfer log what the local PACS holds for
+        *series_uid* now, settling any armed no-progress check.
+
+        Best-effort like every other transfer-log write on this path: a
+        broken log must degrade to "no blacklisting", never abort a
+        query cycle.
+        """
+        if not series_uid:
+            return
+        try:
+            self._transfer_log.note_local_progress(
+                source_pacs=self.remote_key,
+                series_uid=series_uid,
+                local_count=local_count)
+        except sqlite3.Error as e:
+            logger.warning(f"TransferLog.note_local_progress failed: {e}")
 
     @staticmethod
     def _series_datetime(ser: Dataset, study_date: str,
@@ -1317,12 +1397,19 @@ class TransferEngine:
         except sqlite3.Error as e:
             logger.warning(f"TransferLog.record_series failed: {e}")
         try:
-            self._transfer_log.clear_series_failures(
+            # NOT clear_series_failures: "the C-MOVE succeeded" is not
+            # yet evidence the images arrived anywhere.  Arm the check
+            # instead and let the next cycle's local query settle it —
+            # clearing here is what let a series the local PACS silently
+            # discards (an OsiriX ROI/Annotation SR) be re-fetched every
+            # cycle forever, because the streak was wiped each time.
+            self._transfer_log.arm_local_progress_check(
                 source_pacs=self.remote_key,
-                series_uid=job.series_uid)
+                series_uid=job.series_uid,
+                local_count=job.local_count)
         except sqlite3.Error as e:
             logger.warning(
-                f"TransferLog.clear_series_failures failed: {e}")
+                f"TransferLog.arm_local_progress_check failed: {e}")
 
     def _record_failure(self, job: SeriesJob,
                         t_elapsed: float = 0.0) -> int:
@@ -1675,21 +1762,47 @@ class TransferEngine:
         busy importing a prior batch) must not make the engine believe
         nothing has arrived yet and re-download the whole study; the
         next cycle re-queries once it recovers.
+
+        "Failure" covers two shapes, and the second is the subtle one:
+
+        * the query RAISED — unreachable host, refused association;
+        * the query returned but did not run to completion — the
+          association broke mid-stream, or the endpoint answered no
+          C-FIND at all because it has no Find presentation context.
+
+        The built-in Storage SCP is exactly that second case, and it can
+        end up holding the address the inventory query is aimed at (see
+        ``PacsNode.local_query_host``).  Its empty answer looks identical
+        to "nothing has arrived yet" unless the completeness flag is
+        checked — and believing it re-downloads the whole time window
+        every cycle.
         """
         counts: Dict[str, int] = {}
         try:
-            for ls in dicom_ops.c_find_local_series(study_uid):
-                uid = getattr(ls, 'SeriesInstanceUID', '')
-                cnt = int(
-                    getattr(ls, 'NumberOfSeriesRelatedInstances', 0) or 0)
-                if uid:
-                    counts[uid] = cnt
+            complete, series = dicom_ops.c_find_local_series_checked(
+                study_uid)
         except Exception as e:
             logger.warning(
                 f"Local PACS query failed for study {study_uid}: {e} — "
                 f"skipping this study for this cycle; it will be "
                 f"retried once the local PACS is reachable again")
             return None
+        if not complete:
+            logger.warning(
+                f"Local PACS query for study {study_uid} did not "
+                f"complete — skipping this study for this cycle rather "
+                f"than assuming nothing has arrived. If this repeats, "
+                f"the query is reaching an endpoint that cannot answer "
+                f"a C-FIND (the built-in Storage SCP holding the same "
+                f"address); point it at the local PACS explicitly with "
+                f"the node's local-query host/port.")
+            return None
+        for ls in series:
+            uid = getattr(ls, 'SeriesInstanceUID', '')
+            cnt = int(
+                getattr(ls, 'NumberOfSeriesRelatedInstances', 0) or 0)
+            if uid:
+                counts[uid] = cnt
         return counts
 
     def _make_dicom_ops(self) -> DicomOperations:
@@ -1699,4 +1812,6 @@ class TransferEngine:
             local_config,
             remote_node.to_dict(),
             self.remote_key,
+            local_query_config=self.config.get_local_query_dict_for(
+                self.remote_key),
         )

@@ -26,6 +26,13 @@ DEFAULT_LOCAL_PORT = 11112
 DEFAULT_REMOTE_PORT = 104
 DEFAULT_LOCAL_AE_TITLE = "LOCAL_AE"
 DEFAULT_TRANSFER_SYNTAX = "JPEG2000Lossless"
+# Where the local inventory C-FIND goes when the built-in Storage SCP
+# is receiving and no explicit query host was configured.  Loopback is
+# the one address the built-in SCP provably never occupies: it binds
+# the interface that reaches the source PACS (see ``local_ip_for``),
+# never 127.0.0.1.  A local PACS listening on the wildcard therefore
+# always answers here, whichever interface the built-in SCP took.
+LOCAL_QUERY_LOOPBACK = "127.0.0.1"
 
 TRANSFER_SYNTAXES_NAMES = [
     "JPEG2000Lossless",
@@ -152,6 +159,27 @@ class PacsNode:
     # address and port for everything else, including the engine's
     # local C-FIND.
     receive_with_builtin_scp: bool = False
+    # Where to ask "what has already arrived?" -- the local inventory
+    # C-FIND, which is what stops the engine re-downloading series it
+    # already has.  Empty / 0 mean "work it out" -- the C-MOVE
+    # destination normally, but LOOPBACK when
+    # ``receive_with_builtin_scp`` is on, because then the two can
+    # collide.  See ``AppConfig.get_local_query_dict_for``.
+    #
+    # They must be separable because ``receive_with_builtin_scp`` can
+    # make the two endpoints genuinely different.  The built-in SCP
+    # binds the interface address that reaches this source and answers
+    # STORAGE only -- it has no Find presentation context at all.  When
+    # that address is also the one ``get_local_dict_for`` derives (i.e.
+    # the source is reached over the default route, not a VPN), the
+    # built-in SCP's more-specific bind steals the inventory query from
+    # the local PACS, every series then looks absent, and the engine
+    # re-downloads the entire time window every cycle.
+    #
+    # Pointing the query at the local PACS explicitly -- ``127.0.0.1``
+    # when it runs on this machine -- keeps the two apart.
+    local_query_host: str = ""
+    local_query_port: int = 0
     notification_sound_enabled: bool = True
     notification_sound_path: str = ""
     # Per-source ordered list of {"term": str, "is_regex": bool}.
@@ -186,6 +214,8 @@ class PacsNode:
             "local_syntax": self.local_syntax,
             "fallback_folder": self.fallback_folder,
             "receive_with_builtin_scp": self.receive_with_builtin_scp,
+            "local_query_host": self.local_query_host,
+            "local_query_port": self.local_query_port,
             "notification_sound_enabled": self.notification_sound_enabled,
             "notification_sound_path": self.notification_sound_path,
             # Deep-copy entry dicts so callers can mutate the result
@@ -212,6 +242,8 @@ class PacsNode:
             fallback_folder=data.get("fallback_folder", ""),
             receive_with_builtin_scp=bool(
                 data.get("receive_with_builtin_scp", False)),
+            local_query_host=data.get("local_query_host", ""),
+            local_query_port=int(data.get("local_query_port", 0) or 0),
             notification_sound_enabled=data.get("notification_sound_enabled", True),
             notification_sound_path=data.get("notification_sound_path", ""),
             # Missing key → bundled defaults (legacy migration).
@@ -245,6 +277,76 @@ def write_filter_groups_json(path: str, group_names: List[str],
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+class FilterGroupImportError(ValueError):
+    """The contents of a filter-group import file are not the expected
+    shape.
+
+    A ``ValueError`` subclass so existing ``except ValueError`` handlers
+    keep working, but nameable on its own so the GUI can tell "this file
+    is not a filter-group export" apart from any other ValueError.
+    """
+
+
+def parse_filter_groups_payload(
+    data: Any,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Validate a decoded filter-group export and return
+    ``(group_names, assignments)``.
+
+    The file is chosen by the user, so its shape is untrusted input and
+    JSON alone guarantees nothing about it.  Without this check the two
+    fields go straight into :py:func:`merge_filter_group_data`, where a
+    wrong type does not fail loudly but produces nonsense:
+
+    * ``{"filter_group_names": "CT"}`` iterates the STRING and silently
+      creates two groups, ``"C"`` and ``"T"``;
+    * ``{"institution_assignments": []}`` raises a bare
+      ``AttributeError`` (merge) or ``ValueError`` (replace) from deep
+      inside the merge, which in the dialog escapes an unguarded Qt
+      slot.
+
+    Types are rejected rather than coerced: ``"CT"`` is not a
+    one-element list, and guessing that it might be is how the first
+    case above became silent data corruption.  Both keys are OPTIONAL
+    (a file may legitimately carry only groups or only assignments);
+    only a present-but-wrong type is an error.
+
+    Raises:
+        FilterGroupImportError: with a message naming the offending
+            field, suitable for showing to the user verbatim.
+    """
+    if not isinstance(data, dict):
+        raise FilterGroupImportError(
+            "The file must contain a JSON object, but it contains "
+            f"{type(data).__name__}.")
+
+    groups = data.get("filter_group_names", [])
+    if not isinstance(groups, list):
+        raise FilterGroupImportError(
+            '"filter_group_names" must be a list of group names, but '
+            f"it is {type(groups).__name__}.")
+    bad_group = next(
+        (g for g in groups if not isinstance(g, str)), None)
+    if bad_group is not None:
+        raise FilterGroupImportError(
+            '"filter_group_names" must contain only text entries, but '
+            f"it contains {type(bad_group).__name__} ({bad_group!r}).")
+
+    assignments = data.get("institution_assignments", {})
+    if not isinstance(assignments, dict):
+        raise FilterGroupImportError(
+            '"institution_assignments" must be an object mapping each '
+            f"institution to a group, but it is "
+            f"{type(assignments).__name__}.")
+    for inst, grp in assignments.items():
+        if not isinstance(inst, str) or not isinstance(grp, str):
+            raise FilterGroupImportError(
+                '"institution_assignments" must map text to text, but '
+                f"it contains {inst!r}: {grp!r}.")
+
+    return list(groups), dict(assignments)
 
 
 def merge_filter_group_data(
@@ -642,6 +744,45 @@ class AppConfig:
             "transfer_syntax": node.local_syntax,
         }
 
+    def get_local_query_dict_for(self, remote_key: str) -> Dict[str, Any]:
+        """Return the endpoint to ask "what has already arrived?" for
+        *remote_key* — the local inventory C-FIND target.
+
+        Three cases, in precedence order:
+
+        * ``local_query_host`` / ``local_query_port`` set -- the
+          explicit override wins, always.
+        * ``receive_with_builtin_scp`` on and no override -- the host
+          falls back to ``LOCAL_QUERY_LOOPBACK`` rather than to the
+          C-MOVE destination.  Those two addresses coincide whenever
+          the source is reached over the DEFAULT ROUTE instead of a
+          tunnel, and the built-in SCP's interface-specific bind then
+          takes the inventory query away from the local PACS.  The SCP
+          answers Storage only, so the query comes back empty-but-
+          established, the engine cannot verify what has arrived, and
+          that source quietly stops downloading.  Defaulting to
+          loopback removes the coincidence: the built-in SCP never
+          binds 127.0.0.1.
+        * neither -- the C-MOVE destination, the historical behaviour,
+          correct whenever the local PACS both receives and answers.
+
+        The port is NOT given the same treatment: the local PACS
+        listens on one port for both roles in every deployment seen so
+        far, and guessing a different one would break the common case
+        to fix nothing.
+        """
+        target = self.get_local_dict_for(remote_key)
+        node = self.remote_nodes.get(remote_key)
+        if node is None:
+            return target
+        if node.local_query_host:
+            target["ip_address"] = node.local_query_host
+        elif node.receive_with_builtin_scp:
+            target["ip_address"] = LOCAL_QUERY_LOOPBACK
+        if node.local_query_port:
+            target["port"] = node.local_query_port
+        return target
+
     # ══ DEPRECATED COMPATIBILITY SURFACE ═════════════════════════════════
     #
     # Everything below this banner and above the "Filter groups" section
@@ -779,9 +920,11 @@ class AppConfig:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        imported_groups: List[str] = data.get("filter_group_names", [])
-        imported_assignments: Dict[str, str] = data.get(
-            "institution_assignments", {})
+        # Same validation the dialog applies — a malformed file must
+        # fail with a named error here too, not silently create groups
+        # out of the characters of a string.
+        imported_groups, imported_assignments = (
+            parse_filter_groups_payload(data))
 
         # Shared pure helper — the same logic the FilterGroupsDialog
         # applies to its unsaved working copies.

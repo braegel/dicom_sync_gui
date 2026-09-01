@@ -84,6 +84,32 @@ CREATE TABLE IF NOT EXISTS series_failures (
 )
 """
 
+# ``series_failures.attempt_count`` counts BOTH kinds of wasted attempt:
+#
+#   * a C-MOVE that failed outright (``record_series_failure``), and
+#   * a C-MOVE the source PACS answered with SUCCESS that nevertheless
+#     left nothing new in the local PACS (``note_local_progress``).
+#
+# The second kind is the one that used to be invisible.  A series the
+# local PACS refuses to keep — an OsiriX ROI/Annotation SR, which OsiriX
+# attaches to the referenced series instead of storing as a queryable
+# one — is re-fetched forever: the source reports N instances, the local
+# SERIES-level C-FIND keeps answering 0, so the engine re-queues it every
+# single cycle.  Measured on a real 13-day log: 74 165 such re-transfers,
+# 99.3 % of them Modality SR, 19.7 hours of pure association time, one
+# series pulled 625 times in a day.
+#
+# Verification cannot happen at transfer time — the images only become
+# visible to the local query on a LATER cycle.  So a successful C-MOVE
+# ARMS the check by storing the pre-transfer local count here, and the
+# next cycle's queue build DISARMS it by comparing against the count it
+# just observed.  ``-1`` means "nothing to verify".
+_NO_PENDING_VERIFY = -1
+
+_FAILURES_LAST_LOCAL_COUNT_COLUMN = (
+    "ALTER TABLE series_failures ADD COLUMN last_local_count "
+    f"INTEGER NOT NULL DEFAULT {_NO_PENDING_VERIFY}")
+
 
 _STUDY_TABLE = """
 CREATE TABLE IF NOT EXISTS study_transfer (
@@ -234,11 +260,30 @@ class TransferLog:
         self._conn.execute(_SERIES_TABLE)
         self._conn.execute(_STUDY_TABLE)
         self._conn.execute(_FAILURES_TABLE)
+        self._migrate_failures_last_local_count()
         # IF NOT EXISTS, so an existing log picks these up on the next
         # open without a migration step.
         for stmt in _INDEXES:
             self._conn.execute(stmt)
         self._conn.commit()
+
+    def _migrate_failures_last_local_count(self) -> None:
+        """Add ``series_failures.last_local_count`` to a log written by
+        an older build.
+
+        SQLite has no ``ADD COLUMN IF NOT EXISTS``, so the column list
+        is what decides — cheaper and more honest than catching the
+        "duplicate column name" OperationalError, which would also
+        swallow a genuinely broken schema.
+        """
+        columns = {row[1] for row in self._conn.execute(
+            "PRAGMA table_info(series_failures)")}
+        if "last_local_count" in columns:
+            return
+        self._conn.execute(_FAILURES_LAST_LOCAL_COUNT_COLUMN)
+        logger.info(
+            "TransferLog: added series_failures.last_local_count "
+            "(no-progress detection)")
 
     def close(self) -> None:
         self._conn.close()
@@ -381,11 +426,117 @@ class TransferLog:
             self._conn.execute(
                 "INSERT INTO series_failures "
                 "(source_pacs, series_uid_hash, attempt_count, "
-                "last_attempt_at) VALUES (?, ?, 1, ?) "
+                "last_attempt_at, last_local_count) "
+                f"VALUES (?, ?, 1, ?, {_NO_PENDING_VERIFY}) "
                 "ON CONFLICT(source_pacs, series_uid_hash) DO UPDATE SET "
                 "attempt_count = attempt_count + 1, "
-                "last_attempt_at = excluded.last_attempt_at",
+                "last_attempt_at = excluded.last_attempt_at, "
+                # An outright failure settles the attempt on its own, so
+                # disarm any pending no-progress check — otherwise the
+                # next cycle would count this same attempt a second time.
+                f"last_local_count = {_NO_PENDING_VERIFY}",
                 (source_pacs, h, ts))
+            self._conn.commit()
+
+    def arm_local_progress_check(self, *, source_pacs: str,
+                                 series_uid: str,
+                                 local_count: int) -> None:
+        """Record that a C-MOVE for *series_uid* just reported success,
+        with *local_count* instances present locally BEFORE it ran.
+
+        Arms the check that :py:meth:`note_local_progress` resolves on a
+        later cycle.  Deliberately does not touch ``attempt_count``: a
+        successful C-MOVE is only wasted once the next local query shows
+        it changed nothing, and that verdict belongs to the other
+        method.  See the ``_NO_PENDING_VERIFY`` comment for why the
+        check has to straddle two cycles.
+        """
+        h = _sha256(series_uid)
+        ts = datetime.now().isoformat()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO series_failures "
+                "(source_pacs, series_uid_hash, attempt_count, "
+                "last_attempt_at, last_local_count) "
+                "VALUES (?, ?, 0, ?, ?) "
+                "ON CONFLICT(source_pacs, series_uid_hash) DO UPDATE SET "
+                "last_attempt_at = excluded.last_attempt_at, "
+                "last_local_count = excluded.last_local_count",
+                (source_pacs, h, ts, int(local_count)))
+            self._conn.commit()
+
+    def seconds_since_armed_attempt(self, *, source_pacs: str,
+                                    series_uid: str) -> Optional[float]:
+        """Age in seconds of the transfer awaiting verification for
+        *series_uid*, or ``None`` when nothing is armed.
+
+        Lets the engine tell "this series was pulled moments ago and the
+        local PACS has simply not imported it yet" apart from "this
+        series never arrives".  Both look identical in a single local
+        query — the only difference is how long ago the images were
+        handed over.
+
+        Returns ``None`` rather than a huge number when the stored
+        timestamp cannot be parsed, so a corrupt row degrades to "no
+        grace period" instead of "grace forever".
+        """
+        h = _sha256(series_uid)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_attempt_at, last_local_count "
+                "FROM series_failures "
+                "WHERE source_pacs = ? AND series_uid_hash = ?",
+                (source_pacs, h)).fetchone()
+        if row is None or int(row[1]) == _NO_PENDING_VERIFY:
+            return None
+        try:
+            armed_at = datetime.fromisoformat(str(row[0]))
+        except ValueError:
+            return None
+        return (datetime.now() - armed_at).total_seconds()
+
+    def note_local_progress(self, *, source_pacs: str, series_uid: str,
+                            local_count: int) -> None:
+        """Resolve the check armed by
+        :py:meth:`arm_local_progress_check`, given the instance count
+        the local PACS reports for *series_uid* NOW.
+
+        * more instances than before → the transfer worked; drop the
+          row entirely, which also clears any earlier failure streak
+          (a series that is making progress is not a broken series);
+        * no more than before → that C-MOVE accomplished nothing, so it
+          counts as a failed attempt exactly like an outright error, and
+          ``is_series_blacklisted`` will eventually retire the series;
+        * nothing armed → no attempt to judge, so this is a no-op.
+
+        The last case is what keeps the count honest: a series sitting
+        in the queue that was never actually transferred (cycle
+        cancelled, PACS went away, queue aborted mid-way) must not
+        accumulate attempts it never made.  Disarming after the verdict
+        makes the call idempotent within a cycle.
+        """
+        h = _sha256(series_uid)
+        ts = datetime.now().isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_local_count FROM series_failures "
+                "WHERE source_pacs = ? AND series_uid_hash = ?",
+                (source_pacs, h)).fetchone()
+            if row is None or int(row[0]) == _NO_PENDING_VERIFY:
+                return
+            if int(local_count) > int(row[0]):
+                self._conn.execute(
+                    "DELETE FROM series_failures "
+                    "WHERE source_pacs = ? AND series_uid_hash = ?",
+                    (source_pacs, h))
+            else:
+                self._conn.execute(
+                    "UPDATE series_failures SET "
+                    "attempt_count = attempt_count + 1, "
+                    "last_attempt_at = ?, "
+                    f"last_local_count = {_NO_PENDING_VERIFY} "
+                    "WHERE source_pacs = ? AND series_uid_hash = ?",
+                    (ts, source_pacs, h))
             self._conn.commit()
 
     def get_series_failure_count(self, *, source_pacs: str,

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QMessageBox
 
 from gui.settings_dialog import (
     AE_TITLE_MAX_LEN, SettingsDialog, PacsNodeEditor, is_valid_host,
@@ -172,6 +173,36 @@ class TestPacsNodeEditorRemote:
             name="MRI", ae_title="MRI_AE", retrieve_method="C-GET")
         node = self.editor.get_node(base=legacy)
         assert node.retrieve_method == "C-MOVE"
+
+    def test_local_query_fields_default_to_unset(self):
+        """Empty host and port 0 mean "ask the C-MOVE destination",
+        which must stay the default so existing setups are unaffected."""
+        node = self.editor.get_node()
+        assert node.local_query_host == ""
+        assert node.local_query_port == 0
+
+    def test_get_node_includes_local_query_override(self):
+        self.editor.name_edit.setText("CT")
+        self.editor.ae_title_edit.setText("CT_AE")
+        self.editor.local_query_host_edit.setText("127.0.0.1")
+        self.editor.local_query_port_spin.setValue(11115)
+        node = self.editor.get_node()
+        assert node.local_query_host == "127.0.0.1"
+        assert node.local_query_port == 11115
+
+    def test_set_node_restores_local_query_override(self):
+        self.editor.set_node(PacsNode(
+            name="CT", ae_title="CT_AE",
+            local_query_host="127.0.0.1", local_query_port=11115))
+        assert self.editor.local_query_host_edit.text() == "127.0.0.1"
+        assert self.editor.local_query_port_spin.value() == 11115
+
+    def test_clear_fields_resets_local_query_override(self):
+        self.editor.local_query_host_edit.setText("127.0.0.1")
+        self.editor.local_query_port_spin.setValue(11115)
+        self.editor.clear_fields()
+        assert self.editor.local_query_host_edit.text() == ""
+        assert self.editor.local_query_port_spin.value() == 0
 
     def test_get_node_includes_service_params(self):
         self.editor.name_edit.setText("MRI")
@@ -614,3 +645,111 @@ class TestSettingsDialogNetworkValidation:
 
         mock_warning.assert_called_once()
         assert self.dialog._remote_nodes["ct"].ae_title == "CT_AE"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SettingsDialog — local port conflict detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestLocalPortConflicts:
+    """Two sources may share a local port — that is the ordinary "both
+    deliver into one PACS" setup.  What must be caught is the narrower
+    case where both would bind that port THEMSELVES with the built-in
+    Storage SCP on the wildcard address, because the second bind then
+    fails and its service silently never starts.
+    """
+
+    FB = "/tmp/incoming"
+
+    def _dialog(self, nodes):
+        dlg = SettingsDialog.__new__(SettingsDialog)
+        dlg._remote_nodes = nodes
+        return dlg
+
+    def _node(self, ae, port=11112, *, fallback=True, builtin=False,
+              ip="192.168.1.10"):
+        return PacsNode(
+            name=ae, ae_title=ae, ip_address=ip,
+            local_ae_title=ae, local_port=port,
+            fallback_folder=self.FB if fallback else "",
+            receive_with_builtin_scp=builtin)
+
+    # ── exact AE + port duplicate: unconditionally broken ──
+
+    def test_exact_duplicate_is_reported(self):
+        dlg = self._dialog({"a": self._node("SAME"),
+                            "b": self._node("SAME")})
+        assert dlg._find_duplicate_local_endpoint() == (
+            "a", "b", "SAME", 11112)
+
+    def test_distinct_ae_titles_are_not_an_exact_duplicate(self):
+        dlg = self._dialog({"a": self._node("AE_A"),
+                            "b": self._node("AE_B")})
+        assert dlg._find_duplicate_local_endpoint() is None
+
+    # ── wildcard port conflict ──
+
+    def test_two_fallback_sources_on_one_port_conflict(self):
+        """The bug this check exists for: the OS binds on (address,
+        port) and ignores the AE title, so differing AE titles do not
+        keep the two apart."""
+        dlg = self._dialog({"a": self._node("AE_A"),
+                            "b": self._node("AE_B")})
+        assert dlg._find_wildcard_port_conflict() == ("a", "b", 11112)
+
+    def test_builtin_receiver_binds_its_own_interface_and_is_exempt(self):
+        """``receive_with_builtin_scp`` binds the interface that reaches
+        its own source, so two such sources share a port by design —
+        flagging that would condemn a working configuration."""
+        dlg = self._dialog({
+            "a": self._node("AE_A", ip="192.168.2.15"),
+            "b": self._node("AE_B", ip="10.1.15.30", builtin=True),
+        })
+        assert dlg._find_wildcard_port_conflict() is None
+
+    def test_source_without_fallback_folder_never_binds(self):
+        """No fallback folder means no SCP is ever started, so the port
+        cannot be claimed."""
+        dlg = self._dialog({"a": self._node("AE_A", fallback=False),
+                            "b": self._node("AE_B", fallback=False)})
+        assert dlg._find_wildcard_port_conflict() is None
+
+    def test_distinct_ports_do_not_conflict(self):
+        dlg = self._dialog({"a": self._node("AE_A", port=11112),
+                            "b": self._node("AE_B", port=11113)})
+        assert dlg._find_wildcard_port_conflict() is None
+
+    def test_single_source_never_conflicts(self):
+        dlg = self._dialog({"a": self._node("AE_A")})
+        assert dlg._find_wildcard_port_conflict() is None
+
+    def test_binds_wildcard_predicate(self):
+        dlg = self._dialog({})
+        assert dlg._binds_wildcard_on_fallback(self._node("A")) is True
+        assert dlg._binds_wildcard_on_fallback(
+            self._node("A", builtin=True)) is False
+        assert dlg._binds_wildcard_on_fallback(
+            self._node("A", fallback=False)) is False
+
+    # ── save-path wiring ──
+
+    def test_save_is_blocked_when_the_user_declines(self, qapp):
+        dlg = self._dialog({"a": self._node("AE_A"),
+                            "b": self._node("AE_B")})
+        with patch("gui.settings_dialog.QMessageBox.question",
+                   return_value=QMessageBox.No):
+            assert dlg._confirm_wildcard_port_conflict() is False
+
+    def test_save_proceeds_when_the_user_accepts(self, qapp):
+        dlg = self._dialog({"a": self._node("AE_A"),
+                            "b": self._node("AE_B")})
+        with patch("gui.settings_dialog.QMessageBox.question",
+                   return_value=QMessageBox.Yes):
+            assert dlg._confirm_wildcard_port_conflict() is True
+
+    def test_no_prompt_when_there_is_no_conflict(self, qapp):
+        dlg = self._dialog({"a": self._node("AE_A", port=11112),
+                            "b": self._node("AE_B", port=11113)})
+        with patch("gui.settings_dialog.QMessageBox.question") as q:
+            assert dlg._confirm_wildcard_port_conflict() is True
+        q.assert_not_called()

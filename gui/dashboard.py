@@ -940,14 +940,15 @@ class SourceDashboard(QWidget):
 
     def _pending_for(self, job: dict) -> int:
         """Pending images for one job, discounting images the active
-        transfer has already received this run so the count drops live."""
-        if job["status"] in _TERMINAL_STATUSES:
-            return 0
-        pending = max(job["remote_count"] - job["local_count"], 0)
-        if (job["series_uid"] == self._active.series_uid
-                and self._active.images_done > 0):
-            pending = max(pending - self._active.images_done, 0)
-        return pending
+        transfer has already received this run so the count drops live.
+
+        The rule itself belongs to ``ActiveTransfer`` — it is the object
+        that knows which series is in flight and how much of it has
+        landed.  This wrapper exists only because the queue view takes a
+        one-argument ``pending_for`` callable; same delegation pattern
+        as the ``_format_ete`` / ``_status_text`` staticmethods above.
+        """
+        return self._active.pending_for(job, _TERMINAL_STATUSES)
 
     # Pure queue-table formatters live in gui.queue_table.  These thin
     # staticmethod delegates preserve the historical
