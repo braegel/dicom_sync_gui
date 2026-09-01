@@ -14,8 +14,8 @@ no Python installation required.
 
 | File | Architecture | Size |
 |---|---|---|
-| [`DICOM_Sync_1.5.2_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.5.2/DICOM_Sync_1.5.2_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~59 MB |
-| [`DICOM_Sync_1.5.2_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.5.2/DICOM_Sync_1.5.2_macOS_x86_64.dmg) | Intel | ~63 MB |
+| [`DICOM_Sync_1.6.0_macOS_arm64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.6.0/DICOM_Sync_1.6.0_macOS_arm64.dmg) | Apple Silicon (M1/M2/M3/M4) | ~59 MB |
+| [`DICOM_Sync_1.6.0_macOS_x86_64.dmg`](https://github.com/braegel/dicom_sync_gui/releases/download/v1.6.0/DICOM_Sync_1.6.0_macOS_x86_64.dmg) | Intel | ~63 MB |
 
 **Installation:**
 
@@ -48,10 +48,15 @@ The app is self-contained and stores its configuration in
   writes its clipboard text in the configured language (e.g. German:
   `Abschluss Bildübertragung: HH:MM:SS`) so it can be pasted directly into
   a radiology report.
-- **Retry Blacklist** — small series that repeatedly fail to transfer
-  (e.g. tiny localizers the source PACS refuses to send) are automatically
-  skipped after 2 failed C-MOVE attempts. Failure counts persist across
-  restarts; a successful transfer resets the counter.
+- **Retry Blacklist** — series that repeatedly fail to arrive are
+  automatically skipped after 3 fruitless attempts. This covers both a
+  C-MOVE that fails outright (e.g. a tiny localizer the source PACS
+  refuses to send) *and* one the source reports as successful that still
+  leaves nothing new in the local PACS — the case of an object the local
+  PACS silently discards, such as an OsiriX ROI/Annotation SR, which
+  would otherwise be re-fetched on every single cycle forever. Attempt
+  counts persist across restarts; the counter resets as soon as the
+  series actually gains instances locally.
 - **Custom Notification Sound** — plays a two-tone chime when a patient's
   studies complete downloading. Optionally select a custom WAV file or disable
   sound entirely. With active filter groups, sound only plays for matching
@@ -88,7 +93,16 @@ The app is self-contained and stores its configuration in
   configurable folder.  It can also be switched on deliberately per
   source (*Receive C-MOVE images with the built-in SCP*) for a local
   PACS that is reachable but still rejects that source's images — see
-  the 1.5.0 changelog entry.
+  the 1.5.0 changelog entry.  It is also measurably faster than letting
+  a PACS receive the C-STORE itself, because it writes a file instead
+  of doing per-image database work on the transfer's critical path.
+- **Local Inventory Query** — the endpoint asked "what has already
+  arrived?", which is what stops the engine re-downloading series it
+  already has.  Normally the local PACS answers this as well as
+  receiving the images, so the per-source fields stay empty; with the
+  built-in Storage SCP receiving, they default to `127.0.0.1` because
+  the SCP can otherwise bind the very address the query uses and it
+  answers Storage only.
 - **Filter Groups Export/Import** — back up or share institution assignments
   as JSON (merge or replace mode).
 - **Dark Theme** — modern dark UI, platform-independent via PySide6/Qt.
@@ -323,9 +337,9 @@ ARCH=arm64   # or x86_64
 mkdir -p _dmg
 cp -R "dist/DICOM Sync.app" _dmg/
 ln -s /Applications _dmg/Applications
-hdiutil create -volname "DICOM Sync 1.5.2" \
+hdiutil create -volname "DICOM Sync 1.6.0" \
   -srcfolder _dmg -ov -format UDZO \
-  releases/DICOM_Sync_1.5.2_macOS_${ARCH}.dmg
+  releases/DICOM_Sync_1.6.0_macOS_${ARCH}.dmg
 rm -rf _dmg
 ```
 
@@ -346,7 +360,7 @@ rm -rf _dmg
 ```
 dicom_sync_gui/
 ├── main.py                         # Entry point, dark theme, dependency check
-├── __init__.py                     # Package version (1.5.2)
+├── __init__.py                     # Package version (1.6.0)
 ├── __main__.py                     # python -m support
 ├── requirements.txt                # pip dependencies
 ├── dicom_sync.spec                 # PyInstaller build spec

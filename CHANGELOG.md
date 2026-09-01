@@ -2,6 +2,146 @@
 
 All notable changes to DICOM Sync GUI are documented in this file.
 
+## [1.6.0] — 2026-09-02
+
+Download throughput. Diagnosed from a live 13-day transfer log (85 354
+series records): the pipe was mostly full of series the engine had
+already downloaded.
+
+### Fixed
+- **Series the local PACS silently discards were re-downloaded on every
+  cycle, forever.** The retry blacklist only ever counted C-MOVE
+  *failures* — and a successful transfer cleared the counter outright.
+  A series the source PACS hands over happily but the local PACS does
+  not keep therefore never accumulated a single strike: OsiriX, for
+  one, attaches an incoming ROI/Annotation SR to the referenced series
+  instead of storing it as a queryable one, so the source kept
+  reporting one instance, the local SERIES query kept reporting none,
+  and the engine re-queued it every cycle for as long as the study
+  stayed in the time window. In the live log this was **74 165
+  re-transfers, 99.3 % of them Modality SR, 19.7 hours of pure
+  association time**, with one single series pulled 625 times in a day
+  and 91 % of one day's entire transfer time spent this way. A C-MOVE
+  that reports success now only clears the streak once the next
+  cycle's local query shows the series actually gained instances;
+  a fruitless round trip counts as an attempt exactly like an outright
+  error, so such a series retires as `unavailable` after three.
+- **A short sync interval re-pulled large series that were still being
+  imported.** When the local PACS imports asynchronously — the
+  built-in Storage SCP writes into a watched folder and the PACS picks
+  them up on its own schedule — a series stays invisible to the
+  inventory query for a while after it arrives, and the next cycle
+  pulled it again in full. Cost on a source running a 15-second
+  interval: 12 304 seconds of re-transferred series larger than 100
+  images. A just-transferred series is now left alone for two minutes
+  (`LOCAL_IMPORT_GRACE_S`) before being reconsidered, and is not
+  scored as "arrived nowhere" while it waits.
+- **pydicom's "VR UI value exceeds 64 characters" complaint drowned
+  the log.** The suppression around the C-FIND response loop covered
+  the `warnings` channel only; pydicom 3.0.2 reports the same
+  violation a second time through the `pydicom` logger, which
+  propagates to the root logger and so into the log file. The trigger
+  is OsiriX: the SR series it generates ("OsiriX ROI SR", "OsiriX
+  Annotations SR", "WindowsState SR", "Report SR") carry a
+  SeriesInstanceUID that is a comma-joined *list* of the series the
+  annotation refers to — 95 to 287 characters where the VR allows 64.
+  Both the source PACS and the local PACS report that same value, so
+  series matching was never affected, but the message accounted for
+  **74 % of the log's lines and 92 % of its bytes**, rotating the real
+  transfer history out of the 8 MB of retained history in about five
+  hours. A second, unrelated violation came from the other source --
+  UIDs with a leading zero in a component. A log filter now covers the
+  second channel, and rather than dropping the message outright it
+  keeps the FIRST report of each distinct violation and drops only the
+  repeats, so the fact that a PACS emits non-conformant values is
+  still on the record.
+- **An inventory query answered by something that cannot answer
+  C-FIND was read as "nothing has arrived yet."** The built-in Storage
+  SCP offers no Find presentation context, so it establishes the
+  association and then returns nothing — indistinguishable from an
+  authoritative empty answer once the completeness flag was dropped.
+  The study is now skipped for that cycle, with a log line naming the
+  likely cause, instead of re-queuing the entire time window.
+
+### Fixed (code review)
+- **A malformed filter-group import file could corrupt the group list
+  or crash the dialog.** The importer checked that the file parsed as
+  JSON and was non-empty, but never that its two fields had the right
+  *type* — and the merge does not fail loudly on the wrong one.
+  `{"filter_group_names": "CT"}` iterated the string and silently
+  created two groups, `"C"` and `"T"`; `{"institution_assignments": []}`
+  raised out of an unguarded Qt slot. Both fields are now validated
+  against the expected shape before anything is applied, and a bad file
+  is reported with a message naming the offending field. Types are
+  rejected, never coerced. `AppConfig.import_filter_groups` shares the
+  same validation, so both import paths fail identically.
+- **Two source PACS that would fight over the same local port were not
+  detected.** The duplicate check keyed on local AE title *plus* port,
+  but a socket binds on address plus port and ignores the AE title
+  entirely — so two sources with different AE titles on one port passed
+  validation, then both tried to bind it the moment their local PACS
+  went down, and the second service silently never started. Saving now
+  warns about that case. It is a warning, not a hard error: a shared
+  port is normal when both sources deliver into one local PACS, and
+  sources using *Receive C-MOVE images with the built-in SCP* bind
+  their own interface and are exempt by design.
+
+### Added
+- **Separate endpoint for the local inventory query** (per source, in
+  the node editor under *Local Inventory Query*). "Where do C-MOVE
+  images go" and "who do I ask what already arrived" were the same
+  setting, which made *Receive C-MOVE images with the built-in SCP*
+  unusable for a source reached over the default route: the SCP's
+  more-specific bind takes the query away from the local PACS, and
+  every series then looks absent. Leave the new fields empty for the
+  previous behaviour, or point them at the local PACS explicitly
+  (`127.0.0.1` when it runs on the same machine).
+
+### Changed
+- **The C-FIND pass opens one association per endpoint instead of one
+  per query.** A cycle asks the source PACS for its studies and then,
+  for every study, a series list — and asks the local PACS the same
+  question again to see what already arrived, so the cost was `1 + 2n`
+  connect / negotiate / release round trips. Measured on the reporting
+  machine: 33 associations every 69 seconds against one source, about
+  49 000 per day across two, and as many again against the local PACS,
+  which is also the process importing the images. `find_session()`
+  pools them for the duration of the query pass — measured against the
+  live PACS with 16 studies, **32 associations and 3.99 s became 2 and
+  1.65 s**, with 1 408 series across 67 studies compared pooled vs.
+  unpooled and zero differences. Scoped to the query phase on purpose:
+  a pooled association held through a long C-MOVE would sit idle for
+  minutes and invite the peer's idle timeout.
+- **The local inventory query defaults to loopback when the built-in
+  Storage SCP is receiving.** Empty `local_query_host` used to mean
+  "ask the C-MOVE destination", which is the same interface the
+  built-in SCP binds whenever the source is reached over the default
+  route rather than a tunnel. The SCP's more specific bind then took
+  the query, and since it answers Storage only the engine could never
+  verify what had arrived and that source stopped downloading. The
+  built-in SCP never binds `127.0.0.1`, so loopback always reaches the
+  real local PACS. An explicit `local_query_host` still wins, and
+  sources without the built-in SCP are unaffected.
+- **The dashboard's pending-image rule is no longer a second copy.**
+  `SourceDashboard._pending_for` reimplemented
+  `ActiveTransfer.pending_for` line for line, and the copy the
+  application actually called was the untested one — the original had
+  no production callers at all. The dashboard now delegates, which puts
+  the existing tests back on the live path.
+- **pynetdicom's own logging is quiet by default.** It logs at INFO,
+  not DEBUG, including a full element-by-element dump of every C-FIND
+  request and response identifier — measured at 23 650 lines per 71
+  seconds on a live installation, so the entire 8 MB of rotated
+  history covered 4 minutes 16 seconds and no incident could be looked
+  up after the fact. Set `DICOM_SYNC_PYNETDICOM_LOG=INFO` (or `DEBUG`)
+  to get the wire-level detail back when diagnosing a negotiation
+  problem.
+
+### Internal
+- `series_failures` gains a `last_local_count` column, added by an
+  automatic migration on first open; existing attempt counts are kept.
+- 1329 tests (was 1242).
+
 ## [1.5.2] — 2026-08-25
 
 ### Fixed
