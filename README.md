@@ -316,18 +316,47 @@ pyinstaller dicom_sync.spec --clean --noconfirm
 
 ### Intel (x86_64)
 
-Use an x86_64 Python (e.g. installed via `python.org` Universal2
-installer, or downloaded specifically as `x86_64`). On Apple Silicon
-hosts the x86_64 Python binary will automatically be invoked under
-Rosetta.
+Needs a genuinely x86_64 Python.  On an Apple Silicon host `uv` will
+fetch one; every call then has to go through `arch -x86_64`, because a
+universal2 interpreter would otherwise run as arm64 and quietly produce
+an arm64 bundle.
 
 ```bash
-python3 -m venv venv_x86           # x86_64 Python (e.g. 3.12)
-source venv_x86/bin/activate
-pip install -r requirements.txt pyinstaller
+uv python install cpython-3.13-macos-x86_64
+PY=$(uv python find cpython-3.13-macos-x86_64)
 
-pyinstaller dicom_sync.spec --clean --noconfirm
-# → dist/DICOM Sync.app  (x86_64)
+arch -x86_64 "$PY" -m venv venv_x86
+arch -x86_64 venv_x86/bin/python3 -m pip install -r requirements.txt pyinstaller
+
+arch -x86_64 venv_x86/bin/pyinstaller dicom_sync.spec --clean --noconfirm \
+  --distpath dist_x86_64 --workpath build_x86_64
+# → dist_x86_64/DICOM Sync.app  (x86_64)
+```
+
+**Do not build this one against an old Python.**  Apple's
+`/usr/bin/python3` is universal2 and therefore tempting, but it is
+3.9, and the code uses PEP 604 annotations (`str | None`) that are
+evaluated at import time — the bundle builds without complaint and
+then dies on the first launch.  `compileall` does not catch it either,
+because the syntax is valid; only actually starting the app does.
+Keep the Intel interpreter on the same feature level as the arm64 one.
+
+### Verify a bundle before shipping it
+
+Cross-architecture builds fail at *runtime*, not at build time, so
+check both.  `HOME` is redirected so the smoke test cannot touch the
+real configuration or the transfer log:
+
+```bash
+ARCH=x86_64   # or arm64
+file -b "dist_${ARCH}/DICOM Sync.app/Contents/MacOS/DICOM Sync"
+/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+  "dist_${ARCH}/DICOM Sync.app/Contents/Info.plist"
+
+SANDBOX=$(mktemp -d)
+env -i HOME="$SANDBOX" PATH=/usr/bin:/bin QT_QPA_PLATFORM=offscreen \
+  "dist_${ARCH}/DICOM Sync.app/Contents/MacOS/DICOM Sync"
+# must reach "Config loaded"; any traceback here ships as a crash
 ```
 
 ### Package the DMG
